@@ -752,7 +752,7 @@ impl Run<'_> {
         out.push_str(&format!("- Commit verified: `{head}`\n"));
         out.push_str("- Scope gate: passed, every changed file is inside the issue's scope\n");
         out.push_str("- Locked flows: the developer's change touches no file in `.maestro/`\n");
-        out.push_str(&format!("- `./verify.sh`: {}\n", self.verify.as_deref().unwrap_or("not run")));
+        out.push_str(&format!("- `./verify.sh`, run by the engine on this commit: {}\n", self.verify.as_deref().unwrap_or("not run")));
         if let Some((vendor, verdict)) = &self.review {
             out.push_str(&format!("- Review ({vendor}): {} on `{}`\n", verdict.verdict, verdict.head_sha.trim()));
         }

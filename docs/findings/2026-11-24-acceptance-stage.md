@@ -40,6 +40,7 @@ The first attempt at the same issue failed, which is the first real failing run.
 - **Both agents caught the plan's mistake on their own.** The acceptance writer wrote in its notes that the scope probably needed `Sources/UI/List/`. The developer then refused to work outside the scope and said the same. The writer's warning came 60 seconds and one simulator run earlier, but the engine does not read notes.
 - **The reviewer's items are about later issues, not this one.** In-memory storage and index-based row identity are fine for #5 and will matter for delete and persistence. Nothing carries them forward to those issues.
 - **A rerun after a failure needs no cleanup when nothing was pushed.** The engine replaced the old worktree and branch and started again.
+- **The CI review agreed, and could read the issue this time.** The `review` workflow on #14 commented "Verdict: approve" on the same commit and quoted the issue's widened scope, which exists only in the issue body. That confirms the `issues: read` fix from [todo-trial#12](https://github.com/jaechoidev/todo-trial/pull/12). It also read the PR body as contradicting itself: "verify passed" next to the developer's "verify was blocked". The body now says the passing run was the engine's.
 - **`verify.sh` leaves the simulator booted.** That saves about 30 seconds on the next run. Nothing shuts it down.
 
 ## Where the build differs from the design doc
