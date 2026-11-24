@@ -6,6 +6,7 @@
 //! back to it, up to a round limit.
 
 pub mod agent;
+pub mod api;
 pub mod flows;
 pub mod git;
 pub mod github;
@@ -1095,7 +1096,13 @@ impl Run<'_> {
         wanted.dedup();
         let mut held = Vec::new();
         for name in &wanted {
-            held.push(lock::acquire(&self.home, name, &|| println!("  {}: waiting for the {name} lock, another issue holds it", step.name))?);
+            held.push(lock::acquire(&self.home, name, &|| {
+                println!("  {}: waiting for the {name} lock, another issue holds it", step.name);
+                let _ = self.store.set_stage(&self.repo, self.issue.number, &step.name, "waiting", Some(&format!("the {name} lock, which another issue holds")));
+            })?);
+        }
+        if !wanted.is_empty() {
+            self.store.set_stage(&self.repo, self.issue.number, &step.name, "running", None)?;
         }
         let stem = format!("{:02}-{}{}", index + 1, step.name, self.round_tag());
         let stdout = self.run_dir.join(format!("{stem}.stdout.log"));

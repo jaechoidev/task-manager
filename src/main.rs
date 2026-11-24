@@ -107,6 +107,18 @@ enum Top {
         #[arg(long, default_value = ".")]
         repo_dir: PathBuf,
     },
+    /// Serve the local API that the app and other clients use
+    Serve {
+        /// The address to listen on. Anything but this machine needs --token
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        bind: String,
+        /// Require this token on every request
+        #[arg(long)]
+        token: Option<String>,
+        /// A checkout the API may act on. May be given more than once
+        #[arg(long = "repo-dir")]
+        repo_dirs: Vec<PathBuf>,
+    },
     /// Show where each issue stands, from the state database
     Status,
 }
@@ -315,6 +327,11 @@ fn run() -> Result<bool> {
         }
 
         Top::Promote { repo_dir } => engine::handoff::promote(&repo_dir),
+
+        Top::Serve { bind, token, repo_dirs } => {
+            engine::api::serve(&engine::api::ServeOptions { bind, token, repo_dirs })?;
+            Ok(true)
+        }
 
         Top::Status => {
             engine::status()?;

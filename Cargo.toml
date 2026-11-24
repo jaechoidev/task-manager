@@ -20,6 +20,9 @@ serde_yaml_ng = "0.10"
 # "bundled" compiles SQLite in, so the binary has no system dependency.
 # "fallible_uint" lets u64 values such as issue numbers be stored directly.
 rusqlite = { version = "0.43", features = ["bundled", "fallible_uint"] }
+# A small synchronous HTTP server for the local API. The engine's own work
+# is waiting on agents, so it has no use for an async runtime.
+tiny_http = "0.12"
 
 [profile.release]
 strip = true

@@ -2,7 +2,7 @@
 
 A deterministic task manager. Software owns the loop and every gate. An LLM is called only for bounded steps.
 
-So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. A queue runs every ready issue, several at once, and a judgment step decides what happens to an issue that gets stuck. The daemon and the app are not built yet.
+So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. A queue runs every ready issue, several at once, and a judgment step decides what happens to an issue that gets stuck. A local API serves all of it to the macOS app in [app/](app/). A long-running daemon is not built yet.
 
 ## Commands
 
@@ -18,6 +18,7 @@ factory handoff
 factory promote --repo-dir <checkout>
 factory retry <issue> --repo-dir <checkout>
 factory drop <issue> --repo-dir <checkout>
+factory serve --repo-dir <checkout>
 factory status
 ```
 
@@ -34,6 +35,7 @@ factory status
 | `drop` | Takes a stuck issue off the queue: closes its pull request, deletes its branch and worktree, removes the `today` label. The issue stays open | |
 | `handoff` | Writes the day's handoff document for each repository, from the state database | |
 | `promote` | Opens or refreshes the pull request from the default branch into `main`. Never merges it | |
+| `serve` | Serves the local API that the app and other clients use | |
 | `status` | Shows where each issue stands, from the state database | |
 
 Exit code 2 means the command itself could not run.
@@ -223,6 +225,31 @@ It is generated from the state database and the run files, with no LLM call, and
 
 `factory promote` opens a pull request from the default branch into `main`, listing what merged since the last promotion. Run again, it refreshes the same pull request. A person approves and merges it. The engine never does.
 
+## The API and the app
+
+`factory serve` answers JSON under `/v1`, on `127.0.0.1:7878` unless told otherwise. The app in [app/](app/) is a client of it, and so is anything else: no client gets a private path.
+
+| Route | Answers |
+| --- | --- |
+| `GET /v1/health` | The version and the repositories the server may act on |
+| `GET /v1/issues` | Every issue run so far: its state, its stage, what it waits on, which pass it is on |
+| `GET /v1/issues/<owner>/<repo>/<n>` | One issue: every step, the summary, what failed, the judgment, the run's files |
+| `GET /v1/issues/<owner>/<repo>/<n>/log` | The end of the newest output of that run |
+| `GET /v1/blocked` | The issues waiting for a person |
+| `GET /v1/workflow?repo=<owner>/<repo>` | The workflow as a graph: steps in order, and where each failure goes |
+| `GET /v1/usage` | Calls, time and usage limits hit, per vendor |
+| `POST /v1/issues/<owner>/<repo>/<n>/retry` | Starts `factory retry` for the issue |
+| `POST /v1/issues/<owner>/<repo>/<n>/drop` | Runs `factory drop` for the issue |
+
+The two commands and the workflow need a checkout: give `serve` one `--repo-dir` per repository.
+
+Who may call it:
+
+- **On this machine only, by default.** The API can start runs.
+- **Any other address needs `--token`.** The server refuses to start without one, and then every request must send `Authorization: Bearer <token>`.
+
+The engine returns data and no layout. Clients poll: there is no event stream yet.
+
 ## The queue
 
 `factory queue` picks work the way people do: by the `today` label (`--label` changes it).
@@ -316,6 +343,8 @@ cargo install --path .
 | `src/engine/queue.rs` | Which issues are ready, in what order, and how many at once |
 | `src/engine/judgment.rs` | What a judgment's answer is allowed to do, and a split as a plan file |
 | `src/engine/handoff.rs` | The handoff document and the promote pull request |
+| `src/engine/api.rs` | The local API |
+| `app/` | The macOS app, a Swift package |
 | `src/engine/lock.rs` | Locks that hold across processes |
 | `src/engine/github.rs` | Checks, the review verdict and the merge, each tied to one commit |
 | `tests/fix_loop.rs` | The real engine run against stand-ins for `gh`, `codex` and `claude` |
