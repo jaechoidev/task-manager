@@ -2,7 +2,7 @@
 
 A deterministic task manager. Software owns the loop and every gate. An LLM is called only for bounded steps.
 
-So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. The queue and the daemon are not built yet.
+So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. A queue runs every ready issue, several at once. The daemon and the app are not built yet.
 
 ## Commands
 
@@ -12,6 +12,7 @@ factory repo preflight <owner>/<name> --collaborator <login>
 factory plan validate plans/
 factory plan create plans/ --repo <owner>/<name>
 factory run <issue> --repo-dir <checkout>
+factory queue --repo-dir <checkout>
 factory status
 ```
 
@@ -22,6 +23,7 @@ factory status
 | `plan validate` | Checks plan files and prints the parallel batches. No network | 1 when a plan is invalid |
 | `plan create` | Creates issues, parent links and blocked-by links from valid plans. Safe to rerun | 1 when a plan is invalid |
 | `run` | Takes one issue through acceptance flows, develop, verify and review, opens a pull request, waits for GitHub on the same commit and merges. `--no-merge` leaves the merge to a person, `--no-pr` stops before pushing | 1 when the issue ends blocked |
+| `queue` | Runs every ready issue labelled `today`, most urgent first, up to `--parallel` at once | 1 when an issue ended blocked |
 | `status` | Shows where each issue stands, from the state database | |
 
 Exit code 2 means the command itself could not run.
@@ -156,6 +158,45 @@ Files live under `~/.factory` (or `FACTORY_HOME`):
 | `runs/<repo>/issue-<n>/<run-id>/` | Prompts, schemas, replies, logs and the PR body of one run. Files from the second time the run goes back carry `-r2` in their names |
 | `worktrees/<repo>/issue-<n>/` | The issue's worktree. Removed after a merge, kept when the run ends blocked |
 
+## The queue
+
+`factory queue` picks work the way people do: by the `today` label (`--label` changes it).
+
+| Rule | Detail |
+| --- | --- |
+| Ready | The issue was made by `plan create`, is open, carries the label, and everything it is blocked by is closed. GitHub's blocked-by links are the graph |
+| Order | `priority:high`, then unlabelled or `priority:normal`, then `priority:low`. Lower issue numbers first within one priority |
+| At once | Up to `--parallel` issues, 2 by default. Two issues whose scopes overlap never run together, whatever the plan said |
+| Held back | An issue with the `blocked` label waits for a person. An issue the queue already ran is not started twice in one session |
+
+Each issue runs as its own `factory run` process, with its output in `~/.factory/queue/<repo>/`. One that dies takes nothing else with it.
+
+What keeps parallel runs apart:
+
+- **A lock per issue.** A second process for the same issue is refused.
+- **The simulator lock.** A module names shared resources in `locks`, and the engine holds them while its command runs. Development happens in parallel. Verify, which needs the simulator, does not.
+- **A lock around shared git state.** Fetches, pushes and worktree changes in one checkout take turns.
+- **The moved-base check.** When one issue merges while another is still working, the second merges the base branch in and is judged again.
+
+Locks are files under `~/.factory/locks/`, held with the operating system's file lock. The system releases them when a process exits, so a crash leaves none behind.
+
+### Picking up an interrupted run
+
+Before each step the engine writes what the run knows to `progress.json` in the run's folder. When `factory run` finds a run that still says it is running, and no process holds the issue's lock, it picks up at that step:
+
+- The worktree is put back to the engine's last commit. Whatever the interrupted step left half done is discarded, because that step runs again from its start.
+- Steps that finished are not repeated. A run cut off while waiting on GitHub goes back to waiting, with the same pull request.
+- `--restart` starts over, when nothing was pushed yet.
+- A workflow whose steps changed since can't be picked up.
+
+The queue needs nothing special for this: the issue is still open and labelled, so it is picked, and its run resumes.
+
+### Usage limits
+
+A call that fails with signs of a usage or rate limit is not a failed attempt. The engine marks the issue as waiting, sleeps, and makes the same call again: after 1, 5, 15 and 30 minutes, then hourly, for about six hours in all. After that the run stops.
+
+Neither CLI documents a stable format for this, so the engine looks for the phrases both use ("usage limit", "rate limit", "429", "too many requests") in the error and in error lines of the output. It does not read a reset time.
+
 ## Modules
 
 A step in `factory.yaml` names a module. A module is a folder with a `module.yaml`:
@@ -207,6 +248,8 @@ cargo install --path .
 | `src/repo.rs` | `repo init` and the preflight |
 | `src/engine/mod.rs` | The steps and the fixed gates |
 | `src/engine/rounds.rs` | The loop: what runs next, and when the rounds run out |
+| `src/engine/queue.rs` | Which issues are ready, in what order, and how many at once |
+| `src/engine/lock.rs` | Locks that hold across processes |
 | `src/engine/github.rs` | Checks, the review verdict and the merge, each tied to one commit |
 | `tests/fix_loop.rs` | The real engine run against stand-ins for `gh`, `codex` and `claude` |
 | `src/engine/flows.rs` | What the engine checks in a flow file without running it |
