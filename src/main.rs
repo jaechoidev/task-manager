@@ -372,6 +372,7 @@ fn run() -> Result<bool> {
         Top::Drop { issue, repo_dir } => engine::drop_issue(&repo_dir, issue),
 
         Top::Blocked => {
+            quiet_on_closed_pipe();
             engine::blocked()?;
             Ok(true)
         }
@@ -427,6 +428,7 @@ fn run() -> Result<bool> {
         }
 
         Top::Module { command: ModuleCommand::List { repo_dir } } => {
+            quiet_on_closed_pipe();
             for module in engine::editing::modules(&repo_dir)? {
                 let text = |key: &str| module[key].as_str().unwrap_or("").to_string();
                 let list = |key: &str| module[key].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
@@ -455,6 +457,7 @@ fn run() -> Result<bool> {
         }
 
         Top::Status { refresh } => {
+            quiet_on_closed_pipe();
             if refresh {
                 let changed = engine::reconcile()?;
                 println!("{changed} issue(s) corrected from GitHub");
@@ -472,9 +475,11 @@ fn run() -> Result<bool> {
     }
 }
 
-fn main() -> ExitCode {
-    // Rust ignores SIGPIPE, so `factory status | head` would panic when head
-    // closes the pipe. Take the system's default instead: exit quietly.
+/// For commands that only print: exit quietly when the reader goes away, as
+/// in `factory status | head`. Rust ignores SIGPIPE, which turns that into a
+/// panic. Never used by a command that runs agents: there a closed pipe is
+/// an agent that quit early, and the engine must survive to record it.
+fn quiet_on_closed_pipe() {
     #[cfg(unix)]
     {
         extern "C" {
@@ -482,12 +487,14 @@ fn main() -> ExitCode {
         }
         const SIGPIPE: i32 = 13;
         const SIG_DFL: usize = 0;
-        // SAFETY: called once, before any thread exists, with constant arguments.
+        // SAFETY: called before any thread exists, with constant arguments.
         unsafe {
             signal(SIGPIPE, SIG_DFL);
         }
     }
+}
 
+fn main() -> ExitCode {
     match run() {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
