@@ -4,7 +4,27 @@ Build-order step 6: the issue queue from the dependency graph, ready issues by p
 
 ## Result
 
-Built and tested against stand-ins. **Not yet run on GitHub.** The trial plan for it, [todo-trial#21](https://github.com/jaechoidev/todo-trial/pull/21), passed `plan-validate` and is waiting for a person to merge it into `main`.
+`factory queue` took a three-issue plan on `jaechoidev/todo-trial` from nothing to three merged pull requests in 18 minutes 30 seconds, with nobody involved. `dev` passes all eight flows afterwards.
+
+The plan, [todo-trial#21](https://github.com/jaechoidev/todo-trial/pull/21), had one issue first and two that could run together:
+
+| Issue | Pull request | Time | What happened |
+| --- | --- | --- | --- |
+| #24 tabs, alone | [#28](https://github.com/jaechoidev/todo-trial/pull/28), merged | 6 min 6 s | A clean pass. The acceptance writer added three IDs for the tab bar buttons |
+| #25 stats, high priority | [#29](https://github.com/jaechoidev/todo-trial/pull/29), merged | 6 min 21 s | A clean pass, in parallel with #26 |
+| #26 settings | [#30](https://github.com/jaechoidev/todo-trial/pull/30), merged | 12 min 20 s | Passed, then found that #25 had merged first, took `dev` in, and was verified and reviewed a second time |
+
+When each step of the two parallel issues ran, from the request log:
+
+| Step | #25 | #26 |
+| --- | --- | --- |
+| acceptance | 20:37:30 to 20:38:05 | 20:37:31 to 20:38:11 |
+| red, needs the simulator | 20:38:05 to 20:38:53 | 20:38:52 to 20:39:39 |
+| develop | 20:38:52 to 20:39:21 | 20:39:39 to 20:40:05 |
+| verify, needs the simulator | 20:39:39 to 20:42:24 | 20:42:23 to 20:44:53 |
+| verify again, after `dev` moved | | 20:45:10 to 20:48:16 |
+
+The two acceptance writers worked at the same time. Every step that needs the simulator waited its turn: #26 logged "waiting for the simulator lock" three times, and no two simulator steps overlap.
 
 | Part | What it does | How it was checked |
 | --- | --- | --- |
@@ -13,7 +33,13 @@ Built and tested against stand-ins. **Not yet run on GitHub.** The trial plan fo
 | Resume | A run cut off mid-way picks up at the step it was on | Scenarios that kill the engine at verify and while waiting on GitHub |
 | Usage limits | A limited call is waited out and made again | A scenario with a stand-in Codex that reports a usage limit once |
 
-91 tests pass: 68 unit tests and 23 engine scenarios.
+91 tests passed at the end of this step: 68 unit tests and 23 engine scenarios.
+
+What the trial showed that the stand-ins could not:
+
+- **Parallel work saves less than it looks.** Two issues took 12 minutes together and would have taken about 12 and a half one after the other. On an iOS project almost all the time is the simulator, which only one issue can use. The agents' own calls are short.
+- **The second issue to merge pays for it.** #26 was verified twice, three minutes each, because #25 merged first. With more issues in parallel, the last one could be verified several times.
+- **GitHub closed each merged issue fast enough.** The queue saw #24 closed within seconds and started the two issues it blocked.
 
 ## What the scenarios showed
 
@@ -33,12 +59,13 @@ Built and tested against stand-ins. **Not yet run on GitHub.** The trial plan fo
 
 ## Problems hit
 
-1. **The plan PR could not be merged by Claude.** The earlier approval to merge passing plan PRs on the trial repo was refused by the permission system this time, so the real-GitHub trial did not run.
+1. **The plan PR could not be merged by Claude.** The earlier approval to merge passing plan PRs on the trial repo was refused by the permission system this time. Jae merged it, and the trial ran after that.
 2. **A lock test failed once in a full run.** Another test was starting a child process at the same instant, and for a moment that child held a copy of the lock file. Only tests start processes from several threads at once. The test now allows for it.
 
 ## Open items
 
-- **Never run against GitHub.** Priority order, parallel runs, and the moment GitHub closes an issue after a merge have only been seen with stand-ins.
+- **Priority order has only been seen with stand-ins.** In the trial the two parallel issues started together, so the high-priority label decided nothing.
+- **Resume has not been needed on GitHub.** No run was cut off during the trial.
 - **Usage-limit detection has never met a real limit.** The phrases are taken from each CLI's documentation and source.
 - **A queue hit by a usage limit keeps starting issues.** Each run waits on its own. Nothing tells the queue that a vendor is limited.
 - **Two developers at once means two Codex sessions at once.** The effect on usage limits is unmeasured.
