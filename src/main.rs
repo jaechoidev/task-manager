@@ -73,7 +73,7 @@ enum PlanCommand {
         dry_run: bool,
         #[arg(long, default_value = ".maestro")]
         flows_dir: PathBuf,
-        /// Write a markdown report here, for a pull request comment
+        /// Write a markdown report here, for a pull request comment. Empty when nothing was created or linked
         #[arg(long, value_name = "FILE")]
         report: Option<PathBuf>,
     },
@@ -183,7 +183,9 @@ fn run() -> Result<bool> {
             };
             print!("{}", plan::create::text(&outcome));
             if let Some(file) = report {
-                let body = if outcome.plans.is_empty() { String::new() } else { plan::create::markdown(&outcome) };
+                // Left empty when nothing changed, so a rerun doesn't comment again.
+                let changed = outcome.plans.iter().any(|p| p.links_added > 0 || p.parent.created || p.issues.iter().any(|i| i.created));
+                let body = if changed { plan::create::markdown(&outcome) } else { String::new() };
                 std::fs::write(&file, body).with_context(|| format!("writing {}", file.display()))?;
             }
             Ok(true)
