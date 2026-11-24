@@ -24,6 +24,7 @@ factory workflow validate --repo-dir <checkout>
 factory workflow propose --file <factory.yaml> --repo-dir <checkout>
 factory module list --repo-dir <checkout>
 factory module new <kind>/<name> --repo-dir <checkout>
+factory capacity
 factory serve --repo-dir <checkout>
 factory status
 ```
@@ -45,6 +46,7 @@ factory status
 | `workflow propose` | Checks a workflow file, then opens a pull request that replaces `factory.yaml` with it | 1 when it is not valid |
 | `module list` | Lists the built-in modules and the repository's own | |
 | `module new` | Opens a pull request that adds a new module's files. `--dry-run` prints them | |
+| `capacity` | Reads what this machine has, checks the tools a run needs, and proposes how much to run at once. Changes nothing | 1 when something needs attention |
 | `serve` | Serves the local API that the app and other clients use | |
 | `status` | Shows where each issue stands, from the state database. `--refresh` first corrects it from GitHub, for pull requests a person merged or closed by hand | |
 
@@ -252,6 +254,7 @@ It is generated from the state database and the run files, with no LLM call, and
 | `POST /v1/workflow/propose?repo=...` | Checks it, then opens a pull request for it |
 | `POST /v1/modules?repo=...` | Scaffolds `{"module": "<kind>/<name>", "role": ...}` into a pull request |
 | `GET /v1/usage` | Calls, time and usage limits hit, per vendor |
+| `GET /v1/capacity` | What `factory capacity` reports, as data |
 | `POST /v1/issues/<owner>/<repo>/<n>/retry` | Starts `factory retry` for the issue |
 | `POST /v1/issues/<owner>/<repo>/<n>/drop` | Runs `factory drop` for the issue |
 
@@ -285,6 +288,29 @@ What keeps parallel runs apart:
 - **The moved-base check.** When one issue merges while another is still working, the second merges the base branch in and is judged again.
 
 Locks are files under `~/.factory/locks/`, held with the operating system's file lock. The system releases them when a process exits, so a crash leaves none behind.
+
+### What a machine can run at once
+
+`factory capacity` answers that from the machine itself. It changes nothing and starts nothing.
+
+| It reports | From |
+| --- | --- |
+| Cores, memory, free disk, and how idle the CPU and memory are now | `sysctl`, `top`, `memory_pressure`, `df` |
+| Whether each tool a run needs is there: Xcode, Command Line Tools matching macOS, Maestro, Java, git, `gh` and its login, `codex`, `claude` | Each tool's own version command |
+| iPhone simulators on the newest iOS | `simctl` |
+| How many simulator steps and agent calls to allow at once, and why | The numbers below |
+| How many more simulator steps could start this minute | The CPU's idle share and free memory |
+
+The steps of a run need different things, so there is no single number. Agent calls use almost no local CPU: a subscription's usage limit bounds them. A step that builds the app and drives a simulator needs cores and memory.
+
+The proposal for simulator steps is the smaller of two limits, and never more than 3:
+
+- **Cores:** 4 per step, from all cores.
+- **Memory:** 8 GB per step, with 8 GB kept back.
+
+Those come from one measurement, of the trial app on a 12-core, 96 GB Mac, written up in [docs/findings/2026-11-24-capacity.md](docs/findings/2026-11-24-capacity.md). The trial app builds in seconds. A project with a long build needs more cores per step, and should be measured.
+
+The proposal is not yet used. The engine still holds one `simulator` lock, so one simulator step runs at a time.
 
 ### Picking up an interrupted run
 
@@ -383,6 +409,7 @@ cargo install --path .
 | `src/engine/editing.rs` | Checking a workflow draft, listing and scaffolding modules, proposing a change as a pull request |
 | `app/` | The macOS app, a Swift package |
 | `src/engine/lock.rs` | Locks that hold across processes |
+| `src/engine/capacity.rs` | What the machine has, and how much to run at once |
 | `src/engine/github.rs` | Checks, the review verdict and the merge, each tied to one commit |
 | `tests/fix_loop.rs` | The real engine run against stand-ins for `gh`, `codex` and `claude` |
 | `src/engine/flows.rs` | What the engine checks in a flow file without running it |

@@ -117,6 +117,12 @@ enum Top {
         #[command(subcommand)]
         command: ModuleCommand,
     },
+    /// Read what this machine has and propose how much to run at once.
+    /// Changes nothing
+    Capacity {
+        #[arg(long, value_enum, default_value_t = CapacityFormat::Text)]
+        format: CapacityFormat,
+    },
     /// Serve the local API that the app and other clients use
     Serve {
         /// The address to listen on. Anything but this machine needs --token
@@ -142,6 +148,12 @@ enum Top {
 enum Format {
     Text,
     Markdown,
+    Json,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CapacityFormat {
+    Text,
     Json,
 }
 
@@ -449,6 +461,16 @@ fn run() -> Result<bool> {
             let (url, files) = engine::editing::propose_module(&repo_dir, &module, role.as_deref())?;
             println!("opened {url} with {} file(s). Edit the module there. A person merges it", files.len());
             Ok(true)
+        }
+
+        Top::Capacity { format } => {
+            quiet_on_closed_pipe();
+            let report = engine::capacity::read();
+            match format {
+                CapacityFormat::Text => engine::capacity::print(&report),
+                CapacityFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+            }
+            Ok(report.warnings.is_empty())
         }
 
         Top::Serve { bind, token, repo_dirs } => {

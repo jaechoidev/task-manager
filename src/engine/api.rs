@@ -183,6 +183,7 @@ pub fn route(context: &Context_, request: &Request) -> (u16, Value) {
                 (200, json!(rows.iter().map(|row| issue_json(&store, row)).collect::<Result<Vec<_>>>()?))
             }
             ("GET", ["v1", "usage"]) => (200, usage_json(&store)?),
+            ("GET", ["v1", "capacity"]) => (200, serde_json::to_value(super::capacity::read())?),
             ("GET", ["v1", "workflow"]) | ("GET", ["v1", "modules"]) | ("POST", ["v1", "workflow", "validate"]) | ("POST", ["v1", "workflow", "propose"]) | ("POST", ["v1", "modules"]) => {
                 let repo = request.query.get("repo").cloned().or_else(|| context.repos.keys().next().cloned()).unwrap_or_default();
                 let Some(dir) = context.repos.get(&repo) else {
