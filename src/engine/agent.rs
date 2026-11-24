@@ -85,6 +85,7 @@ pub fn call(call: &Call) -> Result<Reply> {
         stdout: &stdout_path,
         stderr: &stderr_path,
         timeout: call.timeout,
+        env: Vec::new(),
     })?;
 
     let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();

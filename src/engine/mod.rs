@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod api;
 pub mod capacity;
+pub mod config;
 pub mod editing;
 pub mod flows;
 pub mod git;
@@ -210,6 +211,8 @@ struct Run<'a> {
     store: &'a Store,
     /// Where the engine keeps its files, for locks.
     home: PathBuf,
+    /// This machine's settings: how many of each resource may be in use.
+    config: config::Config,
     repo: String,
     issue: &'a Issue,
     run_id: String,
@@ -564,6 +567,16 @@ impl Run<'_> {
             let how = if resume.is_some() { ", continuing its session" } else { "" };
             println!("  {name}: {} call, attempt {attempt}{how}", vendor.name());
             let stem = format!("{:02}-{name}{}-{call_number}", index + 1, self.round_tag());
+            // A vendor with a cap on this machine is a pool too. The slot is
+            // held only for the call, so a wait on a usage limit frees it.
+            let vendor_slot = match self.config.vendor_pool(vendor.name()) {
+                Some(size) => Some(lock::acquire_slot(&self.home, vendor.name(), size, &|| {
+                    println!("  {name}: waiting for a free {} call, all {size} in use", vendor.name());
+                    let _ = self.store.set_stage(&self.repo, self.issue.number, name, "waiting", Some(&format!("a free {} call: all {size} are in use", vendor.name())));
+                })?),
+                None => None,
+            };
+            self.store.set_stage(&self.repo, self.issue.number, name, "running", None)?;
             let reply = agent::call(&agent::Call {
                 vendor,
                 model: step.model.as_deref(),
@@ -593,6 +606,8 @@ impl Run<'_> {
                     Some(seconds) => Duration::from_secs(seconds),
                     None => Duration::from_secs(minutes * 60),
                 };
+                // Someone else may use the slot while this call waits.
+                drop(vendor_slot);
                 println!("  {name}: {} hit a usage limit ({sign}). Waiting {} before trying again", vendor.name(), seconds(wait));
                 self.store.set_stage(&self.repo, self.issue.number, name, "waiting", Some(&format!("{} usage limit: {sign}", vendor.name())))?;
                 std::thread::sleep(wait);
@@ -1091,17 +1106,27 @@ impl Run<'_> {
         let quoted: Vec<String> = new.iter().map(|f| format!("'{f}'")).collect();
         let command = template.replace("{{new_flows}}", &quoted.join(" "));
         let judges_code = step.def.produces.iter().any(|p| p == "verify_log");
-        // Shared resources the module names, such as the simulator. Taken in
-        // one order everywhere, and held until the command has finished.
+        // Shared resources the module names, such as the simulator. Each is a
+        // pool on this machine, and the step takes one slot of it. Taken in
+        // one order everywhere, and held until the command has finished. The
+        // command is told which slot it has, so it uses that simulator.
         let mut wanted = step.def.locks.clone();
         wanted.sort();
         wanted.dedup();
         let mut held = Vec::new();
+        let mut env: Vec<(String, String)> = Vec::new();
         for name in &wanted {
-            held.push(lock::acquire(&self.home, name, &|| {
-                println!("  {}: waiting for the {name} lock, another issue holds it", step.name);
-                let _ = self.store.set_stage(&self.repo, self.issue.number, &step.name, "waiting", Some(&format!("the {name} lock, which another issue holds")));
-            })?);
+            let size = self.config.pool(name);
+            let (slot_held, slot) = lock::acquire_slot(&self.home, name, size, &|| {
+                println!("  {}: waiting for a free {name}, all {size} in use", step.name);
+                let _ = self.store.set_stage(&self.repo, self.issue.number, &step.name, "waiting", Some(&format!("a free {name}: all {size} are in use by other issues")));
+            })?;
+            if size > 1 {
+                println!("  {}: has {name} {slot} of {size}", step.name);
+            }
+            let key: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
+            env.push((format!("FACTORY_SLOT_{key}"), slot.to_string()));
+            held.push(slot_held);
         }
         if !wanted.is_empty() {
             self.store.set_stage(&self.repo, self.issue.number, &step.name, "running", None)?;
@@ -1118,6 +1143,7 @@ impl Run<'_> {
             stdout: &stdout,
             stderr: &stderr,
             timeout: Duration::from_secs(step.def.timeout_minutes.unwrap_or(20) * 60),
+            env,
         })?;
         drop(held);
         let passed = outcome.ok();
@@ -1420,6 +1446,12 @@ impl Run<'_> {
 
     /// Merges the pull request, at the commit everything was judged on.
     fn merge(&mut self) -> Result<Outcome> {
+        // One merge at a time per repository. Without this, two issues can
+        // both see an unmoved base branch and both merge, and the second
+        // lands on code it was never verified with. It covers this machine's
+        // runs. A person or another machine merging in that moment is only
+        // stopped by a GitHub rule that branches be up to date.
+        let _turn = lock::acquire(&self.home, &format!("merge-{}", util::repo_dir_name(&self.repo)), &|| println!("  merge: waiting for another issue's merge to finish"))?;
         // The base branch may have moved while GitHub was checking.
         match self.sync("merge")? {
             Outcome::Pass => {}
@@ -1644,6 +1676,7 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     let repo = repo_name(&repo_dir)?;
     let home = util::home()?;
     let store = Store::open(&home)?;
+    let machine = config::Config::load(&home)?;
 
     let issue = issue::load(&repo, opts.issue)?;
     println!("run {repo}#{} {}/{}: {}", issue.number, issue.plan, issue.key, issue.title);
@@ -1781,6 +1814,7 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     let mut run = Run {
         store: &store,
         home: home.clone(),
+        config: machine.clone(),
         repo: repo.clone(),
         issue: &issue,
         run_id: run_id.clone(),

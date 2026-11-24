@@ -7,7 +7,6 @@
 use super::state::{IssueRow, Store};
 use super::{first_line, git, github, lock, repo_name, util, Summary};
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 pub struct HandoffOptions {
@@ -23,12 +22,6 @@ pub struct Entry {
     /// (step, vendor, verdict, seconds, pass)
     pub steps: Vec<(String, Option<String>, String, f64, u32)>,
     pub summary: Option<Summary>,
-}
-
-#[derive(Default, Deserialize)]
-struct Config {
-    /// Folder for handoff documents. `~` is the home directory.
-    handoffs: Option<String>,
 }
 
 fn result_of(row: &IssueRow) -> &'static str {
@@ -136,7 +129,7 @@ pub fn export(opts: &HandoffOptions) -> Result<Vec<PathBuf>> {
     if date.len() != 10 || date.chars().filter(|c| *c == '-').count() != 2 {
         bail!("the date must look like 2026-11-24, and '{date}' does not");
     }
-    let config: Config = std::fs::read_to_string(home.join("config.yaml")).ok().and_then(|text| crate::yaml::from_str(&text).ok()).unwrap_or_default();
+    let config = super::config::Config::load(&home)?;
     let folder = opts.out.clone().or(config.handoffs.as_deref().map(expand)).unwrap_or_else(|| home.join("handoffs"));
 
     let rows: Vec<IssueRow> = store.issues()?.into_iter().filter(|row| row.updated_at.starts_with(&date)).collect();

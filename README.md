@@ -24,7 +24,7 @@ factory workflow validate --repo-dir <checkout>
 factory workflow propose --file <factory.yaml> --repo-dir <checkout>
 factory module list --repo-dir <checkout>
 factory module new <kind>/<name> --repo-dir <checkout>
-factory capacity
+factory capacity [--write] [--prepare]
 factory serve --repo-dir <checkout>
 factory status
 ```
@@ -46,7 +46,7 @@ factory status
 | `workflow propose` | Checks a workflow file, then opens a pull request that replaces `factory.yaml` with it | 1 when it is not valid |
 | `module list` | Lists the built-in modules and the repository's own | |
 | `module new` | Opens a pull request that adds a new module's files. `--dry-run` prints them | |
-| `capacity` | Reads what this machine has, checks the tools a run needs, and proposes how much to run at once. Changes nothing | 1 when something needs attention |
+| `capacity` | Reads what this machine has, checks the tools a run needs, and proposes how much to run at once. Changes nothing unless told: `--write` saves the proposal as this machine's pools, `--prepare` creates the simulators for them | 1 when something needs attention |
 | `serve` | Serves the local API that the app and other clients use | |
 | `status` | Shows where each issue stands, from the state database. `--refresh` first corrects it from GitHub, for pull requests a person merged or closed by hand | |
 
@@ -275,7 +275,7 @@ The engine returns data and no layout. Clients poll: there is no event stream ye
 | --- | --- |
 | Ready | The issue was made by `plan create`, is open, carries the label, and everything it is blocked by is closed. GitHub's blocked-by links are the graph |
 | Order | `priority:high`, then unlabelled or `priority:normal`, then `priority:low`. Lower issue numbers first within one priority |
-| At once | Up to `--parallel` issues, 2 by default. Two issues whose scopes overlap never run together, whatever the plan said |
+| At once | Up to `--parallel` issues. By default 2, or the size of this machine's simulator pool when that is larger. Two issues whose scopes overlap never run together, whatever the plan said |
 | Held back | An issue with the `blocked` label waits for a person. An issue the queue already ran is not started twice in one session |
 
 Each issue runs as its own `factory run` process, with its output in `~/.factory/queue/<repo>/`. One that dies takes nothing else with it.
@@ -283,15 +283,16 @@ Each issue runs as its own `factory run` process, with its output in `~/.factory
 What keeps parallel runs apart:
 
 - **A lock per issue.** A second process for the same issue is refused.
-- **The simulator lock.** A module names shared resources in `locks`, and the engine holds them while its command runs. Development happens in parallel. Verify, which needs the simulator, does not.
+- **Resource pools.** A module names shared resources in `locks`, and the engine holds one slot of each while its command runs. A pool has one slot unless this machine's config says more, so by default verify, which needs the simulator, runs one at a time. See [Pools](#pools).
 - **A lock around shared git state.** Fetches, pushes and worktree changes in one checkout take turns.
 - **The moved-base check.** When one issue merges while another is still working, the second merges the base branch in and is judged again.
+- **One merge at a time per repository.** The last look at the base branch and the merge happen under one lock. Without it two issues could both see an unmoved base and both merge, and the second would land on code it was never verified with. This covers the runs of one machine. Against a person or a second machine merging in that moment, only a GitHub rule that branches be up to date helps.
 
 Locks are files under `~/.factory/locks/`, held with the operating system's file lock. The system releases them when a process exits, so a crash leaves none behind.
 
 ### What a machine can run at once
 
-`factory capacity` answers that from the machine itself. It changes nothing and starts nothing.
+`factory capacity` answers that from the machine itself. On its own it changes nothing and starts nothing.
 
 | It reports | From |
 | --- | --- |
@@ -310,7 +311,35 @@ The proposal for simulator steps is the smaller of two limits, and never more th
 
 Those come from one measurement, of the trial app on a 12-core, 96 GB Mac, written up in [docs/findings/2026-11-24-capacity.md](docs/findings/2026-11-24-capacity.md). The trial app builds in seconds. A project with a long build needs more cores per step, and should be measured.
 
-The proposal is not yet used. The engine still holds one `simulator` lock, so one simulator step runs at a time.
+### Pools
+
+A pool is a resource with a number of slots, counted across every project on the machine. They live in `~/.factory/config.yaml`:
+
+```yaml
+pools:
+  simulator: 3
+  codex: 2
+  claude: 2
+```
+
+| Pool | Who takes a slot | With no entry |
+| --- | --- | --- |
+| A name a module lists in `locks`, such as `simulator` | A check step, for as long as its command runs | 1 slot |
+| A vendor name, `codex` or `claude` | An agent call, for that call only. A call waiting out a usage limit gives its slot back | No cap |
+
+With no config file the engine behaves as before: one simulator step at a time and no cap on agent calls.
+
+```
+factory capacity --write      # save the proposal as this machine's pools
+factory capacity --prepare    # create the simulators the simulator pool needs
+```
+
+- **`--write`** replaces `pools` with the proposal and keeps the file's other settings. Edit the file by hand to choose other numbers.
+- **`--prepare`** creates `factory-sim-1` to `factory-sim-N` on the newest iOS, boots each once, waits for the machine to calm down and shuts it down. A simulator's first boot keeps the machine busy for minutes, and that should not happen in the middle of a run.
+
+A check is told its slot in the environment, as `FACTORY_SLOT_<POOL>`, for example `FACTORY_SLOT_SIMULATOR=2`. What the slot means is the project's business. The template's `verify.sh` uses the simulator named `factory-sim-<slot>`. Slot 1 falls back to the `SIMULATOR` it names when that simulator does not exist. Any other slot fails with a message to run `--prepare`, because two verifies on one simulator would break each other.
+
+Slots are lock files, `~/.factory/locks/<pool>-<slot>.lock`. A run that crashes gives its slot back, as with every lock.
 
 ### Picking up an interrupted run
 
@@ -410,6 +439,7 @@ cargo install --path .
 | `app/` | The macOS app, a Swift package |
 | `src/engine/lock.rs` | Locks that hold across processes |
 | `src/engine/capacity.rs` | What the machine has, and how much to run at once |
+| `src/engine/config.rs` | This machine's settings: pools, the handoff folder |
 | `src/engine/github.rs` | Checks, the review verdict and the merge, each tied to one commit |
 | `tests/fix_loop.rs` | The real engine run against stand-ins for `gh`, `codex` and `claude` |
 | `src/engine/flows.rs` | What the engine checks in a flow file without running it |

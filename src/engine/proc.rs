@@ -19,6 +19,8 @@ pub struct Spec<'a> {
     pub stdout: &'a Path,
     pub stderr: &'a Path,
     pub timeout: Duration,
+    /// Added to the child's environment.
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,7 @@ pub fn run(spec: &Spec) -> Result<Outcome> {
     let mut command = Command::new(spec.program);
     command
         .args(&spec.args)
+        .envs(spec.env.iter().map(|(key, value)| (key, value)))
         .current_dir(spec.cwd)
         .stdin(if spec.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(stdout)
@@ -105,7 +108,19 @@ mod tests {
             stdout: out,
             stderr: err,
             timeout: Duration::from_secs(secs),
+            env: vec![("FACTORY_TEST_VALUE".to_string(), "from the engine".to_string())],
         }
+    }
+
+    #[test]
+    fn a_child_sees_what_the_engine_adds_to_its_environment() {
+        let dir = std::env::temp_dir().join(format!("factory-proc-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, err) = (dir.join("out"), dir.join("err"));
+        let outcome = run(&spec(&dir, &["-c", "echo \"$FACTORY_TEST_VALUE\""], None, &out, &err, 5)).unwrap();
+        assert!(outcome.ok());
+        assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "from the engine");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

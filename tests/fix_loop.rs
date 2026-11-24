@@ -134,10 +134,18 @@ elif method == "PUT" and (found := match(r"repos/o/r/pulls/(\d+)/merge")):
     number = int(found.group(1)) - 2
     if os.environ.get("STUB_REAL_MERGE"):
         # Squash the branch into dev, as GitHub would, so later issues start from it.
+        # GitHub takes merges one at a time, and takes one whose branch is behind.
+        import fcntl
+        turn = open(f"{stub}/merge.lock", "w")
+        fcntl.flock(turn, fcntl.LOCK_EX)
+        branch = branch_of(number)
+        behind = subprocess.run(["git", "--git-dir", origin, "merge-base", "--is-ancestor", "dev", branch]).returncode != 0
+        # Behind means: what was verified is not what dev will hold after this merge.
+        open(f"{stub}/events", "a").write(f"merge {number} {'behind' if behind else 'current'}\n")
         work = f"{stub}/merge-work-{number}"
         run = lambda *c: subprocess.run(["git", *c], cwd=work, check=True, capture_output=True)
         subprocess.run(["git", "clone", "--quiet", origin, work], check=True)
-        run("merge", "--squash", f"origin/{branch_of(number)}")
+        run("merge", "--squash", f"origin/{branch}")
         run("commit", "--quiet", "-m", json.loads(body)["commit_title"])
         run("push", "--quiet", "origin", "dev")
     save("merge", number, body)
@@ -312,9 +320,9 @@ if [ "$1" = "--red" ]; then echo "red: $*"; exit 0; fi
 if [ -f "$STUB_DIR/issues.json" ]; then
   # Several issues share this "simulator". Leave a trace of who used it when.
   name=$(basename "$(pwd)")
-  echo "verify-start $name" >> "$STUB_DIR/events"
+  echo "verify-start $name slot${FACTORY_SLOT_SIMULATOR:-none}" >> "$STUB_DIR/events"
   sleep 1
-  echo "verify-end $name" >> "$STUB_DIR/events"
+  echo "verify-end $name slot${FACTORY_SLOT_SIMULATOR:-none}" >> "$STUB_DIR/events"
 fi
 if grep -rq FIXED Sources 2>/dev/null; then echo "all good"; exit 0; fi
 echo "Sources/A.swift lacks the FIXED marker"
@@ -443,6 +451,10 @@ impl Trial {
             .output()
             .unwrap();
         let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        // Whatever else a queue scenario is about: nothing may merge on a
+        // branch that lacks what merged before it, because that was never verified.
+        let behind: Vec<String> = self.events().into_iter().filter(|e| e.starts_with("merge ") && e.ends_with(" behind")).collect();
+        assert!(behind.is_empty(), "merged without the latest dev: {behind:?} in {:?}\n{text}", self.events());
         (output, text)
     }
 
@@ -461,7 +473,31 @@ impl Trial {
         (output, text)
     }
 
-    /// What the stand-ins did, in order: `dev-start 7`, `verify-end issue-8`, ...
+    /// Sets this machine's pool sizes, as `factory capacity --write` would.
+    fn with_pools(self, pools: &str) -> Trial {
+        fs::write(self.dir.join("home/config.yaml"), format!("pools: {pools}\n")).unwrap();
+        self
+    }
+
+    /// The largest number of verify runs inside at once, and every slot that
+    /// was used. Panics when two runs held the same slot at the same time.
+    fn verify_overlap(&self) -> (usize, std::collections::BTreeSet<String>) {
+        let (mut inside, mut most, mut seen) = (Vec::new(), 0, std::collections::BTreeSet::new());
+        for event in self.events() {
+            let slot = event.rsplit(' ').next().unwrap().to_string();
+            if event.starts_with("verify-start") {
+                assert!(!inside.contains(&slot), "two verify runs held {slot} at once: {:?}", self.events());
+                seen.insert(slot.clone());
+                inside.push(slot);
+                most = most.max(inside.len());
+            } else if event.starts_with("verify-end") {
+                inside.retain(|held| held != &slot);
+            }
+        }
+        (most, seen)
+    }
+
+    /// What the stand-ins did, in order: `dev-start 7`, `verify-end issue-8 slot1`, ...
     fn events(&self) -> Vec<String> {
         self.stub("events").lines().map(str::to_string).collect()
     }
@@ -881,18 +917,71 @@ fn independent_issues_are_developed_at_once_and_share_the_simulator_in_turn() {
     // Both developers were at work before either had finished.
     let first_end = trial.position("dev-end 7").min(trial.position("dev-end 8"));
     assert!(trial.position("dev-start 7") < first_end && trial.position("dev-start 8") < first_end, "{:?}", trial.events());
-    // Verify held the simulator lock: no run started while another was inside.
+    // With no pools set there is one simulator: no run started while another was inside.
+    let (most, slots) = trial.verify_overlap();
+    assert_eq!(most, 1, "two verify runs overlapped: {:?}", trial.events());
+    assert_eq!(slots.into_iter().collect::<Vec<_>>(), ["slot1"]);
+    // The issue that merged second took in the first one's merge and was judged again.
+    assert!(trial.events().iter().filter(|e| e.starts_with("verify-start")).count() >= 3, "{:?}", trial.events());
+}
+
+#[test]
+fn a_simulator_pool_of_two_lets_two_verifies_in_and_keeps_the_third_out() {
+    let trial = Trial::build("q-pool", &github_workflow(2), ISSUE_BODY).with_pools("{ simulator: 2 }").with_issues(&[
+        (7, "a", "Sources/I7/", &["today"], &[]),
+        (8, "b", "Sources/I8/", &["today"], &[]),
+        (9, "c", "Sources/I9/", &["today"], &[]),
+    ]);
+    let (output, text) = trial.queue(&["--parallel", "3"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Blocked: none") && text.contains("Pull request open: none"), "{text}");
+    let files = trial.dev_files();
+    assert!(["Sources/I7/File.swift", "Sources/I8/File.swift", "Sources/I9/File.swift"].iter().all(|f| files.contains(f)), "{files}");
+    // Two at once, never three, and each run was told a slot of its own.
+    let (most, slots) = trial.verify_overlap();
+    assert_eq!(most, 2, "{:?}", trial.events());
+    assert_eq!(slots.into_iter().collect::<Vec<_>>(), ["slot1", "slot2"]);
+    // Each run's own log says which slot it was given.
+    let logs: String = fs::read_dir(trial.dir.join("home/queue/o__r")).unwrap().map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap()).collect();
+    assert!(logs.contains("simulator 1 of 2") && logs.contains("simulator 2 of 2"), "{logs}");
+}
+
+#[test]
+fn the_queue_runs_as_many_issues_as_the_simulator_pool_holds() {
+    let trial = Trial::build("q-pool-default", &github_workflow(2), ISSUE_BODY).with_pools("{ simulator: 3 }").with_issues(&[
+        (7, "a", "Sources/I7/", &["today"], &[]),
+        (8, "b", "Sources/I8/", &["today"], &[]),
+        (9, "c", "Sources/I9/", &["today"], &[]),
+    ]);
+    // No --parallel: the pool decides.
+    let (output, text) = trial.queue(&[]);
+    assert!(output.status.success(), "{text}");
+    // All three were started before any had ended.
+    assert!(text.contains("up to 3 at once"), "{text}");
+    let first_end = text.find(" ended after ").unwrap();
+    assert!(["#7 a started", "#8 b started", "#9 c started"].iter().all(|s| text.find(s).is_some_and(|at| at < first_end)), "{text}");
+    // Three slots, and nobody was ever given a slot somebody else held.
+    let (most, slots) = trial.verify_overlap();
+    assert!(most >= 2 && slots.len() >= 2, "{:?}", trial.events());
+}
+
+#[test]
+fn a_vendor_pool_of_one_makes_developers_take_turns() {
+    let trial = Trial::build("q-vendor-pool", &github_workflow(2), ISSUE_BODY)
+        .with_pools("{ codex: 1 }")
+        .with_issues(&[(7, "a", "Sources/I7/", &["today"], &[]), (8, "b", "Sources/I8/", &["today"], &[])]);
+    let (output, text) = trial.queue(&["--parallel", "2"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Merged:") && text.contains("Blocked: none"), "{text}");
     let mut inside = 0;
     for event in trial.events() {
-        if event.starts_with("verify-start") {
+        if event.starts_with("dev-start") {
             inside += 1;
-            assert_eq!(inside, 1, "two verify runs overlapped: {:?}", trial.events());
-        } else if event.starts_with("verify-end") {
+            assert_eq!(inside, 1, "two developers were at work at once: {:?}", trial.events());
+        } else if event.starts_with("dev-end") {
             inside -= 1;
         }
     }
-    // The issue that merged second took in the first one's merge and was judged again.
-    assert!(trial.events().iter().filter(|e| e.starts_with("verify-start")).count() >= 3, "{:?}", trial.events());
 }
 
 #[test]

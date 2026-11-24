@@ -8,7 +8,9 @@
 //!
 //! It only reads. Nothing is changed and nothing is started.
 
+use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::process::Command;
 
 // The numbers below come from one measurement: the trial app's verify on a
@@ -93,6 +95,8 @@ pub struct Report {
     pub simulators: Option<Simulators>,
     pub proposal: Proposal,
     pub room_now: Room,
+    /// The pools this machine's config sets. Empty means one of everything.
+    pub pools: BTreeMap<String, u32>,
     pub warnings: Vec<String>,
 }
 
@@ -249,6 +253,113 @@ fn simulators() -> Option<Simulators> {
     count_simulators(&text)
 }
 
+/// The pool sizes a proposal stands for, as the machine config holds them.
+pub fn pools_of(proposal: &Proposal) -> BTreeMap<String, u32> {
+    BTreeMap::from([
+        ("simulator".to_string(), proposal.simulator_steps),
+        ("codex".to_string(), proposal.agent_calls_per_vendor),
+        ("claude".to_string(), proposal.agent_calls_per_vendor),
+    ])
+}
+
+/// The name of the simulator that belongs to a slot. A repository's
+/// `verify.sh` looks for this name.
+pub fn simulator_name(slot: u32) -> String {
+    format!("factory-sim-{slot}")
+}
+
+/// `simctl`'s answer as JSON.
+fn simctl_json(what: &str) -> Result<serde_json::Value> {
+    let (ok, text) = output("xcrun", &["simctl", "list", what, "-j"]).ok_or_else(|| anyhow!("xcrun is not available"))?;
+    if !ok {
+        bail!("simctl could not list {what}: {}", first_line(&text));
+    }
+    serde_json::from_str(&text).map_err(|e| anyhow!("simctl's list of {what} is not JSON: {e}"))
+}
+
+/// The runtime to make a simulator on: the newest iOS, and of two runtimes
+/// with that version the plainly named one.
+pub fn pick_runtime(keys: &[String]) -> Option<String> {
+    let newest = keys.iter().filter_map(|key| runtime_version(key)).max()?;
+    keys.iter().filter(|key| runtime_version(key).as_ref() == Some(&newest)).min_by_key(|key| key.len()).cloned()
+}
+
+/// Makes sure the simulators for `count` slots exist and have been used
+/// once. A simulator's first boot indexes and migrates for minutes, which
+/// must not happen in the middle of a run. Returns what it did, per slot.
+pub fn prepare_simulators(count: u32) -> Result<Vec<String>> {
+    let devices = simctl_json("devices")?;
+    let lists = devices.get("devices").and_then(|d| d.as_object()).ok_or_else(|| anyhow!("simctl listed no devices"))?;
+    let existing = |name: &str| -> Option<String> {
+        lists.values().filter_map(|list| list.as_array()).flatten().find(|d| d.get("name").and_then(|n| n.as_str()) == Some(name)).and_then(|d| d.get("udid")?.as_str().map(str::to_string))
+    };
+    let keys: Vec<String> = lists.keys().cloned().collect();
+    let runtime = pick_runtime(&keys).ok_or_else(|| anyhow!("no iOS simulator runtime is installed"))?;
+    let types = simctl_json("devicetypes")?;
+    let type_list = types.get("devicetypes").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    let named = |wanted: &str| type_list.iter().find(|t| t.get("name").and_then(|n| n.as_str()) == Some(wanted));
+    // A plain current iPhone. Any iPhone will do when that model is not there.
+    let device_type = named("iPhone 17")
+        .or_else(|| type_list.iter().rev().find(|t| t.get("name").and_then(|n| n.as_str()).is_some_and(|n| n.starts_with("iPhone"))))
+        .and_then(|t| t.get("identifier")?.as_str().map(str::to_string))
+        .ok_or_else(|| anyhow!("no iPhone device type is installed"))?;
+
+    let mut done = Vec::new();
+    for slot in 1..=count {
+        let name = simulator_name(slot);
+        if existing(&name).is_some() {
+            println!("  {name}: already there");
+            done.push(format!("{name}: already there"));
+            continue;
+        }
+        println!("  {name}: creating, then using it once. This takes a few minutes and keeps the machine busy");
+        // How idle the machine is before the boot. "Calm again" is measured against this.
+        let before = idle_now();
+        let (ok, udid) = output("xcrun", &["simctl", "create", &name, &device_type, &runtime]).ok_or_else(|| anyhow!("xcrun is not available"))?;
+        if !ok {
+            bail!("could not create {name}: {}", first_line(&udid));
+        }
+        let udid = first_line(&udid);
+        let _ = output("xcrun", &["simctl", "boot", &udid]);
+        let _ = output("xcrun", &["simctl", "bootstatus", &udid]);
+        // Maestro installs its driver on first contact. Do that now too.
+        let _ = Command::new("maestro").args(["--device", &udid, "hierarchy"]).env("MAESTRO_CLI_NO_ANALYTICS", "1").output();
+        // Its first boot is over when the machine has calmed down: three
+        // readings in a row near what it was before, and not in the first minute.
+        let started = std::time::Instant::now();
+        let limit = std::time::Duration::from_secs(FIRST_BOOT_WAIT_SECONDS);
+        let mut calm = 0;
+        while calm < 3 && started.elapsed() < limit {
+            let idle = idle_now();
+            let early = started.elapsed() < std::time::Duration::from_secs(60);
+            calm = if !early && calm_again(before, idle) { calm + 1 } else { 0 };
+        }
+        let _ = output("xcrun", &["simctl", "shutdown", &udid]);
+        if calm >= 3 {
+            println!("  {name}: ready after {} s", started.elapsed().as_secs());
+        } else {
+            println!("  {name}: the machine was still busy after {} s. Shut down anyway, its next boot may be slow", started.elapsed().as_secs());
+        }
+        done.push(format!("{name}: created"));
+    }
+    Ok(done)
+}
+
+/// The longest `prepare_simulators` waits for one simulator's first boot to settle.
+const FIRST_BOOT_WAIT_SECONDS: u64 = 600;
+
+/// The CPU's idle share over the next five seconds, in percent.
+fn idle_now() -> Option<u32> {
+    output("top", &["-l", "2", "-n", "0", "-s", "5"]).and_then(|(_, text)| text.lines().rev().find(|l| l.starts_with("CPU usage")).and_then(parse_idle))
+}
+
+/// Whether the machine is about as idle as it was before. A machine that
+/// was busy to begin with is never asked to be idler than it was.
+fn calm_again(before: Option<u32>, now: Option<u32>) -> bool {
+    let wanted = before.map_or(70, |b| b.saturating_sub(10).min(70));
+    now.is_some_and(|idle| idle >= wanted)
+}
+
 /// Reads the machine. Takes a few seconds: several tools are asked for their version.
 pub fn read() -> Report {
     let machine = machine();
@@ -278,7 +389,8 @@ pub fn read() -> Report {
         )),
         Some(_) => {}
     }
-    Report { machine, tools, simulators, proposal, room_now, warnings }
+    let pools = super::util::home().ok().and_then(|home| super::config::Config::load(&home).ok()).map(|c| c.pools).unwrap_or_default();
+    Report { machine, tools, simulators, proposal, room_now, pools, warnings }
 }
 
 impl Tool {
@@ -320,8 +432,15 @@ pub fn print(report: &Report) {
             println!("  - {warning}");
         }
     }
-    println!("these numbers are a proposal, sized from the trial app, which builds in seconds.");
-    println!("the engine still runs one simulator step at a time");
+    println!("in use on this machine");
+    if report.pools.is_empty() {
+        println!("  no pools are set: one simulator step at a time, and no cap on agent calls");
+        println!("  `factory capacity --write` sets the proposal above. `--prepare` makes the simulators for it");
+    } else {
+        let set: Vec<String> = report.pools.iter().map(|(name, size)| format!("{name} {size}")).collect();
+        println!("  {}", set.join(", "));
+    }
+    println!("the proposal is sized from the trial app, which builds in seconds. A long build needs more cores per step");
 }
 
 #[cfg(test)]
@@ -403,6 +522,31 @@ mod tests {
         assert_eq!(runtime_version("com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4"), Some(vec![27, 2]));
         assert_eq!(runtime_version("com.apple.CoreSimulator.SimRuntime.tvOS-27-2"), None);
         assert!(count_simulators("{}").is_none());
+    }
+
+    #[test]
+    fn a_proposal_becomes_pools_and_slots_have_simulators() {
+        let pools = pools_of(&propose(&machine(12, 8, 96)));
+        assert_eq!(pools.get("simulator"), Some(&3));
+        assert_eq!((pools.get("codex"), pools.get("claude")), (Some(&2), Some(&2)));
+        assert_eq!(simulator_name(2), "factory-sim-2");
+        // Of two runtimes with the newest version, the plainly named one.
+        let keys: Vec<String> = ["com.apple.CoreSimulator.SimRuntime.iOS-26-5", "com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4", "com.apple.CoreSimulator.SimRuntime.iOS-27-2", "com.apple.CoreSimulator.SimRuntime.tvOS-27-2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(pick_runtime(&keys).as_deref(), Some("com.apple.CoreSimulator.SimRuntime.iOS-27-2"));
+        assert_eq!(pick_runtime(&["com.apple.CoreSimulator.SimRuntime.tvOS-27-2".to_string()]), None);
+    }
+
+    #[test]
+    fn calm_is_judged_against_how_idle_the_machine_was() {
+        // An idle machine must come back to 70%.
+        assert!(calm_again(Some(95), Some(72)) && !calm_again(Some(95), Some(60)));
+        // One that idled at 66% is calm again at 56%, not before.
+        assert!(calm_again(Some(66), Some(58)) && !calm_again(Some(66), Some(40)));
+        // No reading is not calm. No reading before means the plain 70%.
+        assert!(!calm_again(Some(66), None) && calm_again(None, Some(70)) && !calm_again(None, Some(69)));
     }
 
     #[test]

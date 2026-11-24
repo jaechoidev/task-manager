@@ -49,9 +49,52 @@ pub fn acquire(home: &Path, name: &str, on_wait: &dyn Fn()) -> Result<Held> {
     Ok(Held { _file: file })
 }
 
+/// Takes one slot of a pool of `size`, waiting while every slot is in use.
+/// Returns the slot's number, from 1, with its lock. Whoever holds slot 2 of
+/// `simulator` is the only one using the second simulator.
+pub fn acquire_slot(home: &Path, name: &str, size: u32, on_wait: &dyn Fn()) -> Result<(Held, u32)> {
+    let size = size.max(1);
+    let mut waited = false;
+    loop {
+        for slot in 1..=size {
+            if let Some(held) = try_acquire(home, &format!("{name}-{slot}"))? {
+                return Ok((held, slot));
+            }
+        }
+        if !waited {
+            on_wait();
+            waited = true;
+        }
+        // The system has no way to wait on several files at once.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pool_hands_out_each_slot_once() {
+        let home = std::env::temp_dir().join(format!("factory-lock-pool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let (first, a) = acquire_slot(&home, "simulator", 2, &|| panic!("a free pool should not wait")).unwrap();
+        let (second, b) = acquire_slot(&home, "simulator", 2, &|| panic!("one slot is still free")).unwrap();
+        assert_eq!((a, b), (1, 2));
+        // Both are taken. A third taker waits, and gets whichever is released.
+        let waited = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let third = scope.spawn(|| acquire_slot(&home, "simulator", 2, &|| waited.store(true, std::sync::atomic::Ordering::SeqCst)).map(|(_, slot)| slot).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            drop(second);
+            assert_eq!(third.join().unwrap(), 2);
+        });
+        assert!(waited.load(std::sync::atomic::Ordering::SeqCst));
+        // Another pool is not affected, and a size of zero still gives one slot.
+        assert_eq!(acquire_slot(&home, "codex", 0, &|| {}).unwrap().1, 1);
+        drop(first);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn a_lock_is_exclusive_until_dropped() {

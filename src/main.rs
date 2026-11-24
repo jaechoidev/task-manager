@@ -61,9 +61,10 @@ enum Top {
         /// Only issues with this label are picked
         #[arg(long, default_value = "today")]
         label: String,
-        /// How many issues may run at once
-        #[arg(long, default_value_t = 2)]
-        parallel: usize,
+        /// How many issues may run at once. Two, or the size of this
+        /// machine's simulator pool when that is larger
+        #[arg(long)]
+        parallel: Option<usize>,
         /// Leave every merge to a person
         #[arg(long)]
         no_merge: bool,
@@ -122,6 +123,14 @@ enum Top {
     Capacity {
         #[arg(long, value_enum, default_value_t = CapacityFormat::Text)]
         format: CapacityFormat,
+        /// Write the proposed pool sizes to this machine's config, so the
+        /// engine uses them
+        #[arg(long)]
+        write: bool,
+        /// Create the simulators the simulator pool needs, and use each once
+        /// so its slow first boot is over
+        #[arg(long)]
+        prepare: bool,
     },
     /// Serve the local API that the app and other clients use
     Serve {
@@ -368,6 +377,8 @@ fn run() -> Result<bool> {
         }
 
         Top::Queue { repo_dir, label, parallel, no_merge } => {
+            let pool = engine::config::Config::load(&engine::util::home()?)?.pool("simulator") as usize;
+            let parallel = parallel.unwrap_or(pool.max(2));
             engine::queue::run(&engine::queue::QueueOptions { repo_dir, label, parallel, no_merge })
         }
 
@@ -463,8 +474,23 @@ fn run() -> Result<bool> {
             Ok(true)
         }
 
-        Top::Capacity { format } => {
-            quiet_on_closed_pipe();
+        Top::Capacity { format, write, prepare } => {
+            if !write && !prepare {
+                quiet_on_closed_pipe();
+            }
+            let home = engine::util::home()?;
+            if write {
+                let proposal = engine::capacity::read().proposal;
+                let mut config = engine::config::Config::load(&home)?;
+                config.pools = engine::capacity::pools_of(&proposal);
+                config.save(&home)?;
+                println!("wrote the pools to {}", home.join("config.yaml").display());
+            }
+            if prepare {
+                let size = engine::config::Config::load(&home)?.pool("simulator");
+                println!("preparing {size} simulator(s)");
+                engine::capacity::prepare_simulators(size)?;
+            }
             let report = engine::capacity::read();
             match format {
                 CapacityFormat::Text => engine::capacity::print(&report),
