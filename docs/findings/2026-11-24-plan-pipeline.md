@@ -54,7 +54,7 @@ The goal was met: a project created from the template and the script, where a me
 
 1. **A repo generated from a template is empty for a few seconds.** GitHub answers 409 until the copy lands. `repo init` now waits.
 2. **`runner.temp` can't be read in job-level `env`.** Both workflows were invalid, and an invalid workflow fails on every push to any branch. Fixed in the template. On the trial repo the fix rode in with the plan pull request.
-3. **`dev` on the trial repo still has the invalid workflow files.** It was cut from `main` before the fix. Every push to `dev` will show two failed runs until `main` is merged into `dev`.
+3. **`dev` on the trial repo was cut from `main` before the fix,** so it still held the invalid workflow files. Fixed the same day by fast-forwarding `dev` to `main`. The push to `dev` started no runs.
 
 ## Open items
 
