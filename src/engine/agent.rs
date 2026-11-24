@@ -111,7 +111,10 @@ fn claude_args(call: &Call) -> Vec<String> {
             "dontAsk",
             &["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)"],
         ),
-        Access::WorkspaceWrite => ("acceptEdits", &["Read", "Glob", "Grep", "Edit", "Write", "Bash(./verify.sh)"]),
+        Access::WorkspaceWrite => (
+            "acceptEdits",
+            &["Read", "Glob", "Grep", "Edit", "Write", "Bash(./verify.sh)", "Bash(maestro check-syntax:*)"],
+        ),
     };
     let mut args: Vec<String> = ["-p", "--output-format", "json", "--json-schema", call.schema]
         .iter()

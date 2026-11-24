@@ -18,12 +18,20 @@ Read AGENTS.md first. The current directory is the repository at the commit unde
 
 {{accessibility_ids}}
 
+## Acceptance flows
+
+{{flows}}
+
+{{acceptance}}
+
 # What was verified
 
 - Commit under review: `{{head_sha}}`
-- `./verify.sh`: {{verify_result}}
+- `./verify.sh`, which builds the app and runs every flow in `.maestro/`: {{verify_result}}
 
-The change has already passed the scope gate and the build. Judge what those can't: whether the code meets each acceptance criterion, whether every accessibility ID is present on the right element, and whether there are bugs.
+The change has already passed the scope gate, the build and the flows. Judge what those can't: whether the code meets each acceptance criterion beyond what the flows check, whether every accessibility ID is on the right element, and whether there are bugs.
+
+If the flows miss an acceptance criterion, say so in `items` and ask for a flow that covers the gap. Don't ask the developer to edit a flow: it may not.
 
 # The developer's report
 

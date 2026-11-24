@@ -1,0 +1,10 @@
+name: acceptance-red
+kind: check
+needs: [worktree, acceptance_flows]
+produces: [red_log]
+# {{new_flows}} becomes the issue's new flow files. Passes only when each
+# one is valid and fails on the app as it is before development.
+run: ./verify.sh --red {{new_flows}}
+pass_when: exit_code == 0
+timeout_minutes: 20
+locks: [simulator]

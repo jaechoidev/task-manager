@@ -1,0 +1,12 @@
+name: acceptance
+kind: agent
+role: acceptance
+needs: [issue, worktree]
+produces: [acceptance_flows]
+prompt: prompt.md
+output_schema: report.schema.json
+# Used when the developer files a flow change request.
+ruling_prompt: ruling.md
+ruling_schema: ruling.schema.json
+access: workspace-write   # may write inside the worktree only; the engine owns git
+timeout_minutes: 15

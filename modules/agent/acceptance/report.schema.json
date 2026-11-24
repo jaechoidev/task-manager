@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "flows", "added_ids", "notes"],
+  "properties": {
+    "summary": { "type": "string" },
+    "flows": { "type": "array", "items": { "type": "string" } },
+    "added_ids": { "type": "array", "items": { "type": "string" } },
+    "notes": { "type": "string" }
+  }
+}

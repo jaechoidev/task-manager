@@ -2,7 +2,7 @@
 
 A deterministic task manager. Software owns the loop and every gate. An LLM is called only for bounded steps.
 
-So far it covers repo bootstrap, the plan pipeline, and one issue end to end: develop, verify, review, pull request. Fix loops, the acceptance stage, the queue and the daemon are not built yet.
+So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request. Fix loops, the queue and the daemon are not built yet.
 
 ## Commands
 
@@ -21,7 +21,7 @@ factory status
 | `repo preflight` | Reads every setting back from GitHub. Changes nothing | 1 when a setting is wrong |
 | `plan validate` | Checks plan files and prints the parallel batches. No network | 1 when a plan is invalid |
 | `plan create` | Creates issues, parent links and blocked-by links from valid plans. Safe to rerun | 1 when a plan is invalid |
-| `run` | Takes one issue through develop, verify and review, then opens a pull request into the default branch | 1 when a step fails |
+| `run` | Takes one issue through acceptance flows, develop, verify and review, then opens a pull request into the default branch | 1 when a step fails |
 | `status` | Shows where each issue stands, from the state database | |
 
 Exit code 2 means the command itself could not run.
@@ -54,18 +54,34 @@ The rest of the body repeats the same data as markdown for people.
 
 1. A fresh git worktree on the branch `factory/issue-<n>-<key>`, cut from the default branch.
 2. Each step of `factory.yaml`, read from the default branch:
+   - **acceptance**: one agent call, by a different vendor from the developer, that writes the Maestro flows the issue adds. The engine commits them as their own commit.
+   - **red**: `./verify.sh --red <new flows>`. It passes only when each new flow is valid Maestro and fails on the app as it is, which shows the flow tests something new.
    - **develop**: one headless agent call that may only write inside the worktree.
-   - **verify**: the repo's `./verify.sh`. Exit code 0 is the only pass.
+   - **verify**: the repo's `./verify.sh`, which builds the app and runs every flow. Exit code 0 is the only pass.
    - **review**: one read-only agent call, by a different vendor from the developer.
-3. Push, and open the pull request with the verified commit, the verify result and the review verdict in its body.
+3. Push, and open the pull request with the verified commit, the flows, the verify result and the review verdict in its body.
+
+The acceptance and red steps are skipped for an issue that adds no flow, and a repo without UI flows can leave them out of `factory.yaml`.
 
 What the engine does itself, and no workflow file can turn off:
 
 - Only the engine commits, pushes and opens pull requests. Agents are sandboxed and get no git or network commands.
-- After develop: git history must be untouched, `.maestro/` must be untouched, and every changed file must be inside the issue's scope.
-- After verify and after review: the branch must still be at the developer's commit, with a clean tree.
+- After acceptance: the writer must have written exactly the flow files the issue names as new, and nothing else. A flow may use only plain Maestro commands: no AI commands and no scripts. Every ID a flow looks for must be in the issue's list, declared by the writer as added, or already in the code.
+- After develop: git history must be untouched, `.maestro/` must be untouched, every changed file must be inside the issue's scope, and every accessibility ID must appear as a string literal inside that scope.
+- After every step: the branch must still be at the engine's latest commit, with a clean tree.
 - The reviewer must name the commit it judged, and it must be that commit.
 - Agent output must match its JSON schema. One retry, then the step fails.
+
+### Accessibility IDs
+
+The plan names the IDs for the elements an issue adds. The acceptance writer uses them, and may add IDs it needs. Added IDs must follow the naming rule in the repo's `AGENTS.md`. The engine comments them on the issue and hands the full list to the developer.
+
+### Flow change requests
+
+The developer may not edit a flow. When it thinks one is wrong, it says so in `flow_change_request` in its report. The engine then asks the acceptance writer to rule:
+
+- **Accept**: the writer edits the flow. It may change only the flows the issue lists, and only use IDs that are in the code. The engine commits the change as its own commit, and verify and review judge that commit.
+- **Reject**: the code must change. Without a fix loop, the run stops here.
 
 There is no fix loop yet. A failed step stops the run, records why, labels the issue `blocked` and keeps the worktree.
 
@@ -93,9 +109,20 @@ timeout_minutes: 20
 locks: [simulator]
 ```
 
-Built-in modules are in [modules/](modules/) and ship inside the binary: `agent/dev`, `agent/review`, `check/verify`. A repo overrides one by adding `modules/<kind>/<name>/` with the same file names on its default branch.
+Built-in modules are in [modules/](modules/) and ship inside the binary: `agent/acceptance`, `check/acceptance-red`, `agent/dev`, `check/verify`, `agent/review`. A repo overrides one by adding `modules/<kind>/<name>/` with the same file names on its default branch.
 
-Before a run, the engine checks that every `needs` is produced by an earlier step, that every `on_fail` target exists, that the dev step comes first, and that the reviewer's vendor differs from the developer's.
+A check's `run` may contain `{{new_flows}}`, which becomes the paths of the flows the issue adds.
+
+Before a run, the engine checks that every `needs` is produced by an earlier step, that every `on_fail` target exists, that an acceptance step comes before the dev step, and that the acceptance writer and the reviewer each use a different vendor from the developer.
+
+### What a repo's `verify.sh` must do
+
+| Call | Passes (exit 0) when |
+| --- | --- |
+| `./verify.sh` | The build and every flow in `.maestro/` pass |
+| `./verify.sh --red FLOW...` | Each named flow is valid Maestro, runs, and fails |
+
+The template repo's `verify.sh` does both for an Xcode project and an iOS simulator. It needs Maestro (`brew install mobile-dev-inc/tap/maestro`) and Java 17 or newer.
 
 ## Build and test
 
@@ -117,6 +144,7 @@ cargo install --path .
 | `src/plan/create.rs` | Issue bodies, creation and links, behind a `Github` trait |
 | `src/repo.rs` | `repo init` and the preflight |
 | `src/engine/mod.rs` | The run loop and the fixed gates |
+| `src/engine/flows.rs` | What the engine checks in a flow file without running it |
 | `src/engine/workflow.rs` | `factory.yaml` and `module.yaml` loading and checks |
 | `src/engine/agent.rs` | Headless calls to `codex exec` and `claude -p` |
 | `src/engine/state.rs` | The SQLite state and the request log |
