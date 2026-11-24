@@ -1,0 +1,8 @@
+name: stuck
+kind: judgment
+needs: [issue, worktree]
+produces: [decision]
+prompt: prompt.md
+output_schema: decision.schema.json
+access: read-only
+timeout_minutes: 10

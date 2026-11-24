@@ -68,6 +68,29 @@ enum Top {
         #[arg(long)]
         no_merge: bool,
     },
+    /// Start a stuck issue over: close the pull request and delete the
+    /// branch its last attempt left, then run it from nothing
+    Retry {
+        /// The issue number
+        issue: u64,
+        /// A checkout of the project repository
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+        /// Leave the merge to a person
+        #[arg(long)]
+        no_merge: bool,
+    },
+    /// Take a stuck issue off the queue: close its pull request, delete its
+    /// branch and worktree, and remove the labels that would pick it again
+    Drop {
+        /// The issue number
+        issue: u64,
+        /// A checkout of the project repository
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+    },
+    /// List the issues that are waiting for a person, with why
+    Blocked,
     /// Show where each issue stands, from the state database
     Status,
 }
@@ -240,11 +263,28 @@ fn run() -> Result<bool> {
         }
 
         Top::Run { issue, repo_dir, workflow, no_pr, no_merge, restart } => {
-            engine::run(&engine::RunOptions { repo_dir, issue, workflow_file: workflow, no_pr, no_merge, restart })
+            engine::run(&engine::RunOptions { repo_dir, issue, workflow_file: workflow, no_pr, no_merge, restart, take_over: false })
         }
 
         Top::Queue { repo_dir, label, parallel, no_merge } => {
             engine::queue::run(&engine::queue::QueueOptions { repo_dir, label, parallel, no_merge })
+        }
+
+        Top::Retry { issue, repo_dir, no_merge } => engine::run(&engine::RunOptions {
+            repo_dir,
+            issue,
+            workflow_file: None,
+            no_pr: false,
+            no_merge,
+            restart: true,
+            take_over: true,
+        }),
+
+        Top::Drop { issue, repo_dir } => engine::drop_issue(&repo_dir, issue),
+
+        Top::Blocked => {
+            engine::blocked()?;
+            Ok(true)
         }
 
         Top::Status => {

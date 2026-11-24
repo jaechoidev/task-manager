@@ -15,3 +15,7 @@ pub fn documents(text: &str) -> Result<Vec<serde_json::Value>, String> {
         .map(|document| serde_json::Value::deserialize(document).map_err(|e| e.to_string()))
         .collect()
 }
+
+pub fn to_string<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    serde_yaml_ng::to_string(value).map_err(|e| e.to_string())
+}

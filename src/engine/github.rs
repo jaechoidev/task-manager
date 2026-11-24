@@ -188,6 +188,13 @@ pub fn is_merged(repo: &str, pr: u64) -> Result<bool> {
     Ok(value.get("merged").and_then(Value::as_bool).unwrap_or(false))
 }
 
+/// Closes a pull request the engine opened, saying why.
+pub fn close_pr(repo: &str, pr: u64, why: &str) -> Result<()> {
+    gh::api("POST", &format!("repos/{repo}/issues/{pr}/comments"), Some(&json!({ "body": why })))?;
+    gh::api("PATCH", &format!("repos/{repo}/pulls/{pr}"), Some(&json!({ "state": "closed" })))?;
+    Ok(())
+}
+
 pub fn update_pr_body(repo: &str, pr: u64, body: &str) -> Result<()> {
     gh::api("PATCH", &format!("repos/{repo}/pulls/{pr}"), Some(&json!({ "body": body })))?;
     Ok(())

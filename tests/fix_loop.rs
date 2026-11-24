@@ -84,12 +84,23 @@ elif method == "GET" and (found := match(r"repos/o/r/issues/(\d+)")):
 elif method == "GET" and (found := match(r"repos/o/r/issues/(\d+)/dependencies/blocked_by.*")):
     out([{"number": n, "state": issue(n)["state"]} for n in issues()[found.group(1)].get("blocked_by", [])])
 elif method == "POST" and path == "repos/o/r/pulls":
-    number = int(re.search(r"factory/issue-(\d+)-", json.loads(body)["head"]).group(1))
+    head = re.search(r"factory/issue-(\d+)-", json.loads(body)["head"])
+    number = int(head.group(1)) if head else 90  # 90 stands for a plan pull request
     save("pr", number, body)
     out({"number": number + 2, "html_url": f"https://example.invalid/o/r/pull/{number + 2}"})
 elif method == "PATCH" and (found := match(r"repos/o/r/pulls/(\d+)")):
-    save("pr.update", int(found.group(1)) - 2, body)
+    if json.loads(body).get("state") == "closed":
+        open(f"{stub}/pr-closed-{int(found.group(1)) - 2}", "w").write("closed")
+    else:
+        save("pr.update", int(found.group(1)) - 2, body)
     out({})
+elif method == "GET" and path.startswith("repos/o/r/pulls?"):
+    # The open pull request for a branch, while its branch exists and it was not closed.
+    branch = re.search(r"head=o:([^&]*)", path).group(1).replace("%2F", "/")
+    issue_number = re.search(r"issue-(\d+)-", branch)
+    number = int(issue_number.group(1)) if issue_number else 90
+    is_open = os.path.exists(f"{stub}/pr-{number}.json") and not os.path.exists(f"{stub}/pr-closed-{number}") and git("rev-parse", "-q", "--verify", f"refs/heads/{branch}")
+    out([{"number": number + 2, "html_url": f"https://example.invalid/o/r/pull/{number + 2}"}] if is_open else [])
 elif method == "GET" and (found := match(r"repos/o/r/pulls/(\d+)")):
     out({"merged": os.path.exists(f"{stub}/merge-{int(found.group(1)) - 2}.json")})
 elif method == "GET" and "/check-runs" in path:
@@ -134,6 +145,8 @@ elif method == "PUT" and (found := match(r"repos/o/r/pulls/(\d+)/merge")):
     out({"merged": True})
 elif method == "DELETE" and path.startswith("repos/o/r/git/refs/heads/"):
     open(f"{stub}/deleted", "w").write(path)
+    if os.environ.get("STUB_REAL_DELETE"):
+        git("update-ref", "-d", path.replace("repos/o/r/git/", ""))
 elif method == "GET":
     out([])
 else:
@@ -148,6 +161,15 @@ echo "$*" > "$STUB_DIR/codex.args.$n"
 cat > "$STUB_DIR/codex.prompt.$n"
 out=""; prev=""
 for arg in "$@"; do [ "$prev" = "-o" ] && out="$arg"; prev="$arg"; done
+if grep -q "^You are the reviewer" "$STUB_DIR/codex.prompt.$n"; then
+  # The vendors were swapped: Codex reviews what Claude developed.
+  echo review >> "$STUB_DIR/codex.roles"
+  sha=$(sed -n 's/.*Commit under review: `\([0-9a-f]*\)`.*/\1/p' "$STUB_DIR/codex.prompt.$n" | head -1)
+  echo '{"thread_id":"stub-review-session"}'
+  echo "{\"verdict\":\"approve\",\"head_sha\":\"$sha\",\"summary\":\"looked at it\",\"items\":[]}" > "$out"
+  exit 0
+fi
+echo develop >> "$STUB_DIR/codex.roles"
 mkdir -p Sources
 if [ "$STUB_DEV" = "by-issue" ]; then
   # Each issue gets its own folder. The pause makes overlap in time visible.
@@ -204,6 +226,35 @@ echo "$n" > "$STUB_DIR/claude.count"
 echo "$*" > "$STUB_DIR/claude.args.$n"
 cat > "$STUB_DIR/claude.prompt.$n"
 reply() { echo "{\"type\":\"result\",\"is_error\":false,\"session_id\":\"stub-claude-$n\",\"structured_output\":$1}"; }
+if grep -q "^You decide what happens next" "$STUB_DIR/claude.prompt.$n"; then
+  echo judgment >> "$STUB_DIR/claude.roles"
+  j=$(( $(cat "$STUB_DIR/judge.count" 2>/dev/null || echo 0) + 1 ))
+  echo "$j" > "$STUB_DIR/judge.count"
+  cp "$STUB_DIR/claude.prompt.$n" "$STUB_DIR/judge.prompt.$j"
+  part() { echo "{\"key\":\"$1\",\"title\":\"Part $1\",\"summary\":\"One half.\",\"scope\":[\"$2\"],\"accept\":[\"It works\"],\"flows\":[],\"accessibility_ids\":[],\"depends_on\":[]}"; }
+  good="[$(part part-one Sources/P1/),$(part part-two Sources/P2/)]"
+  # Two unordered issues on the same path: the plan validator refuses this.
+  bad="[$(part part-one Sources/P1/),$(part part-two Sources/P1/)]"
+  case "$STUB_JUDGE" in
+    retry) reply '{"action":"retry","reason":"The developer went down a wrong path.","split":[]}' ;;
+    switch) reply '{"action":"switch-vendor","reason":"The same developer failed the same way.","split":[]}' ;;
+    dance) reply '{"action":"merge-anyway","reason":"It is close enough.","split":[]}' ;;
+    split) reply "{\"action\":\"split\",\"reason\":\"It mixes two changes.\",\"split\":$good}" ;;
+    bad-split-then-good)
+      if [ "$j" = 1 ]; then reply "{\"action\":\"split\",\"reason\":\"It mixes two changes.\",\"split\":$bad}"
+      else reply "{\"action\":\"split\",\"reason\":\"It mixes two changes.\",\"split\":$good}"; fi ;;
+    *) reply '{"action":"escalate","reason":"A person should look.","split":[]}' ;;
+  esac
+  exit 0
+fi
+if grep -q "^You are the developer" "$STUB_DIR/claude.prompt.$n"; then
+  # The vendors were swapped: Claude develops, and gets it right.
+  echo develop >> "$STUB_DIR/claude.roles"
+  mkdir -p Sources
+  printf 'let a = 1\n// FIXED\n' > Sources/A.swift
+  reply '{"summary":"claude did it","commit_subject":"feat(a): by the other vendor","files_changed":["Sources/A.swift"],"verify_ran":"not_run","notes":"","flow_change_request":null}'
+  exit 0
+fi
 if grep -q "Rule on that request" "$STUB_DIR/claude.prompt.$n"; then
   echo ruling >> "$STUB_DIR/claude.roles"
   if [ "$STUB_RULING" = accept ]; then
@@ -303,6 +354,8 @@ impl Trial {
         trial.git(&repo, &["commit", "--quiet", "-m", "start"]);
         trial.git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
         trial.git(&repo, &["push", "--quiet", "-u", "origin", "dev"]);
+        // Plans are proposed into main.
+        trial.git(&repo, &["push", "--quiet", "origin", "dev:main"]);
         trial.git(&repo, &["remote", "set-head", "origin", "dev"]);
         trial
     }
@@ -363,6 +416,21 @@ impl Trial {
             .envs([("STUB_DEV", "by-issue"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "green"), ("STUB_REAL_MERGE", "1")])
             .env("FACTORY_POLL_SECONDS", "0")
             .env("FACTORY_SETTLE_SECONDS", "0")
+            .output()
+            .unwrap();
+        let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        (output, text)
+    }
+
+    /// Runs any `factory` command against the trial's home.
+    fn cli(&self, args: &[&str], env: &[(&str, &str)]) -> (Output, String) {
+        let output = self
+            .command(env!("CARGO_BIN_EXE_factory"))
+            .args(args)
+            .envs(env.iter().copied())
+            .env("FACTORY_POLL_SECONDS", "0")
+            .env("FACTORY_SETTLE_SECONDS", "0")
+            .current_dir(self.dir.join("repo"))
             .output()
             .unwrap();
         let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -846,4 +914,149 @@ fn priority_and_labels_decide_what_runs_and_in_what_order() {
     assert!(text.contains("#11 held not run: it carries the 'blocked' label"), "{text}");
     assert!(text.contains("#12 waiting not run: it is blocked by #10, still open"), "{text}");
     assert!(!trial.events().iter().any(|e| e.ends_with(" 11") || e.ends_with(" 12") || e.ends_with(" 10")), "{:?}", trial.events());
+}
+
+/// A workflow with a judgment module, `rounds` fix rounds and `judgments`
+/// new attempts.
+fn judged_workflow(rounds: u32, judgments: u32) -> String {
+    format!(
+        "workflow:\n  - develop: {{ module: agent/dev, vendor: codex }}\n  - verify:  {{ module: check/verify }}\n  - review:  {{ module: agent/review, vendor: claude }}\non_fail:\n  verify: develop\n  review: develop\njudgment: {{ module: judgment/stuck, vendor: claude }}\nlimits:\n  fix_rounds: {rounds}\n  judgments: {judgments}\n"
+    )
+}
+
+#[test]
+fn a_judgment_of_retry_starts_the_issue_over_from_nothing() {
+    let trial = Trial::build("j-retry", &judged_workflow(0, 2), ISSUE_BODY);
+    let env = [("STUB_DEV", "fix-on-second"), ("STUB_REVIEW", "approve"), ("STUB_JUDGE", "retry")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("judgment: retry. The developer went down a wrong path."), "{text}");
+    assert!(text.contains("attempt 2, from nothing"), "{text}");
+    // A new session and a new worktree: nothing of the first attempt is left.
+    assert!(trial.stub("codex.args.2").starts_with("exec --cd "), "{}", trial.stub("codex.args.2"));
+    assert_eq!(trial.commits(), vec!["feat(a): attempt 2"]);
+    assert_eq!(trial.stub("claude.roles"), "judgment\nreview");
+    // The judgment saw what failed and what it may choose.
+    let prompt = trial.stub("judge.prompt.1");
+    assert!(prompt.contains("stopped at the `verify` step") && prompt.contains("Sources/A.swift lacks the FIXED marker"), "{prompt}");
+    assert!(prompt.contains("Available now: `retry`, `switch-vendor`, `split`, `escalate`."), "{prompt}");
+    assert!(trial.log().contains("\"step\":\"judgment\"") && trial.log().contains("\"verdict\":\"retry\""));
+}
+
+#[test]
+fn a_judgment_of_switch_vendor_swaps_who_develops_and_who_reviews() {
+    let trial = Trial::build("j-switch", &judged_workflow(0, 2), ISSUE_BODY);
+    let env = [("STUB_DEV", "never"), ("STUB_REVIEW", "approve"), ("STUB_JUDGE", "switch")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("the vendors are swapped for the next attempt"), "{text}");
+    assert_eq!(trial.stub("claude.roles"), "judgment\ndevelop");
+    assert_eq!(trial.stub("codex.roles"), "develop\nreview");
+    assert_eq!(trial.commits(), vec!["feat(a): by the other vendor"]);
+    // Each vendor is confined as its new role requires.
+    assert!(trial.stub("codex.args.2").contains("--sandbox read-only"), "{}", trial.stub("codex.args.2"));
+    let developer = trial.stub("claude.args.2");
+    assert!(developer.contains("--permission-mode acceptEdits") && developer.contains("blockWritesOutsideWorkingDirectories"), "{developer}");
+}
+
+#[test]
+fn an_answer_off_the_menu_goes_to_a_person() {
+    let trial = Trial::build("j-menu", &judged_workflow(0, 2), ISSUE_BODY);
+    let env = [("STUB_DEV", "never"), ("STUB_REVIEW", "approve"), ("STUB_JUDGE", "dance")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("The judgment chose `merge-anyway`, but that is not on the menu"), "{text}");
+    assert_eq!(trial.stub("codex.count"), "1");
+
+    // The person's list says what failed, what the judgment said, and what to do.
+    let (_, listed) = trial.cli(&["blocked"], &[]);
+    assert!(listed.contains("o/r#7 a"), "{listed}");
+    assert!(listed.contains("what failed: 0 fix rounds were used and 'verify' still fails"), "{listed}");
+    assert!(listed.contains("judgment: escalate. The judgment chose `merge-anyway`"), "{listed}");
+    assert!(listed.contains("`factory retry 7` starts it over"), "{listed}");
+}
+
+#[test]
+fn a_judgment_cannot_keep_an_issue_going_past_its_attempts() {
+    let trial = Trial::build("j-limit", &judged_workflow(0, 1), ISSUE_BODY);
+    let env = [("STUB_DEV", "never"), ("STUB_REVIEW", "approve"), ("STUB_JUDGE", "retry")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("FAILED at verify, in attempt 2"), "{text}");
+    assert!(text.contains("The judgment chose `retry`, but this issue has no new attempts left"), "{text}");
+    assert_eq!((trial.stub("codex.count").as_str(), trial.stub("judge.count").as_str()), ("2", "2"));
+    // The second judgment was told what was no longer available, and what came before.
+    let second = trial.stub("judge.prompt.2");
+    assert!(second.contains("Available now: `split`, `escalate`. Not available: `retry`"), "{second}");
+    assert!(second.contains("Attempt 1 stopped at `verify`"), "{second}");
+}
+
+#[test]
+fn a_split_is_proposed_as_a_plan_for_a_person_and_creates_nothing() {
+    let trial = Trial::build("j-split", &judged_workflow(0, 2), ISSUE_BODY);
+    let env = [("STUB_DEV", "never"), ("STUB_REVIEW", "approve"), ("STUB_JUDGE", "bad-split-then-good")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert_eq!(output.status.code(), Some(1), "the issue waits for a person: {text}");
+    // The first proposal broke a plan rule, so the validator's errors went back once.
+    assert!(text.contains("the proposed split is not a valid plan, asking once more"), "{text}");
+    assert!(trial.stub("judge.prompt.2").contains("overlap on Sources/P1/"), "{}", trial.stub("judge.prompt.2"));
+    assert!(text.contains("The split is proposed as a plan in https://example.invalid/o/r/pull/92"), "{text}");
+
+    // A pull request into main, where plans are reviewed, holding one plan file.
+    let opened = trial.json("pr.json");
+    assert_eq!((opened["base"].as_str(), opened["head"].as_str()), (Some("main"), Some("plan/trial-split-7")));
+    let origin = trial.dir.join("origin.git");
+    assert_eq!(trial.git(&origin, &["diff", "--name-only", "main", "plan/trial-split-7"]), "plans/trial-split-7.yaml");
+    let plan = trial.git(&origin, &["show", "plan/trial-split-7:plans/trial-split-7.yaml"]);
+    assert!(plan.contains("plan: trial-split-7") && plan.contains("key: part-one") && plan.contains("key: part-two"), "{plan}");
+    // No issue was created, and the developer was not called again.
+    assert!(!trial.stub("gh.calls").contains("POST repos/o/r/issues\n"), "{}", trial.stub("gh.calls"));
+    assert_eq!(trial.stub("codex.count"), "1");
+}
+
+#[test]
+fn retry_takes_over_what_a_blocked_run_left_on_github() {
+    let trial = Trial::build("j-retry-cli", &github_workflow(0), ISSUE_BODY);
+    let stuck = [("STUB_DEV", "never-breaks"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "always-red"), ("STUB_REAL_DELETE", "1")];
+    let (output, text) = trial.factory(&[], &stuck);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("the pull request stays open"), "{text}");
+    let first_head = trial.pushed_head();
+
+    // A plain run refuses, and says how to take over.
+    let (output, text) = trial.factory(&[], &stuck);
+    assert_eq!(output.status.code(), Some(2), "{text}");
+    assert!(text.contains("Use `factory retry 7`"), "{text}");
+
+    // Retrying closes that pull request, deletes that branch, and starts from
+    // nothing. With GitHub green this time, it merges.
+    let green = [("STUB_DEV", "never-breaks"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "green")];
+    let (output, text) = trial.cli(&["retry", "7"], &[green[0], green[1], green[2], ("STUB_REAL_DELETE", "1")]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("closing https://example.invalid/o/r/pull/9, which an earlier attempt opened"), "{text}");
+    assert!(trial.dir.join("stub/pr-closed-7").exists());
+    assert!(text.contains("MERGED into dev"), "{text}");
+    assert_ne!(trial.json("merge.json")["sha"].as_str().unwrap(), first_head, "the merged commit is the new attempt's");
+    assert_eq!(trial.stub("gh.calls").matches("POST repos/o/r/pulls\n").count(), 2);
+}
+
+#[test]
+fn drop_takes_an_issue_off_the_queue_and_removes_what_the_engine_made() {
+    let trial = Trial::build("j-drop", &github_workflow(0), ISSUE_BODY);
+    let stuck = [("STUB_DEV", "never-breaks"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "always-red"), ("STUB_REAL_DELETE", "1")];
+    assert_eq!(trial.factory(&[], &stuck).0.status.code(), Some(1));
+    assert!(trial.cli(&["blocked"], &[]).1.contains("pull request: https://example.invalid/o/r/pull/9"));
+
+    let (output, text) = trial.cli(&["drop", "7"], &stuck);
+    assert!(output.status.success(), "{text}");
+    assert!(trial.dir.join("stub/pr-closed-7").exists(), "{text}");
+    assert!(!trial.dir.join("home/worktrees/o__r/issue-7").exists());
+    assert!(trial.git(&trial.dir.join("origin.git"), &["for-each-ref", "refs/heads/factory"]).is_empty());
+    let calls = trial.stub("gh.calls");
+    for label in ["today", "in-progress", "blocked"] {
+        assert!(calls.contains(&format!("DELETE repos/o/r/issues/7/labels/{label}")), "{calls}");
+    }
+    // It no longer waits for a person, and its run files are still there.
+    assert!(trial.cli(&["blocked"], &[]).1.contains("no issue is waiting for a person"));
+    assert!(trial.dir.join("home/runs/o__r/issue-7").exists());
 }

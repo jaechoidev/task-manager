@@ -10,6 +10,7 @@ pub mod flows;
 pub mod git;
 pub mod github;
 pub mod issue;
+pub mod judgment;
 pub mod lock;
 pub mod proc;
 pub mod queue;
@@ -28,7 +29,7 @@ use state::{StepRecord, Store};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
-use workflow::{Access, Kind, Role, Step, Workflow};
+use workflow::{Access, Kind, Role, Step, Vendor, Workflow};
 
 /// Longest diff handed to a reviewer inline. The reviewer can read the rest.
 const MAX_DIFF_CHARS: usize = 150_000;
@@ -48,6 +49,9 @@ pub struct RunOptions {
     pub no_merge: bool,
     /// Start over even when an interrupted run could be picked up.
     pub restart: bool,
+    /// Start over even when an earlier run left a branch and a pull request
+    /// on GitHub: close that pull request and delete that branch first.
+    pub take_over: bool,
 }
 
 /// The developer's final message.
@@ -1283,6 +1287,98 @@ impl Run<'_> {
         Ok(Outcome::Pass)
     }
 
+    /// Asks the judgment module what should happen to a stuck issue. The
+    /// answer is one action from a fixed menu, checked by code.
+    #[allow(clippy::too_many_arguments)]
+    fn judge(&mut self, index: usize, step: &Step, attempt: u32, failed: &str, failure: &str, earlier: &[String], menu: judgment::Menu) -> Result<(judgment::Action, String)> {
+        let history: Vec<String> = self
+            .store
+            .steps(&self.repo, self.issue.number, &self.run_id)?
+            .iter()
+            .map(|(step, vendor, _, verdict, exit_code, duration_ms, round)| {
+                let who = vendor.as_deref().map(|v| format!(" ({v})")).unwrap_or_default();
+                let code = exit_code.map(|c| format!(", exit {c}")).unwrap_or_default();
+                format!("pass {}: {step}{who}: {verdict}{code}, {:.0} s", round + 1, *duration_ms as f64 / 1000.0)
+            })
+            .collect();
+        let review = match &self.review {
+            Some((vendor, verdict)) => format!("{} by {vendor}, on `{}`: {}\n{}", verdict.verdict, verdict.head_sha.trim(), verdict.summary.trim(), bullets(&verdict.items, false)),
+            None => "No review ran.".to_string(),
+        };
+        let mut values = self.issue_values();
+        values.extend([
+            ("attempt", attempt.to_string()),
+            ("failed_step", failed.to_string()),
+            ("history", bullets(&history, false)),
+            ("dev_report", self.dev_report().unwrap_or_else(|_| "The developer gave no usable report.".to_string())),
+            ("review", review),
+            ("earlier", bullets(earlier, false)),
+            ("available", menu.describe()),
+            // Untrusted text, such as a log, goes last.
+            ("failure", failure.to_string()),
+        ]);
+        let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
+        self.store.set_stage(&self.repo, self.issue.number, "judgment", "running", None)?;
+        let ask = Ask { name: "judgment", prompt: &prompt, schema: step.schema.as_deref(), resume: None };
+        let reply = self.ask::<judgment::Decision>(index, step, &ask, |d| d.action.clone())?.map(|(decision, _)| decision);
+        Ok(judgment::settle(reply, menu))
+    }
+
+    /// Turns a proposed split into a plan file on its own branch and opens a
+    /// pull request for it into `main`, where plans are reviewed. Nothing is
+    /// created from it until a person merges that pull request. Returns the
+    /// pull request's URL, or what the plan validator found wrong.
+    fn propose_split(&self, issues: &[judgment::SplitIssue], reason: &str) -> Result<std::result::Result<String, String>> {
+        let plan_id = format!("{}-split-{}", self.issue.plan, self.issue.number);
+        let text = match judgment::split_plan(&plan_id, self.issue.number, &self.issue.title, reason, issues) {
+            Ok(text) => text,
+            Err(problem) => return Ok(Err(problem)),
+        };
+        let branch = format!("plan/{plan_id}");
+        let dir = self.worktree.with_file_name(format!("split-{}", self.issue.number));
+        let shown = dir.display().to_string();
+        let _git = self.git_lock()?;
+        let _ = git::git(&self.repo_dir, &["worktree", "remove", "--force", &shown]);
+        if git::git(&self.repo_dir, &["rev-parse", "--verify", "--quiet", "origin/main"]).is_err() {
+            return Ok(Err("this repository has no `main` branch to propose a plan into".to_string()));
+        }
+        git::git(&self.repo_dir, &["worktree", "add", "--quiet", "-B", &branch, &shown, "origin/main"])?;
+        let finish = |result: Result<std::result::Result<String, String>>| {
+            let _ = git::git(&self.repo_dir, &["worktree", "remove", "--force", &shown]);
+            result
+        };
+        std::fs::create_dir_all(dir.join("plans"))?;
+        std::fs::write(dir.join("plans").join(format!("{plan_id}.yaml")), &text)?;
+        // The same checks a plan written by a person goes through.
+        let set = crate::plan::model::load(&[dir.join("plans")])?;
+        let report = crate::plan::validate::validate(&set, &crate::plan::validate::Options { flows_dir: dir.join(".maestro") });
+        let mut problems: Vec<String> = report.file_errors.iter().map(|d| format!("{}: {}", d.subject, d.message)).collect();
+        problems.extend(report.plans.iter().flat_map(|p| p.errors.iter().map(|d| format!("{}: {}", d.subject, d.message))));
+        if !problems.is_empty() {
+            return finish(Ok(Err(bullets(&problems, false))));
+        }
+        let subject = format!("plan: split #{} into {} issues", self.issue.number, issues.len());
+        git::commit_all(&dir, &subject, &format!("Proposed by the judgment step. Issue #{}", self.issue.number))?;
+        if let Err(e) = git::git(&dir, &["push", "--quiet", "--force-with-lease", "-u", "origin", &branch]) {
+            return finish(Ok(Err(format!("could not push the plan branch: {e:#}"))));
+        }
+        let body = format!(
+            "Issue #{} could not be finished, and the judgment step proposes to split it.\n\n{}\n\nMerging this creates the new issues through `plan create`. Close issue #{} afterwards, or close this pull request to keep the issue as it is.",
+            self.issue.number,
+            reason.trim(),
+            self.issue.number
+        );
+        let opened = match github::find_pr(&self.repo, &branch)? {
+            Some(found) => Ok(found),
+            None => github::open_pr(&self.repo, "main", &branch, &subject, &body),
+        };
+        finish(match opened {
+            Ok((_, url)) => Ok(Ok(url)),
+            Err(e) => Ok(Err(format!("could not open the plan pull request: {e:#}"))),
+        })
+    }
+
     fn pr_body(&self) -> String {
         let head = self.head_sha.as_deref().unwrap_or("?");
         let mut out = format!("Closes #{}\n\n## What changed\n\n", self.issue.number);
@@ -1398,14 +1494,14 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     let read_module = |module: &str, file: &str| {
         read_base(&format!("modules/{module}/{file}")).or_else(|| workflow::builtin(module, file))
     };
-    let Workflow { steps, mut on_fail, fix_rounds, github_fix_rounds, github } = workflow::parse(&workflow_text, &read_module)?;
-    let acceptance_step = steps.iter().find(|s| s.def.role == Some(Role::Acceptance));
+    let Workflow { mut steps, mut on_fail, fix_rounds, github_fix_rounds, github, judgment, judgments } = workflow::parse(&workflow_text, &read_module)?;
+    let has_acceptance = steps.iter().any(|s| s.def.role == Some(Role::Acceptance));
 
     // Flow names end up in file paths and in a shell command.
     if let Some(flow) = issue.marker.flows.iter().find(|f| !flows::safe_name(&f.file)) {
         bail!("issue #{} names the flow '{}', which is not a plain .yaml file name", issue.number, flow.file);
     }
-    if acceptance_step.is_some() {
+    if has_acceptance {
         for flow in &issue.marker.flows {
             let exists = read_base(&flows::path(&flow.file)).is_some();
             if flow.new && exists {
@@ -1441,10 +1537,16 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     let branch = format!("factory/issue-{}-{}", issue.number, issue.key);
     let worktree = home.join("worktrees").join(&name).join(format!("issue-{}", issue.number));
     let runs = home.join("runs").join(&name).join(format!("issue-{}", issue.number));
+    // One pass through this loop is one attempt at the issue. A judgment may
+    // ask for another, which starts from nothing.
+    let mut attempt = 1u32;
+    let mut earlier: Vec<String> = Vec::new();
+    let mut git_lock = Some(git_lock);
+    loop {
     // An earlier run that was cut off still says it is running or waiting.
     // This process holds the issue's lock, so nothing else is running it.
     let interrupted = match store.issue(&repo, issue.number)? {
-        Some(row) if !opts.restart && matches!(row.status.as_str(), "running" | "waiting") => {
+        Some(row) if attempt == 1 && !opts.restart && matches!(row.status.as_str(), "running" | "waiting") => {
             let dir = runs.join(&row.run_id);
             let saved = std::fs::read_to_string(dir.join("progress.json")).ok().and_then(|text| serde_json::from_str::<Progress>(&text).ok());
             saved.filter(|_| worktree.exists()).map(|progress| (row.run_id, dir, progress))
@@ -1456,11 +1558,24 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
             bail!("run {run_id} of issue #{} was interrupted, and the workflow's steps have changed since. Use --restart to start over", issue.number);
         }
     }
+    let held = match git_lock.take() {
+        Some(held) => held,
+        None => lock::acquire(&home, &format!("git-{name}"), &|| {})?,
+    };
     let (run_id, run_dir) = match &interrupted {
         Some((run_id, dir, _)) => (run_id.clone(), dir.clone()),
         None => {
             if git::remote_branch_exists(&repo_dir, &branch)? {
-                bail!("branch {branch} is already on GitHub from an earlier run. Close its pull request and delete the branch before running this issue again");
+                if attempt == 1 && !opts.take_over {
+                    bail!("branch {branch} is already on GitHub from an earlier run. Use `factory retry {}` to close its pull request, delete the branch and start over", issue.number);
+                }
+                // What an earlier attempt left on GitHub is the engine's own.
+                if let Some((number, url)) = github::find_pr(&repo, &branch)? {
+                    println!("  closing {url}, which an earlier attempt opened");
+                    github::close_pr(&repo, number, "Closed by `factory`: a new attempt at this issue is starting from nothing.")?;
+                }
+                github::delete_branch(&repo, &branch)?;
+                git::git(&repo_dir, &["fetch", "--quiet", "--prune", "origin"])?;
             }
             // Named by the second it starts. Two runs of one issue in the
             // same second still get their own files.
@@ -1469,14 +1584,18 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
             let run_dir = runs.join(&run_id);
             std::fs::create_dir_all(&run_dir)?;
             git::fresh_worktree(&repo_dir, &worktree, &branch, &base_ref)?;
+            if attempt > 1 {
+                println!("  attempt {attempt}, from nothing");
+            }
             println!("  worktree {} on {branch}, from {base} at {}", worktree.display(), &base_sha[..10]);
             println!("  files for this run: {}", run_dir.display());
             store.start_issue(&repo, issue.number, &issue.plan, &issue.key, &issue.title, &run_id, &branch, &worktree.display().to_string(), &base_sha)?;
             (run_id, run_dir)
         }
     };
-    drop(git_lock);
+    drop(held);
     label(&repo, issue.number, Some("in-progress"), Some("blocked"));
+    let acceptance_step = steps.iter().find(|s| s.def.role == Some(Role::Acceptance));
 
     let mut run = Run {
         store: &store,
@@ -1491,7 +1610,7 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         base_ref: base_ref.clone(),
         branch: branch.clone(),
         expected: base_sha.clone(),
-        base_sha,
+        base_sha: base_sha.clone(),
         head_sha: None,
         acceptance: None,
         red: None,
@@ -1572,10 +1691,51 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
             Some((step.clone(), format!("{rounds} used and '{step}' still fails. The last failure:\n{reason}")))
         }
     };
-    if let Some((step, failure)) = stopped {
+    if let Some((step, mut failure)) = stopped {
+        // A stuck issue goes to the judgment module, when the workflow has
+        // one. It may ask for a new attempt. Anything else ends with a person.
+        if let Some(judge) = &judgment {
+            let menu = judgment::Menu { attempts_left: judgments.saturating_sub(attempt - 1), research: false };
+            let mut notes = earlier.clone();
+            let mut decided = (judgment::Action::Escalate, String::new());
+            for round in 0..2 {
+                let (action, reason) = run.judge(names.len(), judge, attempt, &step, &failure, &notes, menu)?;
+                let judgment::Action::Split(list) = &action else {
+                    decided = (action, reason);
+                    break;
+                };
+                match run.propose_split(list, &reason)? {
+                    Ok(url) => {
+                        decided = (action, format!("{reason}\nThe split is proposed as a plan in {url}. Nothing is created until a person merges it."));
+                        break;
+                    }
+                    Err(problems) if round == 0 => {
+                        println!("  judgment: the proposed split is not a valid plan, asking once more");
+                        notes.push(format!("You proposed a split, and it is not a valid plan:\n{problems}\nPropose a valid one, or choose another action."));
+                    }
+                    Err(problems) => {
+                        decided = (judgment::Action::Escalate, format!("The judgment proposed a split twice, and neither was a valid plan:\n{problems}"));
+                    }
+                }
+            }
+            let (action, reason) = decided;
+            println!("  judgment: {}. {}", action.name(), first_line(&reason));
+            if matches!(action, judgment::Action::Retry | judgment::Action::SwitchVendor) {
+                earlier.push(format!("Attempt {attempt} stopped at `{step}`: {} The judgment chose `{}`: {}", first_line(&failure), action.name(), first_line(&reason)));
+                if action == judgment::Action::SwitchVendor {
+                    for step in steps.iter_mut() {
+                        step.vendor = step.vendor.map(|v| if v == Vendor::Codex { Vendor::Claude } else { Vendor::Codex });
+                    }
+                    println!("  the vendors are swapped for the next attempt");
+                }
+                attempt += 1;
+                continue;
+            }
+            failure = format!("{failure}\n\nJudgment: {}. {reason}", action.name());
+        }
         store.set_stage(&repo, issue.number, &step, "failed", Some(&failure))?;
         label(&repo, issue.number, Some("blocked"), Some("in-progress"));
-        println!("FAILED at {step}, after {fix_rounds_used} fix round(s): {failure}");
+        println!("FAILED at {step}, in attempt {attempt}, after {fix_rounds_used} fix round(s): {failure}");
         if let Some((_, url)) = &run.pr {
             println!("  the pull request stays open: {url}");
         }
@@ -1620,6 +1780,84 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         eprintln!("warning: could not remove the worktree or its branch: {e:#}");
     }
     println!("MERGED into {base}: {url}");
+    return Ok(true);
+    }
+}
+
+/// The issues waiting for a person: every run that ended blocked, with why.
+pub fn blocked() -> Result<()> {
+    let home = util::home()?;
+    let store = Store::open(&home)?;
+    let waiting: Vec<_> = store.issues()?.into_iter().filter(|row| row.status == "failed").collect();
+    if waiting.is_empty() {
+        println!("no issue is waiting for a person");
+        return Ok(());
+    }
+    for row in waiting {
+        println!("{}#{} {}  {}", row.repo, row.number, row.key, row.title);
+        println!("  stopped at {}, {}", row.stage, row.updated_at);
+        let failure = row.failure.unwrap_or_default();
+        // The judgment's answer is what a person reads first.
+        match failure.split_once("\n\nJudgment: ") {
+            Some((what, judgment)) => {
+                println!("  what failed: {}", first_line(what));
+                println!("  judgment: {}", judgment.trim().replace('\n', "\n    "));
+            }
+            None => println!("  what failed: {}", first_line(&failure)),
+        }
+        if let Some(url) = &row.pr_url {
+            println!("  pull request: {url}");
+        }
+        println!("  files: {}", home.join("runs").join(util::repo_dir_name(&row.repo)).join(format!("issue-{}", row.number)).join(&row.run_id).display());
+        println!("  next: `factory retry {}` starts it over, `factory drop {}` takes it off the queue", row.number, row.number);
+    }
+    Ok(())
+}
+
+/// Takes an issue off the queue: closes what the engine opened for it on
+/// GitHub, removes its worktree, and removes the labels that would have it
+/// picked again. The issue itself stays open.
+pub fn drop_issue(repo_dir: &Path, number: u64) -> Result<bool> {
+    let repo_dir = repo_dir.canonicalize().with_context(|| format!("{} does not exist", repo_dir.display()))?;
+    let repo = repo_name(&repo_dir)?;
+    let home = util::home()?;
+    let store = Store::open(&home)?;
+    let name = util::repo_dir_name(&repo);
+    let Some(_issue_lock) = lock::try_acquire(&home, &format!("issue-{name}-{number}"))? else {
+        bail!("issue #{number} is being run by another process");
+    };
+    let Some(row) = store.issue(&repo, number)? else {
+        bail!("issue #{number} of {repo} has never been run, so there is nothing to drop");
+    };
+    let branch = format!("factory/issue-{number}-{}", row.key);
+    let _git = lock::acquire(&home, &format!("git-{name}"), &|| {})?;
+    if let Some((pr, url)) = github::find_pr(&repo, &branch)? {
+        github::close_pr(&repo, pr, "Closed by `factory drop`: this issue was taken off the queue.")?;
+        println!("closed {url}");
+    }
+    if git::remote_branch_exists(&repo_dir, &branch)? {
+        github::delete_branch(&repo, &branch)?;
+        println!("deleted the branch {branch} on GitHub");
+    }
+    let worktree = home.join("worktrees").join(&name).join(format!("issue-{number}"));
+    if worktree.exists() {
+        git::git(&repo_dir, &["worktree", "remove", "--force", &worktree.display().to_string()])?;
+        println!("removed the worktree {}", worktree.display());
+    }
+    let _ = git::git(&repo_dir, &["branch", "-D", &branch]);
+    for label_name in ["today", "in-progress", "blocked"] {
+        label(&repo, number, None, Some(label_name));
+    }
+    let said = gh::api(
+        "POST",
+        &format!("repos/{repo}/issues/{number}/comments"),
+        Some(&json!({ "body": "Taken off the queue with `factory drop`. The pull request and branch from the last attempt are gone. The issue stays open." })),
+    );
+    if let Err(e) = said {
+        eprintln!("warning: could not comment on the issue: {e}");
+    }
+    store.set_stage(&repo, number, &row.stage, "dropped", row.failure.as_deref())?;
+    println!("issue #{number} is off the queue. Its run files are kept");
     Ok(true)
 }
 

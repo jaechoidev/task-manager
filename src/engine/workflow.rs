@@ -2,6 +2,7 @@
 //! checks the chain before anything runs.
 
 use super::github;
+use super::judgment::{DEFAULT_JUDGMENTS, MAX_JUDGMENTS};
 use super::rounds::{DEFAULT_FIX_ROUNDS, DEFAULT_GITHUB_FIX_ROUNDS, MAX_FIX_ROUNDS};
 use anyhow::{bail, Result};
 use serde::Deserialize;
@@ -24,6 +25,9 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("agent/review", "prompt.md", include_str!("../../modules/agent/review/prompt.md")),
     ("agent/review", "verdict.schema.json", include_str!("../../modules/agent/review/verdict.schema.json")),
     ("check/verify", "module.yaml", include_str!("../../modules/check/verify/module.yaml")),
+    ("judgment/stuck", "module.yaml", include_str!("../../modules/judgment/stuck/module.yaml")),
+    ("judgment/stuck", "prompt.md", include_str!("../../modules/judgment/stuck/prompt.md")),
+    ("judgment/stuck", "decision.schema.json", include_str!("../../modules/judgment/stuck/decision.schema.json")),
 ];
 
 /// What the engine itself provides before the first step.
@@ -146,6 +150,9 @@ struct FactoryFile {
     /// Present when the engine should follow the pull request on GitHub and
     /// merge it. Absent, a run ends with the pull request open.
     github: Option<GithubSpec>,
+    /// Who decides what happens to an issue that is stuck. Absent, a stuck
+    /// issue goes straight to a person.
+    judgment: Option<StepSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +172,8 @@ struct Limits {
     fix_rounds: Option<u32>,
     /// The same, for failures found on GitHub after the pull request opens.
     github_fix_rounds: Option<u32>,
+    /// How often a judgment may start one issue over.
+    judgments: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +200,10 @@ pub struct Workflow {
     pub fix_rounds: u32,
     pub github_fix_rounds: u32,
     pub github: Option<github::Settings>,
+    /// The module that decides for a stuck issue, and how often it may start
+    /// the issue over.
+    pub judgment: Option<Step>,
+    pub judgments: u32,
 }
 
 /// `read(module, file)` returns a module file's text, or `None` when the
@@ -384,10 +397,63 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
         }
     }
 
+    let judgments = file.limits.judgments.unwrap_or(DEFAULT_JUDGMENTS);
+    if judgments > MAX_JUDGMENTS {
+        errors.push(format!("limits.judgments is {judgments}, and the most the engine allows is {MAX_JUDGMENTS}"));
+    }
+    let judgment = match &file.judgment {
+        None => None,
+        Some(spec) => match judgment_step(spec, read) {
+            Ok(step) => Some(step),
+            Err(problem) => {
+                errors.push(format!("judgment ({}): {problem}", spec.module));
+                None
+            }
+        },
+    };
+
     if !errors.is_empty() {
         bail!("factory.yaml is not valid:\n  - {}", errors.join("\n  - "));
     }
-    Ok(Workflow { steps, on_fail: file.on_fail, fix_rounds, github_fix_rounds, github })
+    Ok(Workflow { steps, on_fail: file.on_fail, fix_rounds, github_fix_rounds, github, judgment, judgments })
+}
+
+/// Loads the module named in the `judgment:` block. It is not a step of the
+/// sequence: the engine calls it when a run is stuck.
+fn judgment_step(spec: &StepSpec, read: &dyn Fn(&str, &str) -> Option<String>) -> std::result::Result<Step, String> {
+    let text = read(&spec.module, "module.yaml").ok_or("the module does not exist")?;
+    let def: ModuleDef = crate::yaml::from_str(&text)?;
+    if def.kind != Kind::Judgment {
+        return Err(format!("it is a {} module, not a judgment module", def.kind.name()));
+    }
+    if def.access != Some(Access::ReadOnly) {
+        return Err("a judgment module must be read-only".into());
+    }
+    let vendor = match spec.vendor.as_deref() {
+        Some(name) => Vendor::parse(name).ok_or(format!("unknown vendor '{name}' (use codex or claude)"))?,
+        None => return Err("it needs a vendor".into()),
+    };
+    let file = |field: &str, name: &Option<String>| -> std::result::Result<String, String> {
+        let name = name.as_deref().ok_or(format!("it needs {field}"))?;
+        read(&spec.module, name).ok_or(format!("{field} file '{name}' does not exist"))
+    };
+    let prompt = file("prompt", &def.prompt)?;
+    let schema = file("output_schema", &def.output_schema)?;
+    if serde_json::from_str::<serde_json::Value>(&schema).is_err() {
+        return Err("output_schema is not valid JSON".into());
+    }
+    Ok(Step {
+        name: "judgment".to_string(),
+        module: spec.module.clone(),
+        def,
+        vendor: Some(vendor),
+        model: spec.model.clone(),
+        prompt: Some(prompt),
+        schema: Some(schema),
+        fix_prompt: None,
+        ruling_prompt: None,
+        ruling_schema: None,
+    })
 }
 
 #[cfg(test)]
@@ -502,6 +568,25 @@ on_fail:
         assert!(found.contains("wait_minutes must be between 1 and 180"), "{found}");
         let reserved = format!("{}github: {{}}\n", WITH_ACCEPTANCE.replace("verify:     {", "merge:      {").replace("verify: develop", "merge: develop"));
         assert!(errors(&reserved).contains("'merge' is a step the engine adds itself"), "{}", errors(&reserved));
+    }
+
+    #[test]
+    fn the_judgment_block_names_a_judgment_module() {
+        assert!(parse(GOOD, &builtin).unwrap().judgment.is_none());
+        let with = format!("{GOOD}judgment: {{ module: judgment/stuck, vendor: claude }}\nlimits:\n  judgments: 1\n");
+        let workflow = parse(&with, &builtin).unwrap();
+        let step = workflow.judgment.unwrap();
+        assert_eq!((step.name.as_str(), step.vendor, workflow.judgments), ("judgment", Some(Vendor::Claude), 1));
+        assert!(step.prompt.unwrap().contains("{{available}}"));
+        assert_eq!(parse(GOOD, &builtin).unwrap().judgments, 2);
+
+        let wrong_kind = format!("{GOOD}judgment: {{ module: agent/review, vendor: claude }}\n");
+        assert!(errors(&wrong_kind).contains("it is a agent module, not a judgment module"));
+        let too_many = format!("{GOOD}limits:\n  judgments: 9\n");
+        assert!(errors(&too_many).contains("limits.judgments is 9"));
+        // A judgment is never a step of the sequence.
+        let as_step = GOOD.replace("- verify:  { module: check/verify }", "- verify:  { module: judgment/stuck, vendor: claude }");
+        assert!(errors(&as_step).contains("judgment modules are not supported"), "{}", errors(&as_step));
     }
 
     #[test]

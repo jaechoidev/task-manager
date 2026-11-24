@@ -2,7 +2,7 @@
 
 A deterministic task manager. Software owns the loop and every gate. An LLM is called only for bounded steps.
 
-So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. A queue runs every ready issue, several at once. The daemon and the app are not built yet.
+So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. A queue runs every ready issue, several at once, and a judgment step decides what happens to an issue that gets stuck. The daemon and the app are not built yet.
 
 ## Commands
 
@@ -13,6 +13,9 @@ factory plan validate plans/
 factory plan create plans/ --repo <owner>/<name>
 factory run <issue> --repo-dir <checkout>
 factory queue --repo-dir <checkout>
+factory blocked
+factory retry <issue> --repo-dir <checkout>
+factory drop <issue> --repo-dir <checkout>
 factory status
 ```
 
@@ -24,6 +27,9 @@ factory status
 | `plan create` | Creates issues, parent links and blocked-by links from valid plans. Safe to rerun | 1 when a plan is invalid |
 | `run` | Takes one issue through acceptance flows, develop, verify and review, opens a pull request, waits for GitHub on the same commit and merges. `--no-merge` leaves the merge to a person, `--no-pr` stops before pushing | 1 when the issue ends blocked |
 | `queue` | Runs every ready issue labelled `today`, most urgent first, up to `--parallel` at once | 1 when an issue ended blocked |
+| `blocked` | Lists the issues waiting for a person, with what failed and what the judgment said | |
+| `retry` | Starts a stuck issue over: closes the pull request and deletes the branch its last attempt left, then runs it from nothing | 1 when it ends blocked again |
+| `drop` | Takes a stuck issue off the queue: closes its pull request, deletes its branch and worktree, removes the `today` label. The issue stays open | |
 | `status` | Shows where each issue stands, from the state database | |
 
 Exit code 2 means the command itself could not run.
@@ -158,6 +164,35 @@ Files live under `~/.factory` (or `FACTORY_HOME`):
 | `runs/<repo>/issue-<n>/<run-id>/` | Prompts, schemas, replies, logs and the PR body of one run. Files from the second time the run goes back carry `-r2` in their names |
 | `worktrees/<repo>/issue-<n>/` | The issue's worktree. Removed after a merge, kept when the run ends blocked |
 
+## When an issue is stuck
+
+A run is stuck when a step fails in a way no fix round can help, or when the fix rounds run out. With a `judgment` block in `factory.yaml`, the engine then makes one fresh LLM call, with the issue's whole record, and the LLM picks one action from a fixed menu:
+
+```yaml
+judgment: { module: judgment/stuck, vendor: claude }
+limits:
+  judgments: 2   # new attempts a judgment may start per issue. 3 at most
+```
+
+| Action | What the engine does |
+| --- | --- |
+| `retry` | Throws the attempt away and starts the issue over from nothing, with the same agents |
+| `switch-vendor` | Starts over with the vendors swapped, so a different model develops and the other one reviews |
+| `split` | Writes the proposed smaller issues as a plan file and opens a pull request for it into `main`. Nothing is created until a person merges that pull request |
+| `research` | Not available yet |
+| `escalate` | Labels the issue `blocked` and leaves it for a person |
+
+Code decides what an answer may do:
+
+- An action that is not on the menu, or a reply that can't be read, is `escalate`.
+- `retry` and `switch-vendor` are refused once the issue has used its new attempts. The LLM can't grant itself more.
+- A split goes through the same validator as a plan written by a person. An invalid one goes back to the LLM once, with the validator's errors.
+- No action skips a check. A new attempt goes through every gate again.
+
+A new attempt closes the pull request and deletes the branch the earlier attempt left on GitHub. Those are the engine's own.
+
+Without a `judgment` block, a stuck issue goes straight to a person. `factory blocked` lists everything that waits, `factory retry` starts one over, and `factory drop` takes one off the queue.
+
 ## The queue
 
 `factory queue` picks work the way people do: by the `today` label (`--label` changes it).
@@ -212,7 +247,7 @@ timeout_minutes: 20
 locks: [simulator]
 ```
 
-Built-in modules are in [modules/](modules/) and ship inside the binary: `agent/acceptance`, `check/acceptance-red`, `agent/dev`, `check/verify`, `agent/review`. A repo overrides one by adding `modules/<kind>/<name>/` with the same file names on its default branch.
+Built-in modules are in [modules/](modules/) and ship inside the binary: `agent/acceptance`, `check/acceptance-red`, `agent/dev`, `check/verify`, `agent/review`, `judgment/stuck`. A repo overrides one by adding `modules/<kind>/<name>/` with the same file names on its default branch.
 
 A check's `run` may contain `{{new_flows}}`, which becomes the paths of the flows the issue adds.
 
@@ -249,6 +284,7 @@ cargo install --path .
 | `src/engine/mod.rs` | The steps and the fixed gates |
 | `src/engine/rounds.rs` | The loop: what runs next, and when the rounds run out |
 | `src/engine/queue.rs` | Which issues are ready, in what order, and how many at once |
+| `src/engine/judgment.rs` | What a judgment's answer is allowed to do, and a split as a plan file |
 | `src/engine/lock.rs` | Locks that hold across processes |
 | `src/engine/github.rs` | Checks, the review verdict and the merge, each tied to one commit |
 | `tests/fix_loop.rs` | The real engine run against stand-ins for `gh`, `codex` and `claude` |
