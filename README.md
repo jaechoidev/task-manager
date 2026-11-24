@@ -18,6 +18,10 @@ factory handoff
 factory promote --repo-dir <checkout>
 factory retry <issue> --repo-dir <checkout>
 factory drop <issue> --repo-dir <checkout>
+factory workflow validate --repo-dir <checkout>
+factory workflow propose --file <factory.yaml> --repo-dir <checkout>
+factory module list --repo-dir <checkout>
+factory module new <kind>/<name> --repo-dir <checkout>
 factory serve --repo-dir <checkout>
 factory status
 ```
@@ -35,6 +39,10 @@ factory status
 | `drop` | Takes a stuck issue off the queue: closes its pull request, deletes its branch and worktree, removes the `today` label. The issue stays open | |
 | `handoff` | Writes the day's handoff document for each repository, from the state database | |
 | `promote` | Opens or refreshes the pull request from the default branch into `main`. Never merges it | |
+| `workflow validate` | Checks a workflow file against the repository's modules. No network | 1 when it is not valid |
+| `workflow propose` | Checks a workflow file, then opens a pull request that replaces `factory.yaml` with it | 1 when it is not valid |
+| `module list` | Lists the built-in modules and the repository's own | |
+| `module new` | Opens a pull request that adds a new module's files. `--dry-run` prints them | |
 | `serve` | Serves the local API that the app and other clients use | |
 | `status` | Shows where each issue stands, from the state database | |
 
@@ -236,7 +244,11 @@ It is generated from the state database and the run files, with no LLM call, and
 | `GET /v1/issues/<owner>/<repo>/<n>` | One issue: every step, the summary, what failed, the judgment, the run's files |
 | `GET /v1/issues/<owner>/<repo>/<n>/log` | The end of the newest output of that run |
 | `GET /v1/blocked` | The issues waiting for a person |
-| `GET /v1/workflow?repo=<owner>/<repo>` | The workflow as a graph: steps in order, and where each failure goes |
+| `GET /v1/workflow?repo=<owner>/<repo>` | The workflow as a graph: steps in order, and where each failure goes. Also the file's text |
+| `GET /v1/modules?repo=<owner>/<repo>` | The modules a workflow may name: built-in and the repository's own |
+| `POST /v1/workflow/validate?repo=...` | Checks the workflow file in the request body. Answers the problems, or the graph |
+| `POST /v1/workflow/propose?repo=...` | Checks it, then opens a pull request for it |
+| `POST /v1/modules?repo=...` | Scaffolds `{"module": "<kind>/<name>", "role": ...}` into a pull request |
 | `GET /v1/usage` | Calls, time and usage limits hit, per vendor |
 | `POST /v1/issues/<owner>/<repo>/<n>/retry` | Starts `factory retry` for the issue |
 | `POST /v1/issues/<owner>/<repo>/<n>/drop` | Runs `factory drop` for the issue |
@@ -308,7 +320,29 @@ Built-in modules are in [modules/](modules/) and ship inside the binary: `agent/
 
 A check's `run` may contain `{{new_flows}}`, which becomes the paths of the flows the issue adds.
 
-Before a run, the engine checks that every `needs` is produced by an earlier step, that every `on_fail` target exists, that an acceptance step comes before the dev step, and that the acceptance writer and the reviewer each use a different vendor from the developer.
+Before a run, and before a change to the file is proposed, the engine checks that:
+
+- every module exists, and every step's `needs` is produced by an earlier step
+- every check and every review has an `on_fail`, so every failure has somewhere to go
+- every `on_fail` points at an earlier step, so there is no loop but the fix loops
+- research comes before acceptance and development, and acceptance before development
+- the acceptance writer and the reviewer each use a different vendor from the developer
+- the limits are within what the engine allows
+
+### Changing the workflow
+
+`factory.yaml` on the default branch is the source of truth, and a run reads it from there. So a change is never written in place: `factory workflow propose` checks the new file and opens a pull request for it, and a person merges that. The app's workflow editor does the same through the API.
+
+### Adding a module
+
+`factory module new <kind>/<name>` opens a pull request with a starting point:
+
+| Kind | What it scaffolds |
+| --- | --- |
+| `check/<name>` | A `module.yaml` and a `run.sh` that fails until someone writes it. A check that passes without checking anything is worse than no check |
+| `agent/<name> --role <role>` | A copy of the built-in module for that role, with its prompt and schema, to edit |
+| `judgment/<name>` | A copy of the built-in judgment module |
+| A built-in's own name | A copy of that built-in, which then overrides it in this repository |
 
 ### What a repo's `verify.sh` must do
 
@@ -344,6 +378,7 @@ cargo install --path .
 | `src/engine/judgment.rs` | What a judgment's answer is allowed to do, and a split as a plan file |
 | `src/engine/handoff.rs` | The handoff document and the promote pull request |
 | `src/engine/api.rs` | The local API |
+| `src/engine/editing.rs` | Checking a workflow draft, listing and scaffolding modules, proposing a change as a pull request |
 | `app/` | The macOS app, a Swift package |
 | `src/engine/lock.rs` | Locks that hold across processes |
 | `src/engine/github.rs` | Checks, the review verdict and the merge, each tied to one commit |

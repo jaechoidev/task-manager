@@ -33,6 +33,66 @@ enum Render {
         return renderer.nsImage
     }
 
+    static func write(_ image: NSImage?, to path: String, note: String) -> Int32 {
+        guard let tiff = image?.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) else {
+            FileHandle.standardError.write(Data("could not draw the image\n".utf8))
+            return 1
+        }
+        do {
+            try png.write(to: URL(fileURLWithPath: path))
+            print("wrote \(path): \(note)")
+            return 0
+        } catch {
+            FileHandle.standardError.write(Data("could not write \(path): \(error.localizedDescription)\n".utf8))
+            return 1
+        }
+    }
+
+    /// Draws the workflow editor's panes for a draft: the text, what the
+    /// engine says about it, and the modules. The draft is the default
+    /// branch's file unless `draftFile` names another.
+    static func editor(to path: String, address: String, draftFile: String?) -> Int32 {
+        _ = NSApplication.shared
+        guard let current: Workflow = fetch(address, "workflow") else {
+            FileHandle.standardError.write(Data("can't read the workflow from \(address)\n".utf8))
+            return 1
+        }
+        let original = current.text ?? ""
+        let draft = draftFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) } ?? original
+        let modules: [ModuleInfo] = fetch(address, "modules") ?? []
+        // The same check the editor makes on every change.
+        var request = URLRequest(url: URL(string: address + "/v1/workflow/validate")!)
+        request.httpMethod = "POST"
+        request.httpBody = Data(draft.utf8)
+        var validation: Validation?
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            validation = data.flatMap { try? JSONDecoder.api.decode(Validation.self, from: $0) }
+            done.signal()
+        }.resume()
+        done.wait()
+        let image = MainActor.assumeIsolated { () -> NSImage? in
+            let view = HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("factory.yaml, the draft").font(.headline)
+                    Text(draft).font(.caption.monospaced()).frame(width: 520, alignment: .leading)
+                        .padding(8).border(Color.gray.opacity(0.3))
+                }
+                VStack(alignment: .leading, spacing: 14) {
+                    ValidationPane(validation: validation, changed: draft != original)
+                    ModuleListPane(modules: modules, insert: nil).frame(width: 560)
+                }
+            }
+            .padding(16)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .environment(\.colorScheme, .light)
+            let renderer = ImageRenderer(content: view)
+            renderer.scale = 2
+            return renderer.nsImage
+        }
+        return write(image, to: path, note: "\(modules.count) module(s), draft \(validation?.ok == true ? "valid" : "not valid")")
+    }
+
     static func run(to path: String, address: String, issue: String?) -> Int32 {
         _ = NSApplication.shared
         guard let issues: [Issue] = fetch(address, "issues") else {

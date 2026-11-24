@@ -3,6 +3,7 @@ import SwiftUI
 
 struct RootView: View {
     @ObservedObject var model: AppModel
+    @StateObject private var editor = EditorModel()
     @State private var tab = "Issue"
 
     var body: some View {
@@ -24,9 +25,9 @@ struct RootView: View {
                         .padding(8).background(Color.accentColor.opacity(0.15))
                 }
                 Picker("", selection: $tab) {
-                    ForEach(["Issue", "Workflow", "Usage"], id: \.self) { Text($0) }
+                    ForEach(["Issue", "Workflow", "Edit workflow", "Usage"], id: \.self) { Text($0) }
                 }
-                .pickerStyle(.segmented).labelsHidden().padding(12).frame(maxWidth: 360)
+                .pickerStyle(.segmented).labelsHidden().padding(12).frame(maxWidth: 520)
                 ScrollView([.vertical, .horizontal]) {
                     Group {
                         switch tab {
@@ -35,6 +36,13 @@ struct RootView: View {
                                 WorkflowPane(workflow: workflow)
                             } else {
                                 Text("Start the engine with `--repo-dir <checkout>` to see a repository's workflow.").foregroundStyle(.secondary)
+                            }
+                        case "Edit workflow":
+                            if let repo = model.selectedIssue?.repo ?? model.repos.first, model.repos.contains(repo) {
+                                WorkflowEditorPane(editor: editor, client: model.client)
+                                    .task(id: repo) { await editor.load(repo: repo, client: model.client) }
+                            } else {
+                                Text("Start the engine with `--repo-dir <checkout>` to edit a repository's workflow.").foregroundStyle(.secondary)
                             }
                         case "Usage":
                             UsagePane(usage: model.usage).frame(width: 520)
@@ -122,6 +130,10 @@ enum Entry {
         if let index = arguments.firstIndex(of: "--render"), arguments.count > index + 1 {
             let address = arguments.firstIndex(of: "--api").flatMap { arguments.count > $0 + 1 ? arguments[$0 + 1] : nil } ?? "http://127.0.0.1:7878"
             let issue = arguments.firstIndex(of: "--issue").flatMap { arguments.count > $0 + 1 ? arguments[$0 + 1] : nil }
+            let draft = arguments.firstIndex(of: "--draft").flatMap { arguments.count > $0 + 1 ? arguments[$0 + 1] : nil }
+            if arguments.contains("--editor") {
+                exit(Render.editor(to: arguments[index + 1], address: address, draftFile: draft))
+            }
             exit(Render.run(to: arguments[index + 1], address: address, issue: issue))
         }
         FactoryApp.main()

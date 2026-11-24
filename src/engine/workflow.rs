@@ -39,6 +39,18 @@ const BUILTIN: &[(&str, &str, &str)] = &[
 /// What the engine itself provides before the first step.
 const PROVIDED: &[&str] = &["issue", "worktree", "base_sha"];
 
+/// The names of the modules that ship inside the binary.
+pub fn builtin_modules() -> Vec<&'static str> {
+    let mut names: Vec<&str> = BUILTIN.iter().map(|(module, _, _)| *module).collect();
+    names.dedup();
+    names
+}
+
+/// Every file of a built-in module: its name and its text.
+pub fn builtin_files(module: &str) -> Vec<(&'static str, &'static str)> {
+    BUILTIN.iter().filter(|(m, _, _)| *m == module).map(|(_, file, text)| (*file, *text)).collect()
+}
+
 pub fn builtin(module: &str, file: &str) -> Option<String> {
     BUILTIN.iter().find(|(m, f, _)| *m == module && *f == file).map(|(_, _, text)| text.to_string())
 }
@@ -350,11 +362,26 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
         });
     }
 
+    let position_of = |name: &String| file.workflow.iter().position(|entry| entry.keys().next() == Some(name));
     for (from, to) in &file.on_fail {
         for step in [from, to] {
             if !names.contains(step) {
                 errors.push(format!("on_fail refers to '{step}', which is not a step"));
             }
+        }
+        // A failure goes back, never forward: forward would skip steps.
+        if let (Some(a), Some(b)) = (position_of(from), position_of(to)) {
+            if b >= a {
+                errors.push(format!("on_fail sends '{from}' to '{to}', which does not come before it"));
+            }
+        }
+    }
+    // Every failure has somewhere to go. A check or a review that fails
+    // with no on_fail could only ever stop the run.
+    for step in &steps {
+        let can_fail = step.def.kind == Kind::Check || step.def.role == Some(Role::Review);
+        if can_fail && !file.on_fail.contains_key(&step.name) {
+            errors.push(format!("step '{}' can fail and has no on_fail: say which earlier step its failure goes back to", step.name));
         }
     }
 
@@ -364,7 +391,9 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
     let position = |role: Role| -> Vec<usize> {
         steps.iter().enumerate().filter(|(_, s)| s.def.role == Some(role)).map(|(i, _)| i).collect()
     };
-    if errors.is_empty() {
+    // Checked whenever every step could be read, so that one mistake does
+    // not hide the others from someone editing the file.
+    if steps.len() == file.workflow.len() {
         match position(Role::Dev).as_slice() {
             [dev] => {
                 let dev_step = &steps[*dev];
@@ -641,6 +670,26 @@ on_fail:
     }
 
     #[test]
+    fn every_failure_goes_back_to_an_earlier_step() {
+        let no_way_back = GOOD.replace("  verify: develop\n", "");
+        assert!(errors(&no_way_back).contains("step 'verify' can fail and has no on_fail"), "{}", errors(&no_way_back));
+        let forward = GOOD.replace("  verify: develop", "  verify: review");
+        assert!(errors(&forward).contains("on_fail sends 'verify' to 'review', which does not come before it"), "{}", errors(&forward));
+        let to_itself = GOOD.replace("  review: develop", "  review: review");
+        assert!(errors(&to_itself).contains("on_fail sends 'review' to 'review'"), "{}", errors(&to_itself));
+    }
+
+    #[test]
+    fn built_in_modules_can_be_listed_and_copied() {
+        let names = builtin_modules();
+        assert!(names.contains(&"agent/dev") && names.contains(&"judgment/stuck") && names.contains(&"check/verify"), "{names:?}");
+        assert_eq!(names.len(), names.iter().collect::<std::collections::BTreeSet<_>>().len(), "no name twice");
+        let files: Vec<&str> = builtin_files("agent/dev").iter().map(|(file, _)| *file).collect();
+        assert_eq!(files, vec!["module.yaml", "prompt.md", "fix.md", "report.schema.json"]);
+        assert!(builtin_files("agent/nothing").is_empty());
+    }
+
+    #[test]
     fn acceptance_writer_must_differ_from_the_developer() {
         let text = WITH_ACCEPTANCE.replace("agent/acceptance, vendor: claude", "agent/acceptance, vendor: codex");
         assert!(errors(&text).contains("step 'acceptance' must use a different vendor"));
@@ -653,6 +702,8 @@ workflow:
   - develop:    { module: agent/dev, vendor: codex }
   - acceptance: { module: agent/acceptance, vendor: claude }
   - verify:     { module: check/verify }
+on_fail:
+  verify: develop
 ";
         assert!(errors(text).contains("the acceptance step must come before the dev step"));
         let red_alone = "

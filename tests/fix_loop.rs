@@ -1195,3 +1195,70 @@ fn promote_opens_one_pull_request_into_main_and_never_merges_it() {
     assert_eq!(calls.matches("POST repos/o/r/pulls\n").count(), 2, "one for the issue, one for the promotion: {calls}");
     assert!(!calls.contains("PUT repos/o/r/pulls/92/merge"), "{calls}");
 }
+
+#[test]
+fn a_workflow_change_is_checked_and_then_proposed_as_a_pull_request() {
+    let trial = Trial::build("wf-propose", &github_workflow(2), ISSUE_BODY);
+    let (output, text) = trial.cli(&["workflow", "validate"], &[]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("workflow OK: develop -> verify -> review"), "{text}");
+    assert!(text.contains("a failed verify goes back to develop"), "{text}");
+
+    // A draft that breaks the rules is never proposed.
+    let bad = trial.dir.join("bad.yaml");
+    fs::write(&bad, github_workflow(2).replace("  verify: develop\n", "").replace("vendor: claude", "vendor: codex")).unwrap();
+    let (output, text) = trial.cli(&["workflow", "propose", "--file", bad.to_str().unwrap()], &[]);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("step 'verify' can fail and has no on_fail"), "{text}");
+    assert!(text.contains("step 'review' must use a different vendor"), "{text}");
+    assert!(!trial.stub("gh.calls").contains("POST repos/o/r/pulls"), "{}", trial.stub("gh.calls"));
+
+    // A valid one becomes a pull request into the default branch, and dev itself is untouched.
+    let good = trial.dir.join("good.yaml");
+    fs::write(&good, github_workflow(1)).unwrap();
+    let (output, text) = trial.cli(&["workflow", "propose", "--file", good.to_str().unwrap()], &[]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("opened https://example.invalid/o/r/pull/92. A person merges it"), "{text}");
+    let opened = trial.json("pr-90.json");
+    assert_eq!(opened["base"], "dev");
+    let branch = opened["head"].as_str().unwrap().to_string();
+    assert!(branch.starts_with("factory/workflow-"), "{branch}");
+    let origin = trial.dir.join("origin.git");
+    assert_eq!(trial.git(&origin, &["diff", "--name-only", "dev", &branch]), "factory.yaml");
+    assert!(trial.git(&origin, &["show", &format!("{branch}:factory.yaml")]).contains("github_fix_rounds: 1"));
+    assert!(trial.git(&origin, &["show", "dev:factory.yaml"]).contains("github_fix_rounds: 2"));
+    assert!(!trial.stub("gh.calls").contains("/merge"), "{}", trial.stub("gh.calls"));
+
+    // Proposing what is already there changes nothing.
+    fs::write(&good, github_workflow(2)).unwrap();
+    let (output, text) = trial.cli(&["workflow", "propose", "--file", good.to_str().unwrap()], &[]);
+    assert_eq!(output.status.code(), Some(2), "{text}");
+    assert!(text.contains("nothing would change"), "{text}");
+}
+
+#[test]
+fn a_new_module_is_scaffolded_into_a_pull_request() {
+    let trial = Trial::build("module-new", &github_workflow(2), ISSUE_BODY);
+    let (_, listed) = trial.cli(&["module", "list"], &[]);
+    assert!(listed.contains("check/verify  check, built-in") && listed.contains("agent/dev  agent (dev), built-in"), "{listed}");
+    assert!(!listed.contains("check/lint"), "{listed}");
+
+    let (_, shown) = trial.cli(&["module", "new", "check/lint", "--dry-run"], &[]);
+    assert!(shown.contains("--- modules/check/lint/module.yaml") && shown.contains("run: ./modules/check/lint/run.sh"), "{shown}");
+    assert!(!trial.stub("gh.calls").contains("POST repos/o/r/pulls"));
+
+    let (output, text) = trial.cli(&["module", "new", "check/lint"], &[]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("opened https://example.invalid/o/r/pull/92 with 2 file(s)"), "{text}");
+    let origin = trial.dir.join("origin.git");
+    let files = trial.git(&origin, &["ls-tree", "-r", "factory/module-check-lint", "modules/"]);
+    // The script is executable, and fails until someone writes it.
+    assert!(files.contains("100755") && files.contains("modules/check/lint/run.sh"), "{files}");
+    assert!(files.contains("100644") && files.contains("modules/check/lint/module.yaml"), "{files}");
+    assert!(trial.git(&origin, &["show", "factory/module-check-lint:modules/check/lint/run.sh"]).contains("exit 1"));
+    assert_eq!(trial.json("pr-90.json")["base"], "dev");
+
+    let (output, text) = trial.cli(&["module", "new", "agent/helper"], &[]);
+    assert_eq!(output.status.code(), Some(2), "{text}");
+    assert!(text.contains("an agent module needs a role"), "{text}");
+}

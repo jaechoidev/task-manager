@@ -10,6 +10,7 @@ A window and a menu bar item onto the engine. It is a client of `factory serve` 
 | Issue | Its state and what it waits on, the summary written for a person, every step with who ran it and how long it took, and the end of the newest output |
 | Needs you | For a stuck issue: what failed, what the judgment said, and two buttons, "Start over" and "Take off the queue" |
 | Workflow | The repository's steps as a graph, with an arrow from each step to where its failure goes. Read only |
+| Edit workflow | The workflow file's text, checked by the engine as you type, with the graph of the draft, the modules it may use, and a form that scaffolds a new module. "Open a pull request" is how a change is saved |
 | Usage | Calls, time and usage limits hit, per vendor |
 | Menu bar | How many issues need a person, and what is running |
 
@@ -47,7 +48,7 @@ swift test
 swift run FactoryApp --render out.png --api http://127.0.0.1:7878
 ```
 
-The second draws the panes to an image from live data.
+The second draws the panes to an image from live data. Add `--editor` to draw the workflow editor's panes, and `--draft <file>` to draw them for a draft.
 
 ## Layout
 
@@ -58,5 +59,6 @@ The second draws the panes to an image from live data.
 | `AppModel.swift` | What the windows show, refreshed every two seconds |
 | `Views.swift` | The panes |
 | `Graph.swift` | Where the workflow's steps and arrows go |
+| `Editor.swift` | The workflow editor, the module list and the scaffold form |
 | `App.swift` | The window, the menu bar item, settings |
 | `Render.swift` | Drawing the panes to an image |

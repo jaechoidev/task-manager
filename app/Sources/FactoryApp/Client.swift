@@ -28,6 +28,21 @@ struct APIClient {
         return try JSONDecoder.api.decode(T.self, from: data)
     }
 
+    /// Sends a body and decodes the answer, whatever its status: a refusal
+    /// from the engine comes back as data to show, not as a thrown error.
+    func send<T: Decodable>(_ path: String, body: Data, json: Bool = false, as type: T.Type = T.self) async throws -> T {
+        var request = self.request(path, method: "POST")
+        request.httpBody = body
+        request.timeoutInterval = 90
+        request.setValue(json ? "application/json" : "text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let decoded = try? JSONDecoder.api.decode(T.self, from: data) {
+            return decoded
+        }
+        try check(response, data)
+        return try JSONDecoder.api.decode(T.self, from: data)
+    }
+
     func post(_ path: String) async throws {
         let (data, response) = try await URLSession.shared.data(for: request(path, method: "POST"))
         try check(response, data)

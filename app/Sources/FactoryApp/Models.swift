@@ -85,6 +85,63 @@ struct Workflow: Codable, Equatable {
     var judgment: WorkflowStep?
     var summary: WorkflowStep?
     var limits: WorkflowLimits
+    /// The workflow file itself. Present for the one on the default branch.
+    var text: String?
+}
+
+/// A module a workflow may name.
+struct ModuleInfo: Codable, Equatable, Identifiable {
+    var module: String
+    var kind: String
+    var role: String?
+    var needs: [String]
+    var produces: [String]
+    var locks: [String]
+    /// `built-in`, `repository`, or `repository, overriding the built-in`.
+    var source: String
+    var problem: String?
+    var id: String { module }
+}
+
+/// What the engine says about a draft workflow.
+struct Validation: Codable, Equatable {
+    var ok: Bool
+    var errors: [String]
+    var workflow: Workflow?
+}
+
+/// What came of asking for a pull request.
+struct Proposal: Codable, Equatable {
+    var ok: Bool
+    var url: String?
+    var errors: [String]?
+    var error: String?
+    var files: [String]?
+
+    var problems: [String] { (errors ?? []) + (error.map { [$0] } ?? []) }
+}
+
+/// Adds a step to a workflow file's text: a line at the end of the `workflow:`
+/// list, and for a check the `on_fail` line every check needs. The person
+/// edits from there. The file stays the source of truth.
+func insertStep(into text: String, module: ModuleInfo, developer: String?) -> String {
+    let name = module.module.split(separator: "/").last.map(String.init) ?? module.module
+    let vendor = module.kind == "check" ? "" : ", vendor: claude"
+    let step = "  - \(name): { module: \(module.module)\(vendor) }"
+    var lines = text.components(separatedBy: "\n")
+    // The step list ends at the next top-level key after `workflow:`.
+    guard let start = lines.firstIndex(where: { $0.hasPrefix("workflow:") }) else { return text }
+    let end = lines[(start + 1)...].firstIndex(where: { line in
+        guard let first = line.first else { return false }
+        return first != " " && first != "#" && first != "-"
+    }) ?? lines.count
+    var at = end
+    while at > start + 1 && lines[at - 1].trimmingCharacters(in: .whitespaces).isEmpty { at -= 1 }
+    lines.insert(step, at: at)
+    if module.kind == "check", let developer, let onFail = lines.firstIndex(where: { $0.hasPrefix("on_fail:") }) {
+        lines.insert("  \(name): \(developer)", at: onFail + 1)
+    }
+    return lines.joined(separator: "\n")
 }
 
 struct UsageRow: Codable, Equatable, Identifiable {

@@ -90,6 +90,32 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(layout.size.height, layout.nodes[0].frame.maxY)
     }
 
+    func testTheEnginesAnswersAboutADraftDecode() throws {
+        let invalid = #"{"ok":false,"errors":["step 'verify' can fail and has no on_fail"],"workflow":null}"#
+        let checked = try JSONDecoder.api.decode(Validation.self, from: Data(invalid.utf8))
+        XCTAssertFalse(checked.ok)
+        XCTAssertEqual(checked.errors.count, 1)
+        XCTAssertNil(checked.workflow)
+        let modules = #"[{"module":"check/verify","kind":"check","role":null,"needs":["worktree","head_sha"],"produces":["verify_log"],"locks":["simulator"],"source":"built-in","problem":null}]"#
+        XCTAssertEqual(try JSONDecoder.api.decode([ModuleInfo].self, from: Data(modules.utf8))[0].locks, ["simulator"])
+        let refused = #"{"ok":false,"error":"an agent module needs a role"}"#
+        XCTAssertEqual(try JSONDecoder.api.decode(Proposal.self, from: Data(refused.utf8)).problems, ["an agent module needs a role"])
+        let opened = #"{"ok":true,"url":"https://example.invalid/pull/9","files":["modules/check/lint/module.yaml"]}"#
+        XCTAssertEqual(try JSONDecoder.api.decode(Proposal.self, from: Data(opened.utf8)).files?.count, 1)
+    }
+
+    func testAddingAStepPutsItInTheListAndGivesAChecksFailureAWayBack() {
+        let text = "# The workflow\nworkflow:\n  - develop: { module: agent/dev, vendor: codex }\n  - verify:  { module: check/verify }\non_fail:\n  verify: develop\nlimits:\n  fix_rounds: 3\n"
+        let lint = ModuleInfo(module: "check/lint", kind: "check", role: nil, needs: [], produces: [], locks: [], source: "repository", problem: nil)
+        let withCheck = insertStep(into: text, module: lint, developer: "develop")
+        XCTAssertEqual(withCheck, "# The workflow\nworkflow:\n  - develop: { module: agent/dev, vendor: codex }\n  - verify:  { module: check/verify }\n  - lint: { module: check/lint }\non_fail:\n  lint: develop\n  verify: develop\nlimits:\n  fix_rounds: 3\n")
+        let review = ModuleInfo(module: "agent/review", kind: "agent", role: "review", needs: [], produces: [], locks: [], source: "built-in", problem: nil)
+        let withAgent = insertStep(into: text, module: review, developer: "develop")
+        XCTAssertTrue(withAgent.contains("  - review: { module: agent/review, vendor: claude }\non_fail:\n  verify: develop"))
+        // A file with no step list is left alone.
+        XCTAssertEqual(insertStep(into: "limits:\n", module: lint, developer: nil), "limits:\n")
+    }
+
     func testAnArrowToAStepThatIsNotThereIsLeftOut() throws {
         var workflow = try workflow()
         workflow.onFail = ["verify": "develop", "review": "nowhere", "acceptance": "develop"]

@@ -107,6 +107,16 @@ enum Top {
         #[arg(long, default_value = ".")]
         repo_dir: PathBuf,
     },
+    /// Check a workflow file, or propose a new one as a pull request
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
+    /// List the modules a workflow may use, or scaffold a new one
+    Module {
+        #[command(subcommand)]
+        command: ModuleCommand,
+    },
     /// Serve the local API that the app and other clients use
     Serve {
         /// The address to listen on. Anything but this machine needs --token
@@ -128,6 +138,52 @@ enum Format {
     Text,
     Markdown,
     Json,
+}
+
+#[derive(Subcommand)]
+enum WorkflowCommand {
+    /// Check a workflow file against the repository's modules. No network
+    Validate {
+        /// The file to check. The one on the default branch when absent
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// A checkout of the project repository
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+    },
+    /// Open a pull request that replaces factory.yaml with this file
+    Propose {
+        /// The new workflow file
+        #[arg(long)]
+        file: PathBuf,
+        /// A checkout of the project repository
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModuleCommand {
+    /// List the built-in modules and the repository's own
+    List {
+        /// A checkout of the project repository
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+    },
+    /// Open a pull request that adds a new module's files
+    New {
+        /// The module, as <kind>/<name>, such as check/lint
+        module: String,
+        /// For an agent module: research, acceptance, dev, review or summary
+        #[arg(long)]
+        role: Option<String>,
+        /// A checkout of the project repository
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+        /// Print the files instead of opening a pull request
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -327,6 +383,66 @@ fn run() -> Result<bool> {
         }
 
         Top::Promote { repo_dir } => engine::handoff::promote(&repo_dir),
+
+        Top::Workflow { command: WorkflowCommand::Validate { file, repo_dir } } => {
+            let text = match &file {
+                Some(file) => std::fs::read_to_string(file)?,
+                None => engine::editing::current(&repo_dir)?,
+            };
+            match engine::editing::check(&repo_dir, &text)? {
+                Ok(workflow) => {
+                    let names: Vec<&str> = workflow.steps.iter().map(|s| s.name.as_str()).collect();
+                    println!("workflow OK: {}", names.join(" -> "));
+                    for (from, to) in &workflow.on_fail {
+                        println!("  a failed {from} goes back to {to}");
+                    }
+                    println!("  fix rounds {}, GitHub fix rounds {}, new attempts {}", workflow.fix_rounds, workflow.github_fix_rounds, workflow.judgments);
+                    Ok(true)
+                }
+                Err(problems) => {
+                    println!("workflow is not valid:");
+                    problems.iter().for_each(|p| println!("  - {p}"));
+                    Ok(false)
+                }
+            }
+        }
+
+        Top::Workflow { command: WorkflowCommand::Propose { file, repo_dir } } => {
+            match engine::editing::propose_workflow(&repo_dir, &std::fs::read_to_string(&file)?)? {
+                Ok(url) => {
+                    println!("opened {url}. A person merges it");
+                    Ok(true)
+                }
+                Err(problems) => {
+                    println!("not proposed, the workflow is not valid:");
+                    problems.iter().for_each(|p| println!("  - {p}"));
+                    Ok(false)
+                }
+            }
+        }
+
+        Top::Module { command: ModuleCommand::List { repo_dir } } => {
+            for module in engine::editing::modules(&repo_dir)? {
+                let text = |key: &str| module[key].as_str().unwrap_or("").to_string();
+                let list = |key: &str| module[key].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                let role = if text("role").is_empty() { String::new() } else { format!(" ({})", text("role")) };
+                println!("{}  {}{role}, {}", text("module"), text("kind"), text("source"));
+                println!("    needs: {}. produces: {}", list("needs"), list("produces"));
+            }
+            Ok(true)
+        }
+
+        Top::Module { command: ModuleCommand::New { module, role, repo_dir, dry_run } } => {
+            if dry_run {
+                for (path, text) in engine::editing::scaffold(&module, role.as_deref())? {
+                    println!("--- {path}\n{text}");
+                }
+                return Ok(true);
+            }
+            let (url, files) = engine::editing::propose_module(&repo_dir, &module, role.as_deref())?;
+            println!("opened {url} with {} file(s). Edit the module there. A person merges it", files.len());
+            Ok(true)
+        }
 
         Top::Serve { bind, token, repo_dirs } => {
             engine::api::serve(&engine::api::ServeOptions { bind, token, repo_dirs })?;

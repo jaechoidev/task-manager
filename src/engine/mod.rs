@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod editing;
 pub mod flows;
 pub mod git;
 pub mod github;

@@ -9,7 +9,7 @@
 //! must carry that token.
 
 use super::state::{IssueRow, Store};
-use super::{first_line, git, util, workflow};
+use super::{editing, first_line, git, util};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -31,6 +31,7 @@ pub struct Request<'a> {
     /// The path without its query string.
     pub path: &'a str,
     pub query: BTreeMap<String, String>,
+    pub body: &'a str,
 }
 
 /// What the server knows besides the database.
@@ -142,44 +143,6 @@ fn log_json(home: &Path, row: &IssueRow, file: Option<&str>) -> Value {
     }
 }
 
-/// The workflow of a repository, as a graph: the steps in order and where
-/// each failure goes. Read from the default branch, as a run reads it.
-fn workflow_json(repo_dir: &Path) -> Result<Value> {
-    let base = git::git(repo_dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).context("could not find the default branch")?;
-    let read_base = |path: &str| git::git(repo_dir, &["show", &format!("{base}:{path}")]).ok();
-    let text = read_base("factory.yaml").ok_or_else(|| anyhow!("{base} has no factory.yaml"))?;
-    let read_module = |module: &str, file: &str| read_base(&format!("modules/{module}/{file}")).or_else(|| workflow::builtin(module, file));
-    let parsed = workflow::parse(&text, &read_module)?;
-    let step = |s: &workflow::Step| {
-        json!({
-            "name": s.name,
-            "module": s.module,
-            "kind": s.def.kind.name(),
-            "vendor": s.vendor.map(|v| v.name()),
-            "locks": s.def.locks,
-        })
-    };
-    let mut steps: Vec<Value> = parsed.steps.iter().map(step).collect();
-    // The engine's own steps follow the workflow's.
-    let engine = |name: &str| json!({ "name": name, "module": format!("engine/{name}"), "kind": "engine", "vendor": null, "locks": [] });
-    steps.extend([engine("sync"), engine("pr")]);
-    let mut on_fail = parsed.on_fail.clone();
-    if parsed.github.is_some() {
-        steps.extend([engine("github"), engine("merge")]);
-        if let Some(dev) = parsed.steps.iter().find(|s| s.def.role == Some(workflow::Role::Dev)) {
-            on_fail.insert("github".to_string(), dev.name.clone());
-        }
-    }
-    Ok(json!({
-        "branch": base.trim_start_matches("origin/"),
-        "steps": steps,
-        "on_fail": on_fail,
-        "judgment": parsed.judgment.as_ref().map(step),
-        "summary": parsed.summary.as_ref().map(step),
-        "limits": { "fix_rounds": parsed.fix_rounds, "github_fix_rounds": parsed.github_fix_rounds, "judgments": parsed.judgments },
-    }))
-}
-
 /// Calls and time per vendor, and how often a usage limit was hit.
 fn usage_json(store: &Store) -> Result<Value> {
     let mut by_vendor: BTreeMap<String, (u64, f64, u64)> = BTreeMap::new();
@@ -220,11 +183,35 @@ pub fn route(context: &Context_, request: &Request) -> (u16, Value) {
                 (200, json!(rows.iter().map(|row| issue_json(&store, row)).collect::<Result<Vec<_>>>()?))
             }
             ("GET", ["v1", "usage"]) => (200, usage_json(&store)?),
-            ("GET", ["v1", "workflow"]) => {
+            ("GET", ["v1", "workflow"]) | ("GET", ["v1", "modules"]) | ("POST", ["v1", "workflow", "validate"]) | ("POST", ["v1", "workflow", "propose"]) | ("POST", ["v1", "modules"]) => {
                 let repo = request.query.get("repo").cloned().or_else(|| context.repos.keys().next().cloned()).unwrap_or_default();
-                match context.repos.get(&repo) {
-                    Some(dir) => (200, workflow_json(dir)?),
-                    None => (404, json!({ "error": format!("the server was not started with a checkout of '{repo}'") })),
+                let Some(dir) = context.repos.get(&repo) else {
+                    return Ok((404, json!({ "error": format!("the server was not started with a checkout of '{repo}'") })));
+                };
+                let base = git::git(dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).unwrap_or_default();
+                match (request.method, parts.as_slice()) {
+                    ("GET", [_, "workflow"]) => (200, editing::current_graph(dir)?),
+                    ("GET", [_, "modules"]) => (200, json!(editing::modules(dir)?)),
+                    // A draft is checked exactly as a run would check it.
+                    ("POST", [_, "workflow", "validate"]) => match editing::check(dir, request.body)? {
+                        Ok(parsed) => (200, json!({ "ok": true, "errors": [], "workflow": editing::graph(&base, &parsed) })),
+                        Err(problems) => (200, json!({ "ok": false, "errors": problems, "workflow": null })),
+                    },
+                    // Saving is a pull request. Nothing reaches the default branch from here.
+                    ("POST", [_, "workflow", "propose"]) => match editing::propose_workflow(dir, request.body)? {
+                        Ok(url) => (200, json!({ "ok": true, "url": url, "errors": [] })),
+                        Err(problems) => (422, json!({ "ok": false, "url": null, "errors": problems })),
+                    },
+                    _ => {
+                        let wanted: Value = serde_json::from_str(request.body).unwrap_or(Value::Null);
+                        let Some(module) = wanted.get("module").and_then(Value::as_str) else {
+                            return Ok((422, json!({ "ok": false, "error": "send {\"module\": \"<kind>/<name>\", \"role\": ...}" })));
+                        };
+                        match editing::propose_module(dir, module, wanted.get("role").and_then(Value::as_str)) {
+                            Ok((url, files)) => (200, json!({ "ok": true, "url": url, "files": files })),
+                            Err(e) => (422, json!({ "ok": false, "error": format!("{e:#}") })),
+                        }
+                    }
                 }
             }
             ("GET", ["v1", "issues", owner, name, number]) => match find(&store, owner, name, number)? {
@@ -327,13 +314,15 @@ pub fn serve(opts: &ServeOptions) -> Result<()> {
     let context = Context_ { home: util::home()?, repos, program: std::env::current_exe().context("finding the factory program")? };
     let server = tiny_http::Server::http(address).map_err(|e| anyhow!("could not listen on {address}: {e}"))?;
     println!("factory API on http://{address}/v1, for {}", if context.repos.is_empty() { "no repository (read only)".to_string() } else { context.repos.keys().cloned().collect::<Vec<_>>().join(", ") });
-    for request in server.incoming_requests() {
+    for mut request in server.incoming_requests() {
         let url = request.url().to_string();
         let (path, query) = url.split_once('?').unwrap_or((&url, ""));
         let method = request.method().as_str().to_string();
         let header = request.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.as_str().to_string());
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(request.as_reader(), &mut text);
         let (status, body) = if authorized(opts.token.as_deref(), header.as_deref()) {
-            route(&context, &Request { method: &method, path, query: parse_query(query) })
+            route(&context, &Request { method: &method, path, query: parse_query(query), body: &text })
         } else {
             (401, json!({ "error": "this server needs a token: send `Authorization: Bearer <token>`" }))
         };
@@ -389,7 +378,7 @@ mod tests {
 
     fn get(context: &Context_, path: &str) -> (u16, Value) {
         let (path, query) = path.split_once('?').unwrap_or((path, ""));
-        route(context, &Request { method: "GET", path, query: parse_query(query) })
+        route(context, &Request { method: "GET", path, query: parse_query(query), body: "" })
     }
 
     #[test]
