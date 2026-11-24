@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // The panes are built from plain stacks, with no List or Table, so the same
@@ -114,7 +115,10 @@ struct IssueDetailPane: View {
                     Text(stateLabel(issue)).font(.callout)
                     if issue.pass > 1 { Text("pass \(issue.pass)").font(.callout).foregroundStyle(.secondary) }
                     if let url = issue.prUrl, let link = URL(string: url) {
-                        Link("Pull request", destination: link).font(.callout)
+                        // Plain text with a tap, not a Link: a Link can't be
+                        // drawn to an image, and this pane is.
+                        Text("Pull request #\(link.lastPathComponent)").font(.callout).foregroundStyle(Color.accentColor).underline()
+                            .onTapGesture { NSWorkspace.shared.open(link) }
                     }
                 }
                 if !issue.waitsOn.isEmpty && issue.state != "needs-a-person" {
