@@ -150,13 +150,17 @@ pub fn init(opts: &Options) -> Result<Vec<Check>> {
     }
 
     // 2. Branches. A repo made from a template fills in a moment later.
+    // Until the copy lands, GitHub answers 409 "Git Repository is empty".
     let mut main_sha = None;
     for _ in 0..30 {
-        if let Some(reference) = exists(gh::api("GET", &format!("repos/{repo}/git/ref/heads/main"), None))? {
-            main_sha = reference.pointer("/object/sha").and_then(Value::as_str).map(str::to_string);
-            break;
+        match gh::api("GET", &format!("repos/{repo}/git/ref/heads/main"), None) {
+            Ok(reference) => {
+                main_sha = reference.pointer("/object/sha").and_then(Value::as_str).map(str::to_string);
+                break;
+            }
+            Err(e) if e.is(404) || e.is(409) => std::thread::sleep(Duration::from_secs(2)),
+            Err(e) => return Err(e.into()),
         }
-        std::thread::sleep(Duration::from_secs(2));
     }
     let main_sha = main_sha.ok_or_else(|| anyhow!("{repo} has no main branch after 60 seconds"))?;
 
