@@ -2,7 +2,7 @@
 
 A deterministic task manager. Software owns the loop and every gate. An LLM is called only for bounded steps.
 
-So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, with fix rounds when verify or review fails. The GitHub loop, the queue and the daemon are not built yet.
+So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. The queue and the daemon are not built yet.
 
 ## Commands
 
@@ -21,7 +21,7 @@ factory status
 | `repo preflight` | Reads every setting back from GitHub. Changes nothing | 1 when a setting is wrong |
 | `plan validate` | Checks plan files and prints the parallel batches. No network | 1 when a plan is invalid |
 | `plan create` | Creates issues, parent links and blocked-by links from valid plans. Safe to rerun | 1 when a plan is invalid |
-| `run` | Takes one issue through acceptance flows, develop, verify and review, with fix rounds, then opens a pull request into the default branch | 1 when the issue ends blocked |
+| `run` | Takes one issue through acceptance flows, develop, verify and review, opens a pull request, waits for GitHub on the same commit and merges. `--no-merge` leaves the merge to a person, `--no-pr` stops before pushing | 1 when the issue ends blocked |
 | `status` | Shows where each issue stands, from the state database | |
 
 Exit code 2 means the command itself could not run.
@@ -59,7 +59,13 @@ The rest of the body repeats the same data as markdown for people.
    - **develop**: one headless agent call that may only write inside the worktree.
    - **verify**: the repo's `./verify.sh`, which builds the app and runs every flow. Exit code 0 is the only pass.
    - **review**: one read-only agent call, by a different vendor from the developer.
-3. Push, and open the pull request with the verified commit, the flows, the verify result and the review verdict in its body.
+3. The engine's own steps, which are not in `factory.yaml`:
+   - **sync**: if the default branch moved, merge it in and run verify and review again.
+   - **pr**: push, and open the pull request with the verified commit, the flows, the verify result and the review verdict in its body.
+   - **github**: wait for the checks and the review on the pull request's head commit.
+   - **merge**: merge at exactly that commit, then delete the branch and the worktree.
+
+The last two run only when `factory.yaml` has a `github` block. Without it, a run ends with the pull request open.
 
 The acceptance and red steps are skipped for an issue that adds no flow, and a repo without UI flows can leave them out of `factory.yaml`.
 
@@ -85,11 +91,39 @@ A failure the developer can fix sends the issue back to the dev step. The develo
 
 `on_fail` in `factory.yaml` says where each step's failure goes. Only a return to the dev step is built, so a failed red check still stops the run.
 
-The rounds are limited: 3 by default, set with `limits.fix_rounds` in `factory.yaml`, 5 at most. The limit is shared by every kind of failure. When the rounds run out, the run stops and the issue is labelled `blocked`.
+The rounds are limited: 3 by default, set with `limits.fix_rounds` in `factory.yaml`, 5 at most. The limit is shared by every failure before the pull request. Failures found on GitHub have their own limit. When the rounds run out, the run stops and the issue is labelled `blocked`.
 
 Some failures are never retried, because another attempt would not help: an agent whose reply is unusable twice, a developer who changes no files, a check that times out, a reviewer who names the wrong commit, and any change to git history.
 
 Later reviews see what the earlier review asked for, and are told not to raise new matters of taste.
+
+### The GitHub loop
+
+```yaml
+github:
+  review_check: review   # the check whose verdict comment is the GitHub review
+  checks: []             # other checks that must appear before the commit is judged
+  wait_minutes: 20       # per commit
+  merge: squash          # or merge, or rebase
+limits:
+  github_fix_rounds: 2   # 5 at most
+```
+
+Every signal belongs to one commit. The engine asks GitHub about the pull request's head commit and ignores anything said about another one.
+
+| GitHub says | The engine does |
+| --- | --- |
+| Every check finished and passed, and the review approved this commit | Merges |
+| A check failed | Sends the developer the check's name and the end of its log, as a GitHub fix round |
+| The review asked for changes on this commit | Sends the developer the review's summary and items, as a GitHub fix round |
+| The review check ended with no verdict for this commit | Stops. No code change fixes that. A missing token secret looks like this |
+| Checks are still running after `wait_minutes` | Stops |
+
+A green check is not an approval. The review workflow posts a comment whose first line is `<!-- factory:review {"verdict":...,"sha":...} -->`, and that line is what counts. The engine reads it only from comments by `github-actions[bot]`, which only a workflow in the repository can post as, and only when its `sha` is the head commit. The workflow takes the commit from the event, not from the model.
+
+A GitHub fix round is a full round: the developer continues its session, then verify and the local review run again, and only then is the new commit pushed. GitHub rounds have their own limit, separate from `fix_rounds`.
+
+If the default branch moves during a run, the engine merges it into the issue's branch, which makes a commit nothing has judged, so verify, the local review and GitHub all run again. It uses a merge, not a rebase, so it never force-pushes. A conflict stops the run for a person. This may happen 3 times in one run.
 
 ### How agents are confined
 
@@ -119,8 +153,8 @@ Files live under `~/.factory` (or `FACTORY_HOME`):
 | --- | --- |
 | `state.db` | SQLite: one row per issue, one row per step |
 | `requests.jsonl` | One line per agent call, check or gate |
-| `runs/<repo>/issue-<n>/<run-id>/` | Prompts, schemas, replies, logs and the PR body of one run. Files from fix round 2 carry `-r2` in their names |
-| `worktrees/<repo>/issue-<n>/` | The issue's worktree |
+| `runs/<repo>/issue-<n>/<run-id>/` | Prompts, schemas, replies, logs and the PR body of one run. Files from the second time the run goes back carry `-r2` in their names |
+| `worktrees/<repo>/issue-<n>/` | The issue's worktree. Removed after a merge, kept when the run ends blocked |
 
 ## Modules
 
@@ -172,7 +206,9 @@ cargo install --path .
 | `src/plan/create.rs` | Issue bodies, creation and links, behind a `Github` trait |
 | `src/repo.rs` | `repo init` and the preflight |
 | `src/engine/mod.rs` | The steps and the fixed gates |
-| `src/engine/rounds.rs` | The fix loop: what runs next, and when the rounds run out |
+| `src/engine/rounds.rs` | The loop: what runs next, and when the rounds run out |
+| `src/engine/github.rs` | Checks, the review verdict and the merge, each tied to one commit |
+| `tests/fix_loop.rs` | The real engine run against stand-ins for `gh`, `codex` and `claude` |
 | `src/engine/flows.rs` | What the engine checks in a flow file without running it |
 | `src/engine/workflow.rs` | `factory.yaml` and `module.yaml` loading and checks |
 | `src/engine/agent.rs` | Headless calls to `codex exec` and `claude -p` |

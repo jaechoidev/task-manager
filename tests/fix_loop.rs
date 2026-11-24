@@ -11,16 +11,88 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const GH: &str = r#"#!/bin/bash
-# Stands in for gh: one repository, o/r, with one open issue, #7.
-cat > /dev/null
-if [ "$1" = "repo" ]; then echo "o/r"; exit 0; fi
-if [ "$1" != "api" ]; then exit 1; fi
-case "$3 $6" in
-  "GET repos/o/r/issues/7") cat "$STUB_DIR/issue.json" ;;
-  "GET repos/o/r/issues/7/"*) echo "[]" ;;
-  *) echo "{}" ;;
-esac
+const GH: &str = r#"#!/usr/bin/env python3
+# Stands in for gh: one repository, o/r, with one open issue, #7, and the
+# pull request the engine opens, #9. STUB_GITHUB says how GitHub answers.
+import json, os, subprocess, sys
+
+stub = os.environ["STUB_DIR"]
+mode = os.environ.get("STUB_GITHUB", "green")
+body = sys.stdin.read()
+args = sys.argv[1:]
+if args[:1] == ["repo"]:
+    print("o/r")
+    sys.exit(0)
+if args[:1] != ["api"]:
+    sys.exit(1)
+method = args[2]
+path = args[5] if args[3] == "-H" else args[3]
+with open(f"{stub}/gh.calls", "a") as calls:
+    calls.write(f"{method} {path}\n")
+
+def nth(sha):
+    # 1 for the first commit of the pull request GitHub was asked about.
+    file = f"{stub}/gh.shas"
+    seen = open(file).read().split() if os.path.exists(file) else []
+    if sha not in seen:
+        seen.append(sha)
+        open(file, "w").write("\n".join(seen) + "\n")
+    return seen.index(sha) + 1
+
+def pr_head():
+    git = ["git", "--git-dir", f"{stub}/../origin.git", "rev-parse", "refs/heads/factory/issue-7-a"]
+    return subprocess.run(git, capture_output=True, text=True).stdout.strip()
+
+def comment(login, verdict, sha, items):
+    marker = json.dumps({"v": 1, "verdict": verdict, "sha": sha, "summary": "looked at it", "items": items})
+    return {"user": {"login": login}, "body": f"<!-- factory:review {marker} -->\nVerdict: {verdict}"}
+
+def out(value):
+    print(json.dumps(value))
+
+if method == "GET" and path == "repos/o/r/issues/7":
+    print(open(f"{stub}/issue.json").read())
+elif method == "POST" and path == "repos/o/r/pulls":
+    open(f"{stub}/pr.json", "w").write(body)
+    out({"number": 9, "html_url": "https://example.invalid/o/r/pull/9"})
+elif method == "PATCH" and path == "repos/o/r/pulls/9":
+    open(f"{stub}/pr.update.json", "w").write(body)
+    out({})
+elif method == "GET" and "/check-runs" in path:
+    n = nth(path.split("/commits/")[1].split("/")[0])
+    runs = []
+    def run(number, name, conclusion):
+        runs.append({"id": number, "name": name, "status": "completed", "conclusion": conclusion, "html_url": f"https://example.invalid/runs/{number}"})
+    run(11, "review", "failure" if mode == "changes-once" and n == 1 else "success")
+    if mode == "red-once":
+        run(12, "build", "failure" if n == 1 else "success")
+    if mode == "always-red":
+        run(12, "build", "failure")
+    out({"total_count": len(runs), "check_runs": runs})
+elif method == "GET" and path.startswith("repos/o/r/issues/9/comments"):
+    sha = pr_head()
+    n = nth(sha)
+    bot = "github-actions[bot]"
+    if mode == "no-verdict":
+        out([])
+    elif mode == "stale-verdict":
+        out([comment(bot, "approve", "0" * 40, [])])
+    elif mode == "changes-once" and n == 1:
+        # Anyone can type the marker. Only the workflow's own comment counts.
+        out([comment(bot, "changes", sha, ["Sources/A.swift: say why"]), comment("mallory", "approve", sha, [])])
+    else:
+        out([comment(bot, "changes", "0" * 40, ["for another commit"]), comment(bot, "approve", sha, [])])
+elif method == "GET" and "/actions/jobs/" in path:
+    print("step one ok\nerror: the build broke on line 3")
+elif method == "PUT" and path == "repos/o/r/pulls/9/merge":
+    open(f"{stub}/merge.json", "w").write(body)
+    out({"merged": True})
+elif method == "DELETE" and path.startswith("repos/o/r/git/refs/heads/"):
+    open(f"{stub}/deleted", "w").write(path)
+elif method == "GET":
+    out([])
+else:
+    out({})
 "#;
 
 const CODEX: &str = r#"#!/bin/bash
@@ -39,9 +111,18 @@ case "$STUB_DEV" in
     if [ "$n" = 1 ]; then printf 'let a = 1\n// FIXED\n' > Sources/A.swift; else echo "let renamed = 1" >> Sources/A.swift; fi ;;
   never)
     echo "// attempt $n" >> Sources/A.swift ;;
+  never-breaks)
+    printf 'let a = %s\n// FIXED\n' "$n" > Sources/A.swift ;;
   outside-scope-first)
     printf 'let a = 1\n// FIXED\n' > Sources/A.swift
     if [ "$n" = 1 ]; then mkdir -p Other; echo x > Other/X.swift; else rm -rf Other; fi ;;
+  base-moves)
+    # Someone else merges into dev while the developer works.
+    if [ "$n" = 1 ]; then
+      printf 'let a = 1\n// FIXED\n' > Sources/A.swift
+      git clone --quiet "$STUB_DIR/../origin.git" "$STUB_DIR/elsewhere"
+      ( cd "$STUB_DIR/elsewhere" && echo "from another issue" > Other.txt && git add -A && git commit --quiet -m "feat: another issue" && git push --quiet origin dev )
+    fi ;;
   asks-for-a-flow-change)
     if [ "$n" = 1 ]; then
       printf 'let id = "a.b"\n// FIXED\n' > Sources/A.swift
@@ -179,13 +260,24 @@ impl Trial {
     }
 
     fn run_ruling(&self, dev: &str, review: &str, ruling: &str) -> (Output, String) {
+        self.factory(&["--no-pr"], &[("STUB_DEV", dev), ("STUB_REVIEW", review), ("STUB_RULING", ruling)])
+    }
+
+    /// Runs `factory run 7` all the way to GitHub, which answers as `github` says.
+    fn run_to_github(&self, dev: &str, github: &str, flags: &[&str]) -> (Output, String) {
+        self.factory(flags, &[("STUB_DEV", dev), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", github)])
+    }
+
+    fn factory(&self, flags: &[&str], env: &[(&str, &str)]) -> (Output, String) {
         let output = self
             .command(env!("CARGO_BIN_EXE_factory"))
-            .args(["run", "7", "--no-pr", "--repo-dir"])
+            .args(["run", "7"])
+            .args(flags)
+            .arg("--repo-dir")
             .arg(self.dir.join("repo"))
-            .env("STUB_DEV", dev)
-            .env("STUB_REVIEW", review)
-            .env("STUB_RULING", ruling)
+            .envs(env.iter().copied())
+            .env("FACTORY_POLL_SECONDS", "0")
+            .env("FACTORY_SETTLE_SECONDS", "0")
             .output()
             .unwrap();
         let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -200,6 +292,20 @@ impl Trial {
     fn commits(&self) -> Vec<String> {
         let worktree = self.dir.join("home/worktrees/o__r/issue-7");
         self.git(&worktree, &["log", "--reverse", "--format=%s", "origin/dev..HEAD"]).lines().map(str::to_string).collect()
+    }
+
+    /// Subjects of the commits on the pushed branch, oldest first.
+    fn pushed(&self) -> Vec<String> {
+        let origin = self.dir.join("origin.git");
+        self.git(&origin, &["log", "--reverse", "--format=%s", "dev..factory/issue-7-a"]).lines().map(str::to_string).collect()
+    }
+
+    fn pushed_head(&self) -> String {
+        self.git(&self.dir.join("origin.git"), &["rev-parse", "factory/issue-7-a"])
+    }
+
+    fn json(&self, file: &str) -> serde_json::Value {
+        serde_json::from_str(&self.stub(file)).unwrap_or(serde_json::Value::Null)
     }
 
     fn log(&self) -> String {
@@ -290,8 +396,9 @@ fn a_change_outside_scope_is_sent_back_before_anything_is_committed() {
     let (output, text) = trial.run("outside-scope-first", "approve");
     assert!(output.status.success(), "{text}");
     assert!(text.contains("passed after 1 fix round(s)"), "{text}");
-    // The rejected attempt was never committed.
-    assert_eq!(trial.commits(), vec!["feat(a): attempt 2"]);
+    // The rejected attempt was never committed. The one commit holds the
+    // whole change, so it is named after the change, not after the fix.
+    assert_eq!(trial.commits(), vec!["feat(a): attempt 1"]);
     let prompt = trial.stub("codex.prompt.2");
     assert!(prompt.contains("at the `develop` step"), "{prompt}");
     assert!(prompt.contains("outside the issue's scope: Other/X.swift"), "{prompt}");
@@ -343,4 +450,148 @@ fn a_rejected_flow_change_sends_the_developer_back_to_the_code() {
     assert!(prompt.contains("rejected your flow change request"), "{prompt}");
     assert!(prompt.contains("the criteria require that assertion"), "{prompt}");
     assert!(prompt.contains("at the `develop` step"), "{prompt}");
+}
+
+/// A workflow that follows the pull request on GitHub, with `rounds` GitHub
+/// fix rounds.
+fn github_workflow(rounds: u32) -> String {
+    format!(
+        "workflow:\n  - develop: {{ module: agent/dev, vendor: codex }}\n  - verify:  {{ module: check/verify }}\n  - review:  {{ module: agent/review, vendor: claude }}\non_fail:\n  verify: develop\n  review: develop\ngithub:\n  review_check: review\nlimits:\n  github_fix_rounds: {rounds}\n"
+    )
+}
+
+#[test]
+fn a_green_pull_request_is_merged_at_the_commit_that_was_judged() {
+    let trial = Trial::build("merge", &github_workflow(2), ISSUE_BODY);
+    let (output, text) = trial.run_to_github("right-first-time", "green", &[]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("MERGED into dev: https://example.invalid/o/r/pull/9"), "{text}");
+
+    let opened = trial.json("pr.json");
+    assert_eq!((opened["base"].as_str(), opened["head"].as_str()), (Some("dev"), Some("factory/issue-7-a")));
+    assert_eq!(opened["title"], "feat(a): attempt 1");
+    assert!(opened["body"].as_str().unwrap().starts_with("Closes #7"), "{opened}");
+
+    let merge = trial.json("merge.json");
+    assert_eq!(merge["sha"].as_str().unwrap(), trial.pushed_head());
+    assert_eq!(merge["merge_method"], "squash");
+    assert_eq!(merge["commit_title"], "feat(a): attempt 1 (#9)");
+    assert_eq!(merge["commit_message"], "Closes #7");
+
+    // The branch and the worktree are gone. The run's files stay.
+    assert_eq!(trial.stub("deleted"), "repos/o/r/git/refs/heads/factory/issue-7-a");
+    assert!(!trial.dir.join("home/worktrees/o__r/issue-7").exists());
+    assert!(trial.log().contains("\"step\":\"merge\"") && trial.log().contains("\"verdict\":\"merged\""));
+    // A verdict the workflow posted for another commit did not count against this one.
+    assert_eq!(trial.stub("codex.count"), "1");
+}
+
+#[test]
+fn a_github_review_asking_for_changes_starts_a_github_fix_round() {
+    let trial = Trial::build("gh-review", &github_workflow(2), ISSUE_BODY);
+    let (output, text) = trial.run_to_github("right-first-time", "changes-once", &[]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("passed after 1 fix round(s)"), "{text}");
+    assert_eq!(trial.pushed(), vec!["feat(a): attempt 1", "feat(a): attempt 2"]);
+
+    let prompt = trial.stub("codex.prompt.2");
+    assert!(prompt.contains("at the `github` step"), "{prompt}");
+    assert!(prompt.contains("This is fix round 1 of 2"), "{prompt}");
+    assert!(prompt.contains("R1: Sources/A.swift: say why"), "{prompt}");
+    assert!(trial.stub("codex.args.2").starts_with("exec resume stub-session"));
+
+    // The fix was verified and reviewed locally before it was pushed, the
+    // pull request's body was refreshed, and only then was it merged. The
+    // approval typed by someone who is not the workflow never counted.
+    assert_eq!(trial.log().matches("\"step\":\"verify\"").count(), 2);
+    assert_eq!(trial.stub("claude.count"), "2");
+    assert!(trial.json("pr.update.json")["body"].as_str().unwrap().contains("Fix rounds"));
+    assert_eq!(trial.json("merge.json")["sha"].as_str().unwrap(), trial.pushed_head());
+    assert_eq!(trial.stub("gh.shas").lines().count(), 2);
+}
+
+#[test]
+fn a_red_check_goes_back_to_the_developer_with_its_log() {
+    let trial = Trial::build("gh-red", &github_workflow(2), ISSUE_BODY);
+    let (output, text) = trial.run_to_github("right-first-time", "red-once", &[]);
+    assert!(output.status.success(), "{text}");
+    let prompt = trial.stub("codex.prompt.2");
+    assert!(prompt.contains("The check `build` ended as failure"), "{prompt}");
+    assert!(prompt.contains("error: the build broke on line 3"), "{prompt}");
+    assert!(text.contains("MERGED into dev"), "{text}");
+}
+
+#[test]
+fn github_fix_rounds_run_out_and_the_pull_request_stays_open() {
+    let trial = Trial::build("gh-limit", &github_workflow(1), ISSUE_BODY);
+    let (output, text) = trial.run_to_github("never-breaks", "always-red", &[]);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("1 GitHub fix round was used and 'github' still fails"), "{text}");
+    assert!(text.contains("the pull request stays open: https://example.invalid/o/r/pull/9"), "{text}");
+    assert_eq!(trial.stub("codex.count"), "2");
+    assert_eq!(trial.stub("merge.json"), "");
+    assert!(trial.dir.join("home/worktrees/o__r/issue-7").exists());
+}
+
+#[test]
+fn a_green_check_without_a_verdict_for_this_commit_is_not_an_approval() {
+    for mode in ["no-verdict", "stale-verdict"] {
+        let trial = Trial::build(mode, &github_workflow(2), ISSUE_BODY);
+        let (output, text) = trial.run_to_github("right-first-time", mode, &[]);
+        assert_eq!(output.status.code(), Some(1), "{mode}: {text}");
+        assert!(text.contains("the 'review' check passed without posting a verdict"), "{mode}: {text}");
+        // No code change fixes a missing verdict, so the developer is not called again.
+        assert_eq!(trial.stub("codex.count"), "1", "{mode}");
+        assert_eq!(trial.stub("merge.json"), "", "{mode}");
+    }
+}
+
+#[test]
+fn a_base_branch_that_moved_is_merged_in_and_everything_is_judged_again() {
+    let trial = Trial::build("moved", &github_workflow(2), ISSUE_BODY);
+    let (output, text) = trial.run_to_github("base-moves", "green", &[]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("dev moved 1 time(s) during the run and was merged in"), "{text}");
+    assert_eq!(trial.pushed(), vec!["feat(a): attempt 1", "merge: dev into factory/issue-7-a"]);
+
+    // Verify and review ran again on the merge commit, without the developer.
+    assert_eq!(trial.stub("codex.count"), "1");
+    assert_eq!(trial.log().matches("\"step\":\"verify\"").count(), 2);
+    assert_eq!(trial.stub("claude.count"), "2");
+    // The second review judged the merge commit, and its diff holds only this
+    // issue's change, not what came in from dev.
+    let review = trial.stub("claude.prompt.2");
+    assert!(review.contains(&format!("Commit under review: `{}`", trial.pushed_head())), "{review}");
+    assert!(review.contains("Sources/A.swift") && !review.contains("Other.txt"), "{review}");
+    assert_eq!(trial.json("merge.json")["sha"].as_str().unwrap(), trial.pushed_head());
+}
+
+#[test]
+fn no_merge_stops_once_github_is_green() {
+    let trial = Trial::build("no-merge", &github_workflow(2), ISSUE_BODY);
+    let (output, text) = trial.run_to_github("right-first-time", "green", &["--no-merge"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Not merged (--no-merge)"), "{text}");
+    assert_eq!(trial.stub("merge.json"), "");
+    assert!(trial.log().contains("\"step\":\"github\"") && trial.log().contains("\"verdict\":\"green\""));
+}
+
+#[test]
+fn without_a_github_block_the_run_ends_with_the_pull_request_open() {
+    let trial = Trial::new("open-only", 3);
+    let (output, text) = trial.factory(&[], &[("STUB_DEV", "right-first-time"), ("STUB_REVIEW", "approve")]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("PASSED every step. Pull request: https://example.invalid/o/r/pull/9"), "{text}");
+    assert!(!trial.stub("gh.calls").contains("check-runs"), "nothing was asked about checks");
+    assert_eq!(trial.stub("merge.json"), "");
+}
+
+#[test]
+fn a_pull_request_is_named_after_the_change_even_when_a_gate_held_the_first_attempt() {
+    let trial = Trial::build("title", &github_workflow(2), ISSUE_BODY);
+    let (output, text) = trial.run_to_github("outside-scope-first", "green", &[]);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(trial.json("pr.json")["title"], "feat(a): attempt 1");
+    assert_eq!(trial.json("merge.json")["commit_title"], "feat(a): attempt 1 (#9)");
+    assert!(trial.json("pr.json")["body"].as_str().unwrap().contains("`develop` failed: scope gate"));
 }

@@ -1,7 +1,8 @@
 //! Loads a repo's workflow (`factory.yaml`) and the modules it names, and
 //! checks the chain before anything runs.
 
-use super::rounds::{DEFAULT_FIX_ROUNDS, MAX_FIX_ROUNDS};
+use super::github;
+use super::rounds::{DEFAULT_FIX_ROUNDS, DEFAULT_GITHUB_FIX_ROUNDS, MAX_FIX_ROUNDS};
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -142,6 +143,19 @@ struct FactoryFile {
     on_fail: BTreeMap<String, String>,
     #[serde(default)]
     limits: Limits,
+    /// Present when the engine should follow the pull request on GitHub and
+    /// merge it. Absent, a run ends with the pull request open.
+    github: Option<GithubSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GithubSpec {
+    wait_minutes: Option<u64>,
+    #[serde(default)]
+    checks: Vec<String>,
+    review_check: Option<String>,
+    merge: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -149,6 +163,8 @@ struct FactoryFile {
 struct Limits {
     /// How many times a failure may send the issue back to the developer.
     fix_rounds: Option<u32>,
+    /// The same, for failures found on GitHub after the pull request opens.
+    github_fix_rounds: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +189,8 @@ pub struct Workflow {
     pub on_fail: BTreeMap<String, String>,
     /// How many times a failure may send the issue back to the developer.
     pub fix_rounds: u32,
+    pub github_fix_rounds: u32,
+    pub github: Option<github::Settings>,
 }
 
 /// `read(module, file)` returns a module file's text, or `None` when the
@@ -342,10 +360,34 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
         errors.push(format!("limits.fix_rounds is {fix_rounds}, and the most the engine allows is {MAX_FIX_ROUNDS}"));
     }
 
+    let github_fix_rounds = file.limits.github_fix_rounds.unwrap_or(DEFAULT_GITHUB_FIX_ROUNDS);
+    if github_fix_rounds > MAX_FIX_ROUNDS {
+        errors.push(format!("limits.github_fix_rounds is {github_fix_rounds}, and the most the engine allows is {MAX_FIX_ROUNDS}"));
+    }
+    let github = file.github.map(|spec| github::Settings {
+        wait_minutes: spec.wait_minutes.unwrap_or(20),
+        checks: spec.checks,
+        review_check: spec.review_check.filter(|name| !name.trim().is_empty()),
+        merge: spec.merge.unwrap_or_else(|| "squash".to_string()),
+    });
+    if let Some(settings) = &github {
+        if !["squash", "merge", "rebase"].contains(&settings.merge.as_str()) {
+            errors.push(format!("github.merge is '{}' (use squash, merge or rebase)", settings.merge));
+        }
+        if settings.wait_minutes == 0 || settings.wait_minutes > 180 {
+            errors.push("github.wait_minutes must be between 1 and 180".to_string());
+        }
+        for reserved in ["sync", "pr", "github", "merge"] {
+            if names.contains(reserved) {
+                errors.push(format!("'{reserved}' is a step the engine adds itself and can't be a step name"));
+            }
+        }
+    }
+
     if !errors.is_empty() {
         bail!("factory.yaml is not valid:\n  - {}", errors.join("\n  - "));
     }
-    Ok(Workflow { steps, on_fail: file.on_fail, fix_rounds })
+    Ok(Workflow { steps, on_fail: file.on_fail, fix_rounds, github_fix_rounds, github })
 }
 
 #[cfg(test)]
@@ -443,6 +485,23 @@ on_fail:
         assert_eq!(parse(&none, &builtin).unwrap().fix_rounds, 0);
         let many = format!("{WITH_ACCEPTANCE}limits:\n  fix_rounds: 9\n");
         assert!(errors(&many).contains("the most the engine allows is 5"));
+    }
+
+    #[test]
+    fn the_github_block_is_optional_and_checked() {
+        assert!(parse(WITH_ACCEPTANCE, &builtin).unwrap().github.is_none());
+        let with = format!("{WITH_ACCEPTANCE}github:\n  review_check: review\nlimits:\n  github_fix_rounds: 1\n");
+        let workflow = parse(&with, &builtin).unwrap();
+        let github = workflow.github.unwrap();
+        assert_eq!((github.wait_minutes, github.merge.as_str(), github.review_check.as_deref()), (20, "squash", Some("review")));
+        assert_eq!((workflow.fix_rounds, workflow.github_fix_rounds), (3, 1));
+
+        let bad = format!("{WITH_ACCEPTANCE}github:\n  merge: fast\n  wait_minutes: 0\n");
+        let found = errors(&bad);
+        assert!(found.contains("github.merge is 'fast'"), "{found}");
+        assert!(found.contains("wait_minutes must be between 1 and 180"), "{found}");
+        let reserved = format!("{}github: {{}}\n", WITH_ACCEPTANCE.replace("verify:     {", "merge:      {").replace("verify: develop", "merge: develop"));
+        assert!(errors(&reserved).contains("'merge' is a step the engine adds itself"), "{}", errors(&reserved));
     }
 
     #[test]

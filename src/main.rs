@@ -44,6 +44,10 @@ enum Top {
         /// Stop after review, without pushing or opening a pull request
         #[arg(long)]
         no_pr: bool,
+        /// Follow the pull request on GitHub and fix what fails there, but
+        /// leave the merge to a person
+        #[arg(long)]
+        no_merge: bool,
     },
     /// Show where each issue stands, from the state database
     Status,
@@ -216,8 +220,8 @@ fn run() -> Result<bool> {
             Ok(repo::passed(&checks))
         }
 
-        Top::Run { issue, repo_dir, workflow, no_pr } => {
-            engine::run(&engine::RunOptions { repo_dir, issue, workflow_file: workflow, no_pr })
+        Top::Run { issue, repo_dir, workflow, no_pr, no_merge } => {
+            engine::run(&engine::RunOptions { repo_dir, issue, workflow_file: workflow, no_pr, no_merge })
         }
 
         Top::Status => {

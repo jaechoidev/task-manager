@@ -66,6 +66,20 @@ pub fn api(method: &str, path: &str, body: Option<&Value>) -> Result<Value, ApiE
     serde_json::from_str(&stdout).map_err(|e| fail(format!("{method} {path}: unreadable response: {e}")))
 }
 
+/// Reads an endpoint that answers with plain text, such as a job's log.
+pub fn api_text(path: &str) -> Result<String, ApiError> {
+    let output = Command::new("gh")
+        .args(["api", "--method", "GET", path])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| ApiError { status: None, message: format!("could not run gh: {e}") })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ApiError { status: None, message: format!("GET {path}: {stderr}") });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Reads every page of a list endpoint. `path` must not carry a `page` parameter.
 pub fn api_list(path: &str) -> Result<Vec<Value>, ApiError> {
     let sep = if path.contains('?') { '&' } else { '?' };

@@ -1,12 +1,14 @@
 //! The issue loop, run by code. An agent saying "done" is never a pass.
 //!
 //! This version takes one issue through acceptance flows, develop, verify and
-//! review, then opens a pull request. A failed verify or a review that asks
-//! for changes sends the issue back to the developer, up to a round limit.
+//! review, opens a pull request, waits for GitHub's checks and review on the
+//! same commit, and merges. A failure the developer can fix sends the issue
+//! back to it, up to a round limit.
 
 pub mod agent;
 pub mod flows;
 pub mod git;
+pub mod github;
 pub mod issue;
 pub mod proc;
 pub mod rounds;
@@ -17,13 +19,13 @@ pub mod workflow;
 use crate::gh;
 use anyhow::{anyhow, bail, Context, Result};
 use issue::Issue;
-use rounds::{End, Feedback, Outcome};
+use rounds::{End, Feedback, Limits, Outcome};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use state::{StepRecord, Store};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use workflow::{Access, Kind, Role, Step, Workflow};
 
 /// Longest diff handed to a reviewer inline. The reviewer can read the rest.
@@ -40,6 +42,8 @@ pub struct RunOptions {
     pub workflow_file: Option<PathBuf>,
     /// Stop after review, without pushing or opening a pull request.
     pub no_pr: bool,
+    /// Follow the pull request on GitHub, but don't merge it.
+    pub no_merge: bool,
 }
 
 /// The developer's final message.
@@ -128,6 +132,12 @@ struct Run<'a> {
     run_id: String,
     run_dir: PathBuf,
     worktree: PathBuf,
+    /// The checkout the worktree belongs to.
+    repo_dir: PathBuf,
+    /// The branch pull requests go into, and its remote-tracking name.
+    base: String,
+    base_ref: String,
+    branch: String,
     base_sha: String,
     /// Where the branch must be right now: the engine's latest commit.
     expected: String,
@@ -139,13 +149,22 @@ struct Run<'a> {
     /// Every accessibility ID development must implement: the plan's, plus
     /// any the acceptance writer added.
     ids: Vec<String>,
-    /// 0 for the first pass, then one per fix round.
+    /// 0 for the first pass, then one more each time the run goes back.
     round: u32,
-    max_rounds: u32,
     fixes: Vec<Fix>,
+    /// The pull request, once open: number and URL.
+    pr: Option<(u64, String)>,
+    github: Option<github::Settings>,
+    /// When the branch was last pushed.
+    pushed: Option<Instant>,
+    merged: bool,
     dev: Option<DevReport>,
     dev_vendor: Option<String>,
     dev_subject: Option<String>,
+    /// The subject the developer proposed on its first attempt. It names the
+    /// whole change even when a gate held that attempt back and the first
+    /// commit comes out of a fix round.
+    first_subject: Option<String>,
     /// The developer's session, continued in fix rounds.
     dev_session: Option<String>,
     /// The review before the current one, when it asked for changes.
@@ -322,6 +341,34 @@ impl Run<'_> {
         Ok(match self.gate(name, Some(reason))? {
             Outcome::Stop(reason) => Outcome::Rework(reason),
             other => other,
+        })
+    }
+
+    /// Logs a step the engine does itself, such as a push or a merge.
+    fn engine_step(&self, name: &str, verdict: &str, started: Instant) -> Result<()> {
+        self.store.record(&StepRecord {
+            ts: util::now(),
+            repo: self.repo.clone(),
+            issue: self.issue.number,
+            run_id: self.run_id.clone(),
+            step: name.to_string(),
+            kind: "engine".to_string(),
+            module: format!("engine/{name}"),
+            vendor: None,
+            model: None,
+            subscription: None,
+            round: self.round,
+            attempt: 1,
+            sha: Some(self.expected.clone()),
+            exit_code: None,
+            timed_out: false,
+            verdict: verdict.to_string(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            input: None,
+            output: None,
+            stdout: None,
+            stderr: None,
+            session_id: None,
         })
     }
 
@@ -557,8 +604,8 @@ impl Run<'_> {
                     None => "Nothing of yours is committed yet. Your earlier changes are still in the directory, because a gate rejected them.".to_string(),
                 };
                 values.extend([
-                    ("round", self.round.to_string()),
-                    ("max_rounds", self.max_rounds.to_string()),
+                    ("round", feedback.round.to_string()),
+                    ("max_rounds", feedback.limit.to_string()),
                     ("failed_step", feedback.from.clone()),
                     ("state", state),
                     // Untrusted text, such as a log, goes last.
@@ -584,6 +631,9 @@ impl Run<'_> {
         };
         if session.is_some() {
             self.dev_session = session;
+        }
+        if self.first_subject.is_none() {
+            self.first_subject = Some(report.commit_subject.clone());
         }
         // A gate the developer can fix sends it back with the reason, and
         // with the failure it was already working on, which still stands.
@@ -633,7 +683,11 @@ impl Run<'_> {
         }
         self.gate("ids-implemented", None)?;
 
-        let subject = commit_subject(&report.commit_subject, self.issue);
+        // The developer's first commit holds the whole change, so it carries
+        // the subject of the first attempt, whichever round it lands in.
+        let first_commit = self.dev_subject.is_none();
+        let proposed = if first_commit { self.first_subject.clone().unwrap_or_default() } else { report.commit_subject.clone() };
+        let subject = commit_subject(&proposed, self.issue);
         let body = format!("Issue #{}", self.issue.number);
         let head = git::commit_all(&self.worktree, &subject, &body)?;
         println!("  committed {} \"{subject}\"", &head[..head.len().min(10)]);
@@ -641,15 +695,11 @@ impl Run<'_> {
         self.expected = head.clone();
         self.head_sha = Some(head.clone());
         self.dev_vendor = step.vendor.map(|v| v.name().to_string());
-        match feedback {
-            Some(feedback) => self.fixes.push(Fix {
-                round: self.round,
-                from: feedback.from.clone(),
-                why: first_line(&feedback.reason),
-                commit: head,
-                subject,
-            }),
-            None => self.dev_subject = Some(subject),
+        if first_commit {
+            self.dev_subject = Some(subject.clone());
+        }
+        if let Some(feedback) = feedback {
+            self.fixes.push(Fix { round: self.round, from: feedback.from.clone(), why: first_line(&feedback.reason), commit: head, subject });
         }
         self.dev = Some(report);
         Ok(Outcome::Pass)
@@ -839,7 +889,10 @@ impl Run<'_> {
 
     fn review(&mut self, index: usize, step: &Step) -> Result<Outcome> {
         let head = self.head_sha.clone().ok_or_else(|| anyhow!("review needs a commit"))?;
-        let mut diff = git::diff(&self.worktree, &self.base_sha, &head)?;
+        // The branch's own changes. After the base branch was merged in, that
+        // is no longer everything since the commit the branch started from.
+        let from = git::git(&self.worktree, &["merge-base", &self.base_ref, &head]).unwrap_or_else(|_| self.base_sha.clone());
+        let mut diff = git::diff(&self.worktree, &from, &head)?;
         if diff.len() > MAX_DIFF_CHARS {
             let cut = (0..=MAX_DIFF_CHARS).rev().find(|&i| diff.is_char_boundary(i)).unwrap_or(0);
             diff.truncate(cut);
@@ -850,7 +903,7 @@ impl Run<'_> {
         let mut values = self.issue_values();
         values.extend([
             ("head_sha", head.clone()),
-            ("base_sha", self.base_sha.clone()),
+            ("base_sha", from),
             ("verify_result", verify),
             ("acceptance", self.acceptance_note()),
             (
@@ -900,6 +953,173 @@ impl Run<'_> {
         };
         self.review = Some((vendor, verdict));
         Ok(result)
+    }
+
+    /// Takes in the base branch when it has moved since the branch last
+    /// contained it. The branch then holds a commit nothing has judged, so
+    /// every check runs again. `name` is the step doing the asking.
+    fn sync(&mut self, name: &str) -> Result<Outcome> {
+        let started = Instant::now();
+        git::git(&self.worktree, &["fetch", "--quiet", "origin"])?;
+        if git::is_ancestor(&self.worktree, &self.base_ref, "HEAD")? {
+            if name == "sync" {
+                self.engine_step(name, "pass", started)?;
+            }
+            return Ok(Outcome::Pass);
+        }
+        let tip = git::git(&self.worktree, &["rev-parse", &self.base_ref])?;
+        println!("  {name}: {} moved to {}, merging it in", self.base, &tip[..tip.len().min(10)]);
+        let message = format!("merge: {} into {}", self.base, self.branch);
+        match git::merge_in(&self.worktree, &self.base_ref, &message)? {
+            Ok(sha) => {
+                self.store.set_head(&self.repo, self.issue.number, &sha)?;
+                self.expected = sha.clone();
+                self.head_sha = Some(sha.clone());
+                self.engine_step(name, "merged-base", started)?;
+                Ok(Outcome::Again(format!("{} moved to {tip} and was merged in as {sha}", self.base)))
+            }
+            Err(conflicts) => {
+                self.engine_step(name, "conflict", started)?;
+                Ok(Outcome::Stop(format!(
+                    "{} moved to {tip}, and merging it in conflicts in: {}. A person resolves this",
+                    self.base,
+                    conflicts.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// Pushes the branch and opens the pull request, or refreshes its body
+    /// when it is already open.
+    fn publish(&mut self) -> Result<Outcome> {
+        let started = Instant::now();
+        if let Err(e) = git::git(&self.worktree, &["push", "--quiet", "-u", "origin", &self.branch]) {
+            self.engine_step("pr", "push-failed", started)?;
+            return Ok(Outcome::Stop(format!("could not push {}: {e:#}", self.branch)));
+        }
+        self.pushed = Some(Instant::now());
+        let body = self.pr_body();
+        std::fs::write(self.run_dir.join(format!("pr-body{}.md", self.round_tag())), &body)?;
+        match &self.pr {
+            Some((number, _)) => {
+                github::update_pr_body(&self.repo, *number, &body)?;
+                println!("  pr: pushed {} to #{number}", &self.expected[..self.expected.len().min(10)]);
+            }
+            None => {
+                let title = match &self.dev_subject {
+                    Some(subject) => subject.clone(),
+                    None => git::git(&self.worktree, &["log", "-1", "--format=%s"])?,
+                };
+                let (number, url) = match github::open_pr(&self.repo, &self.base, &self.branch, &title, &body) {
+                    Ok(found) => found,
+                    Err(e) => {
+                        self.engine_step("pr", "open-failed", started)?;
+                        return Ok(Outcome::Stop(format!("could not open the pull request: {e:#}")));
+                    }
+                };
+                self.store.set_pr(&self.repo, self.issue.number, number, &url)?;
+                println!("  pr: opened {url}");
+                self.pr = Some((number, url));
+            }
+        }
+        self.engine_step("pr", "pushed", started)?;
+        Ok(Outcome::Pass)
+    }
+
+    /// Waits for GitHub's checks and review on the pull request's head
+    /// commit. A check or a verdict for any other commit is ignored.
+    fn github(&mut self) -> Result<Outcome> {
+        let settings = self.github.clone().ok_or_else(|| anyhow!("the workflow has no github block"))?;
+        let (pr, _) = self.pr.clone().ok_or_else(|| anyhow!("no pull request is open"))?;
+        let head = self.head_sha.clone().ok_or_else(|| anyhow!("no commit to wait on"))?;
+        let started = Instant::now();
+        let wait = Duration::from_secs(settings.wait_minutes * 60);
+        let seconds_from = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let poll = Duration::from_secs(seconds_from("FACTORY_POLL_SECONDS", 15));
+        let settle = Duration::from_secs(seconds_from("FACTORY_SETTLE_SECONDS", 30));
+        let mut shown = String::new();
+        loop {
+            let checks = github::checks(&self.repo, &head)?;
+            let review = match settings.review_check {
+                Some(_) => github::review_for(&self.repo, pr, &head)?,
+                None => None,
+            };
+            let settled = self.pushed.is_none_or(|at| at.elapsed() >= settle);
+            match github::judge(&settings, &checks, review.as_ref(), settled) {
+                github::Standing::Waiting(what) => {
+                    if what != shown {
+                        println!("  github: waiting on {}, {what}", &head[..head.len().min(10)]);
+                        shown = what.clone();
+                    }
+                    if started.elapsed() >= wait {
+                        self.engine_step("github", "timeout", started)?;
+                        return Ok(Outcome::Stop(format!(
+                            "GitHub's checks on {head} did not finish in {} minutes: {what}",
+                            settings.wait_minutes
+                        )));
+                    }
+                    std::thread::sleep(poll);
+                }
+                github::Standing::Green => {
+                    println!("  github: green on {} after {}", &head[..head.len().min(10)], seconds(started.elapsed()));
+                    self.engine_step("github", "green", started)?;
+                    return Ok(Outcome::Pass);
+                }
+                github::Standing::NoVerdict(why) => {
+                    self.engine_step("github", "no-verdict", started)?;
+                    return Ok(Outcome::Stop(why));
+                }
+                github::Standing::Failed { checks, review } => {
+                    let mut text = format!("GitHub did not pass commit `{head}`, in pull request #{pr}.");
+                    for check in &checks {
+                        let log = github::job_log(&self.repo, check.id);
+                        let file = self.run_dir.join(format!("github-{}{}.log", check.name.replace('/', "_"), self.round_tag()));
+                        let _ = std::fs::write(&file, &log);
+                        text.push_str(&format!(
+                            "\n\n## The check `{}` ended as {}\n\n{}\n\nThe end of its log:\n\n```\n{}\n```",
+                            check.name,
+                            check.conclusion.as_deref().unwrap_or("unknown"),
+                            check.url,
+                            tail(&file)
+                        ));
+                    }
+                    if let Some(review) = &review {
+                        let items: Vec<String> = review.items.iter().enumerate().map(|(i, item)| format!("R{}: {}", i + 1, item.trim())).collect();
+                        text.push_str(&format!(
+                            "\n\n## The GitHub review asked for changes\n\n{}\n\nFix each of these:\n\n{}",
+                            review.summary.trim(),
+                            bullets(&items, false)
+                        ));
+                    }
+                    println!("  github: failed on {}", &head[..head.len().min(10)]);
+                    self.engine_step("github", "failed", started)?;
+                    return Ok(Outcome::Rework(text));
+                }
+            }
+        }
+    }
+
+    /// Merges the pull request, at the commit everything was judged on.
+    fn merge(&mut self) -> Result<Outcome> {
+        // The base branch may have moved while GitHub was checking.
+        match self.sync("merge")? {
+            Outcome::Pass => {}
+            other => return Ok(other),
+        }
+        let started = Instant::now();
+        let settings = self.github.clone().ok_or_else(|| anyhow!("the workflow has no github block"))?;
+        let (pr, url) = self.pr.clone().ok_or_else(|| anyhow!("no pull request is open"))?;
+        let head = self.head_sha.clone().ok_or_else(|| anyhow!("no commit to merge"))?;
+        let title = format!("{} (#{pr})", self.dev_subject.clone().unwrap_or_else(|| self.issue.title.clone()));
+        let message = format!("Closes #{}", self.issue.number);
+        if let Err(e) = github::merge(&self.repo, pr, &head, &settings.merge, &title, &message) {
+            self.engine_step("merge", "refused", started)?;
+            return Ok(Outcome::Stop(format!("GitHub refused to merge #{pr} at {head}: {e:#}")));
+        }
+        println!("  merge: {url} merged into {} at {}", self.base, &head[..head.len().min(10)]);
+        self.merged = true;
+        self.engine_step("merge", "merged", started)?;
+        Ok(Outcome::Pass)
     }
 
     fn pr_body(&self) -> String {
@@ -1010,7 +1230,7 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     let read_module = |module: &str, file: &str| {
         read_base(&format!("modules/{module}/{file}")).or_else(|| workflow::builtin(module, file))
     };
-    let Workflow { steps, on_fail, fix_rounds } = workflow::parse(&workflow_text, &read_module)?;
+    let Workflow { steps, mut on_fail, fix_rounds, github_fix_rounds, github } = workflow::parse(&workflow_text, &read_module)?;
     let acceptance_step = steps.iter().find(|s| s.def.role == Some(Role::Acceptance));
 
     // Flow names end up in file paths and in a shell command.
@@ -1053,6 +1273,10 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         run_id,
         run_dir,
         worktree: worktree.clone(),
+        repo_dir: repo_dir.clone(),
+        base: base.clone(),
+        base_ref: base_ref.clone(),
+        branch: branch.clone(),
         expected: base_sha.clone(),
         base_sha,
         head_sha: None,
@@ -1060,11 +1284,15 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         red: None,
         ids: issue.marker.accessibility_ids.clone(),
         round: 0,
-        max_rounds: fix_rounds,
         fixes: Vec::new(),
+        pr: None,
+        github: github.clone(),
+        pushed: None,
+        merged: false,
         dev: None,
         dev_vendor: None,
         dev_subject: None,
+        first_subject: None,
         dev_session: None,
         earlier_review: None,
         ruling: None,
@@ -1072,86 +1300,116 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         review: None,
     };
 
-    let names: Vec<String> = steps.iter().map(|s| s.name.clone()).collect();
     let dev_index = steps
         .iter()
         .position(|s| s.def.role == Some(Role::Dev))
         .ok_or_else(|| anyhow!("the workflow has no dev step"))?;
-    let (end, rounds_used) = rounds::drive(&names, dev_index, &on_fail, fix_rounds, &mut |index, round, feedback| {
-        let step = &steps[index];
-        run.round = round;
-        if let Some(feedback) = feedback {
-            println!("  fix round {round} of {fix_rounds}: back to {} after {} failed", step.name, feedback.from);
+    // After the workflow's own steps come the engine's: take in a moved base
+    // branch, push and open the pull request, wait on GitHub, merge. A repo
+    // with no `github` block stops with the pull request open.
+    let mut names: Vec<String> = steps.iter().map(|s| s.name.clone()).collect();
+    if !opts.no_pr {
+        names.extend(["sync".to_string(), "pr".to_string()]);
+    }
+    let github_from = names.len();
+    let follows = github.is_some() && !opts.no_pr;
+    if follows {
+        names.push("github".to_string());
+        on_fail.insert("github".to_string(), steps[dev_index].name.clone());
+        if !opts.no_merge {
+            names.push("merge".to_string());
         }
-        store.set_stage(&repo, issue.number, &step.name, "running", None)?;
-        let result = match (step.def.kind, step.def.role) {
-            (Kind::Agent, Some(Role::Acceptance)) => run.acceptance(index, step),
-            (Kind::Agent, Some(Role::Dev)) => run.develop(index, step, feedback).and_then(|outcome| {
-                // A flow change request is ruled on before anything judges the code.
-                let request = run.dev.as_ref().and_then(|d| d.flow_change_request.clone()).filter(|r| !r.trim().is_empty());
-                match (outcome, request, acceptance_step.filter(|s| s.ruling_prompt.is_some())) {
-                    (Outcome::Pass, Some(request), Some(writer)) => run.rule(index, writer, &request),
-                    (outcome, _, _) => Ok(outcome),
-                }
-            }),
-            (Kind::Agent, Some(Role::Review)) => run.review(index, step),
-            (Kind::Check, _) => run.check(index, step),
-            _ => Err(anyhow!("step '{}' has a kind the engine can't run yet", step.name)),
+    }
+    let limits = Limits { local: fix_rounds, github: github_fix_rounds, github_from };
+    let (end, used) = rounds::drive(&names, dev_index, &on_fail, limits, &mut |index, turn| {
+        let name = &names[index];
+        run.round = turn.pass;
+        if let Some(feedback) = turn.feedback {
+            println!("  fix round {} of {}: back to {name} after {} failed", feedback.round, feedback.limit, feedback.from);
+        }
+        store.set_stage(&repo, issue.number, name, "running", None)?;
+        let result = match steps.get(index) {
+            None => match name.as_str() {
+                "sync" => run.sync("sync"),
+                "pr" => run.publish(),
+                "github" => run.github(),
+                "merge" => run.merge(),
+                other => Err(anyhow!("'{other}' is not a step the engine knows")),
+            },
+            Some(step) => match (step.def.kind, step.def.role) {
+                (Kind::Agent, Some(Role::Acceptance)) => run.acceptance(index, step),
+                (Kind::Agent, Some(Role::Dev)) => run.develop(index, step, turn.feedback).and_then(|outcome| {
+                    // A flow change request is ruled on before anything judges the code.
+                    let request = run.dev.as_ref().and_then(|d| d.flow_change_request.clone()).filter(|r| !r.trim().is_empty());
+                    match (outcome, request, acceptance_step.filter(|s| s.ruling_prompt.is_some())) {
+                        (Outcome::Pass, Some(request), Some(writer)) => run.rule(index, writer, &request),
+                        (outcome, _, _) => Ok(outcome),
+                    }
+                }),
+                (Kind::Agent, Some(Role::Review)) => run.review(index, step),
+                (Kind::Check, _) => run.check(index, step),
+                _ => Err(anyhow!("step '{}' has a kind the engine can't run yet", step.name)),
+            },
         };
         // An engine error stops the run like any failure no fix round can help.
         Ok(result.unwrap_or_else(|e| Outcome::Stop(format!("engine error: {e:#}"))))
     })?;
+    let fix_rounds_used = used.local + used.github;
     let stopped = match end {
         End::Passed => None,
         End::Blocked { step, reason } => Some((step, reason)),
-        End::OutOfRounds { step, reason } => {
-            let rounds = if fix_rounds == 1 { "1 fix round was".to_string() } else { format!("{fix_rounds} fix rounds were") };
+        End::OutOfRounds { step, reason, limit, github } => {
+            let kind = if github { "GitHub fix round" } else { "fix round" };
+            let rounds = if limit == 1 { format!("1 {kind} was") } else { format!("{limit} {kind}s were") };
             Some((step.clone(), format!("{rounds} used and '{step}' still fails. The last failure:\n{reason}")))
         }
     };
     if let Some((step, failure)) = stopped {
         store.set_stage(&repo, issue.number, &step, "failed", Some(&failure))?;
         label(&repo, issue.number, Some("blocked"), Some("in-progress"));
-        println!("FAILED at {step}, after {rounds_used} fix round(s): {failure}");
+        println!("FAILED at {step}, after {fix_rounds_used} fix round(s): {failure}");
+        if let Some((_, url)) = &run.pr {
+            println!("  the pull request stays open: {url}");
+        }
         println!("  a person decides from here. Worktree kept at {}", worktree.display());
         return Ok(false);
     }
-    if rounds_used > 0 {
-        println!("  passed after {rounds_used} fix round(s)");
+    if fix_rounds_used > 0 {
+        println!("  passed after {fix_rounds_used} fix round(s)");
+    }
+    if used.syncs > 0 {
+        println!("  {base} moved {} time(s) during the run and was merged in", used.syncs);
     }
 
-    if opts.no_pr {
+    let Some((_, url)) = run.pr.clone() else {
         store.set_stage(&repo, issue.number, "reviewed", "passed", None)?;
         println!("PASSED every step. No pull request opened (--no-pr)");
         return Ok(true);
+    };
+    if !run.merged {
+        let (stage, status, note) = if follows {
+            ("github", "green", "\n  GitHub's checks and review are green. Not merged (--no-merge)")
+        } else {
+            ("pr", "open", "")
+        };
+        store.set_stage(&repo, issue.number, stage, status, None)?;
+        println!("PASSED every step. Pull request: {url}{note}");
+        return Ok(true);
     }
 
-    store.set_stage(&repo, issue.number, "pr", "running", None)?;
-    git::git(&worktree, &["push", "--quiet", "-u", "origin", &branch])?;
-    let body_file = run.run_dir.join("pr-body.md");
-    std::fs::write(&body_file, run.pr_body())?;
-    // The developer's commit names the change. A later flow commit does not.
-    let title = match &run.dev_subject {
-        Some(subject) => subject.clone(),
-        None => git::git(&worktree, &["log", "-1", "--format=%s"])?,
-    };
-    let output = Command::new("gh")
-        .args(["pr", "create", "--base", &base, "--head", &branch, "--title", &title, "--body-file"])
-        .arg(&body_file)
-        .current_dir(&worktree)
-        .output()
-        .context("running gh pr create")?;
-    if !output.status.success() {
-        let failure = format!("gh pr create failed: {}", String::from_utf8_lossy(&output.stderr).trim());
-        store.set_stage(&repo, issue.number, "pr", "failed", Some(&failure))?;
-        println!("FAILED at pr: {failure}");
-        return Ok(false);
+    // Merged. The branch, the worktree and the label have done their work.
+    // The run's files stay.
+    store.set_stage(&repo, issue.number, "merged", "done", None)?;
+    label(&repo, issue.number, None, Some("in-progress"));
+    if let Err(e) = github::delete_branch(&repo, &branch) {
+        eprintln!("warning: could not delete the branch {branch} on GitHub: {e}");
     }
-    let url = String::from_utf8_lossy(&output.stdout).trim().lines().last().unwrap_or("").to_string();
-    let number = url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-    store.set_pr(&repo, issue.number, number, &url)?;
-    store.set_stage(&repo, issue.number, "pr", "open", None)?;
-    println!("PASSED every step. Pull request: {url}");
+    let cleanup = git::git(&run.repo_dir, &["worktree", "remove", "--force", &worktree.display().to_string()])
+        .and_then(|_| git::git(&run.repo_dir, &["branch", "-D", &branch]));
+    if let Err(e) = cleanup {
+        eprintln!("warning: could not remove the worktree or its branch: {e:#}");
+    }
+    println!("MERGED into {base}: {url}");
     Ok(true)
 }
 
@@ -1175,7 +1433,7 @@ pub fn status() -> Result<()> {
         let mut shown_round = 0;
         for (step, vendor, attempt, verdict, exit_code, duration_ms, round) in store.steps(&row.repo, row.number, &row.run_id)? {
             if round != shown_round {
-                println!("    fix round {round}");
+                println!("    back for pass {}", round + 1);
                 shown_round = round;
             }
             let who = vendor.map(|v| format!(" [{v}]")).unwrap_or_default();

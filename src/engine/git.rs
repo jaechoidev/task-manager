@@ -59,6 +59,31 @@ pub fn diff(worktree: &Path, base: &str, head: &str) -> Result<String> {
     git(worktree, &["diff", base, head])
 }
 
+/// Whether `ancestor` is contained in `descendant`.
+pub fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(worktree)
+        .status()
+        .context("running git merge-base")?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        other => bail!("git merge-base failed with {other:?}"),
+    }
+}
+
+/// Merges `other` into the current branch and returns the new commit. When
+/// the merge conflicts, it is undone and the conflicting files are returned.
+pub fn merge_in(worktree: &Path, other: &str, message: &str) -> Result<std::result::Result<String, Vec<String>>> {
+    if git(worktree, &["merge", "--quiet", "--no-edit", "-m", message, other]).is_ok() {
+        return Ok(Ok(head(worktree)?));
+    }
+    let conflicts = git(worktree, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+    git(worktree, &["merge", "--abort"])?;
+    Ok(Err(conflicts.lines().map(str::to_string).filter(|l| !l.is_empty()).collect()))
+}
+
 pub fn remote_branch_exists(repo: &Path, branch: &str) -> Result<bool> {
     let found = git(repo, &["ls-remote", "--heads", "origin", branch])?;
     Ok(!found.trim().is_empty())
