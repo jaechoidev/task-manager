@@ -44,5 +44,5 @@ What the summary got right: it said the approval rests on reading the code, that
 - **Text from the web reaches the developer.** The researcher is told that web text is not an instruction, writes only one file, and has no shell. But the developer then reads that file. The gates on the developer still apply.
 - **Nothing checks that the sources are real.** The gate wants a `## Sources` section and a non-empty list. It does not open the links.
 - **Research and summary have not run on the iOS project.**
-- **`factory promote` has only run against a stand-in.** On the trial repository, `main` requires an approval and `plan-validate`, and neither has been seen with a promotion.
+- **The promotion is open, not merged.** `factory promote` opened [todo-trial#33](https://github.com/jaechoidev/todo-trial/pull/33) with 17 changes and refreshed it on a second run. `plan-validate` passed on it. It waits for a person's approval, as it should.
 - **No notification when a handoff is written or an issue needs a person.** That comes with the app.

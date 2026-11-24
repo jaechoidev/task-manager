@@ -1,5 +1,7 @@
 # factory
 
+Status, open decisions and what needs a person: [the status report](https://claude.ai/artifact/1qmZayiHcGUBccEFtQGSe2).
+
 A deterministic task manager. Software owns the loop and every gate. An LLM is called only for bounded steps.
 
 So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. A queue runs every ready issue, several at once, and a judgment step decides what happens to an issue that gets stuck. A local API serves all of it to the macOS app in [app/](app/). A long-running daemon is not built yet.
