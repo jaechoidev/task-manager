@@ -1,0 +1,22 @@
+[package]
+name = "factory"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic task manager: plan validation, issue creation and repo bootstrap"
+publish = false
+
+[[bin]]
+name = "factory"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# serde_yaml is archived. serde_yaml_ng is its maintained continuation.
+# All YAML parsing goes through plan::model::parse_str, so swapping is one function.
+serde_yaml_ng = "0.10"
+
+[profile.release]
+strip = true
