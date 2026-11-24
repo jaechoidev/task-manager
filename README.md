@@ -43,7 +43,7 @@ Every issue `factory` creates starts with one machine-readable line:
 The parent issue carries the same line without `key`. This line is the contract between planning and the engine:
 
 - `plan create` finds existing issues by `plan` and `key`, which is why a rerun creates nothing new.
-- The engine will read scope, acceptance criteria, flows and accessibility IDs from it.
+- `factory run` reads scope, acceptance criteria, flows and accessibility IDs from it.
 - Execution order comes from GitHub's native blocked-by links, not from this line.
 
 The rest of the body repeats the same data as markdown for people.
