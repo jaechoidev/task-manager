@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "commit_subject", "files_changed", "verify_ran", "notes", "flow_change_request"],
+  "properties": {
+    "summary": { "type": "string" },
+    "commit_subject": { "type": "string" },
+    "files_changed": { "type": "array", "items": { "type": "string" } },
+    "verify_ran": { "type": "string", "enum": ["passed", "failed", "blocked", "not_run"] },
+    "notes": { "type": "string" },
+    "flow_change_request": { "type": ["string", "null"] }
+  }
+}

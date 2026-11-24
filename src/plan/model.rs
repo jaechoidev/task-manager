@@ -147,9 +147,8 @@ pub struct PlanSet {
     pub file_errors: Vec<(PathBuf, String)>,
 }
 
-/// The single entry point for YAML parsing.
 pub fn parse_str(text: &str) -> Result<PlanFile, String> {
-    serde_yaml_ng::from_str::<PlanFile>(text).map_err(|e| e.to_string())
+    crate::yaml::from_str(text)
 }
 
 /// Expands directories to the `.yaml` and `.yml` files directly inside them.

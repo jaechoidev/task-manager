@@ -1,0 +1,9 @@
+name: review
+kind: agent
+role: review
+needs: [issue, worktree, head_sha, verify_log]
+produces: [verdict]
+prompt: prompt.md
+output_schema: verdict.schema.json
+access: read-only
+timeout_minutes: 15

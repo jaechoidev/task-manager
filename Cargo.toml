@@ -15,8 +15,11 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # serde_yaml is archived. serde_yaml_ng is its maintained continuation.
-# All YAML parsing goes through plan::model::parse_str, so swapping is one function.
+# All YAML parsing goes through src/yaml.rs, so swapping is one function.
 serde_yaml_ng = "0.10"
+# "bundled" compiles SQLite in, so the binary has no system dependency.
+# "fallible_uint" lets u64 values such as issue numbers be stored directly.
+rusqlite = { version = "0.43", features = ["bundled", "fallible_uint"] }
 
 [profile.release]
 strip = true

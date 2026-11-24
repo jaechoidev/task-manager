@@ -1,0 +1,279 @@
+//! The state of record: one SQLite database, plus a JSONL request log.
+//!
+//! GitHub labels only mirror this for visibility. After a crash the database
+//! says where each issue stopped.
+
+use super::util;
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
+use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS issues (
+    repo        TEXT NOT NULL,
+    number      INTEGER NOT NULL,
+    plan        TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    run_id      TEXT NOT NULL,
+    stage       TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    branch      TEXT,
+    worktree    TEXT,
+    base_sha    TEXT,
+    head_sha    TEXT,
+    pr_number   INTEGER,
+    pr_url      TEXT,
+    failure     TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (repo, number)
+);
+CREATE TABLE IF NOT EXISTS steps (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo         TEXT NOT NULL,
+    number       INTEGER NOT NULL,
+    run_id       TEXT NOT NULL,
+    step         TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    module       TEXT NOT NULL,
+    vendor       TEXT,
+    attempt      INTEGER NOT NULL,
+    sha          TEXT,
+    exit_code    INTEGER,
+    timed_out    INTEGER NOT NULL,
+    verdict      TEXT NOT NULL,
+    duration_ms  INTEGER NOT NULL,
+    input_path   TEXT,
+    output_path  TEXT,
+    session_id   TEXT,
+    finished_at  TEXT NOT NULL
+);
+";
+
+/// One line of the request log, and one row of `steps`.
+#[derive(Debug, Clone, Serialize)]
+pub struct StepRecord {
+    pub ts: String,
+    pub repo: String,
+    pub issue: u64,
+    pub run_id: String,
+    pub step: String,
+    pub kind: String,
+    pub module: String,
+    pub vendor: Option<String>,
+    pub model: Option<String>,
+    /// Which account ran the call. Only one per vendor exists so far.
+    pub subscription: Option<String>,
+    pub attempt: u32,
+    pub sha: Option<String>,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    /// `pass`, `fail`, or an agent's own verdict such as `approve`.
+    pub verdict: String,
+    pub duration_ms: u64,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IssueRow {
+    pub repo: String,
+    pub number: u64,
+    pub key: String,
+    pub title: String,
+    pub run_id: String,
+    pub stage: String,
+    pub status: String,
+    pub head_sha: Option<String>,
+    pub pr_url: Option<String>,
+    pub failure: Option<String>,
+    pub updated_at: String,
+}
+
+pub struct Store {
+    db: Connection,
+    log: PathBuf,
+}
+
+impl Store {
+    pub fn open(home: &Path) -> Result<Store> {
+        std::fs::create_dir_all(home).with_context(|| format!("creating {}", home.display()))?;
+        let db = Connection::open(home.join("state.db")).context("opening the state database")?;
+        db.execute_batch(SCHEMA)?;
+        Ok(Store { db, log: home.join("requests.jsonl") })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_issue(
+        &self,
+        repo: &str,
+        number: u64,
+        plan: &str,
+        key: &str,
+        title: &str,
+        run_id: &str,
+        branch: &str,
+        worktree: &str,
+        base_sha: &str,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO issues (repo, number, plan, key, title, run_id, stage, status, branch, worktree, base_sha, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'start', 'running', ?7, ?8, ?9, ?10)
+             ON CONFLICT (repo, number) DO UPDATE SET
+                 plan = excluded.plan, key = excluded.key, title = excluded.title, run_id = excluded.run_id,
+                 stage = 'start', status = 'running', branch = excluded.branch, worktree = excluded.worktree,
+                 base_sha = excluded.base_sha, head_sha = NULL, pr_number = NULL, pr_url = NULL, failure = NULL,
+                 updated_at = excluded.updated_at",
+            params![repo, number, plan, key, title, run_id, branch, worktree, base_sha, util::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_stage(&self, repo: &str, number: u64, stage: &str, status: &str, failure: Option<&str>) -> Result<()> {
+        self.db.execute(
+            "UPDATE issues SET stage = ?3, status = ?4, failure = ?5, updated_at = ?6 WHERE repo = ?1 AND number = ?2",
+            params![repo, number, stage, status, failure, util::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_head(&self, repo: &str, number: u64, sha: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE issues SET head_sha = ?3, updated_at = ?4 WHERE repo = ?1 AND number = ?2",
+            params![repo, number, sha, util::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_pr(&self, repo: &str, number: u64, pr_number: u64, pr_url: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE issues SET pr_number = ?3, pr_url = ?4, updated_at = ?5 WHERE repo = ?1 AND number = ?2",
+            params![repo, number, pr_number, pr_url, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Writes the step to the database and appends it to the request log.
+    pub fn record(&self, step: &StepRecord) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO steps (repo, number, run_id, step, kind, module, vendor, attempt, sha, exit_code, timed_out,
+                                verdict, duration_ms, input_path, output_path, session_id, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                step.repo,
+                step.issue,
+                step.run_id,
+                step.step,
+                step.kind,
+                step.module,
+                step.vendor,
+                step.attempt,
+                step.sha,
+                step.exit_code,
+                step.timed_out,
+                step.verdict,
+                step.duration_ms,
+                step.input,
+                step.output,
+                step.session_id,
+                step.ts
+            ],
+        )?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&self.log)?;
+        writeln!(file, "{}", serde_json::to_string(step)?)?;
+        Ok(())
+    }
+
+    pub fn issues(&self) -> Result<Vec<IssueRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT repo, number, key, title, run_id, stage, status, head_sha, pr_url, failure, updated_at
+             FROM issues ORDER BY updated_at DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(IssueRow {
+                repo: row.get(0)?,
+                number: row.get(1)?,
+                key: row.get(2)?,
+                title: row.get(3)?,
+                run_id: row.get(4)?,
+                stage: row.get(5)?,
+                status: row.get(6)?,
+                head_sha: row.get(7)?,
+                pr_url: row.get(8)?,
+                failure: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Steps of one run, oldest first: (step, vendor, attempt, verdict, exit code, duration ms, sha).
+    #[allow(clippy::type_complexity)]
+    pub fn steps(&self, repo: &str, number: u64, run_id: &str) -> Result<Vec<(String, Option<String>, u32, String, Option<i32>, u64, Option<String>)>> {
+        let mut statement = self.db.prepare(
+            "SELECT step, vendor, attempt, verdict, exit_code, duration_ms, sha FROM steps
+             WHERE repo = ?1 AND number = ?2 AND run_id = ?3 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![repo, number, run_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_survive_a_reopen() {
+        let home = std::env::temp_dir().join(format!("factory-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        {
+            let store = Store::open(&home).unwrap();
+            store.start_issue("o/r", 4, "todo-v1", "shell", "Shell", "run1", "b", "/w", "abc").unwrap();
+            store.set_stage("o/r", 4, "verify", "failed", Some("exit 65")).unwrap();
+            store
+                .record(&StepRecord {
+                    ts: util::now(),
+                    repo: "o/r".into(),
+                    issue: 4,
+                    run_id: "run1".into(),
+                    step: "verify".into(),
+                    kind: "check".into(),
+                    module: "check/verify".into(),
+                    vendor: None,
+                    model: None,
+                    subscription: None,
+                    attempt: 1,
+                    sha: Some("def".into()),
+                    exit_code: Some(65),
+                    timed_out: false,
+                    verdict: "fail".into(),
+                    duration_ms: 1200,
+                    input: None,
+                    output: None,
+                    stdout: None,
+                    stderr: None,
+                    session_id: None,
+                })
+                .unwrap();
+        }
+        let store = Store::open(&home).unwrap();
+        let issues = store.issues().unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!((issues[0].stage.as_str(), issues[0].status.as_str()), ("verify", "failed"));
+        assert_eq!(issues[0].failure.as_deref(), Some("exit 65"));
+        let steps = store.steps("o/r", 4, "run1").unwrap();
+        assert_eq!(steps[0].3, "fail");
+        let log = std::fs::read_to_string(home.join("requests.jsonl")).unwrap();
+        assert!(log.contains("\"module\":\"check/verify\""));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}

@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "head_sha", "summary", "items"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["approve", "changes"] },
+    "head_sha": { "type": "string" },
+    "summary": { "type": "string" },
+    "items": { "type": "array", "items": { "type": "string" } }
+  }
+}

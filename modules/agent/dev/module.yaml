@@ -1,0 +1,9 @@
+name: dev
+kind: agent
+role: dev
+needs: [issue, worktree]
+produces: [commit, head_sha, report]
+prompt: prompt.md
+output_schema: report.schema.json
+access: workspace-write   # may write inside the worktree only; the engine owns git
+timeout_minutes: 30

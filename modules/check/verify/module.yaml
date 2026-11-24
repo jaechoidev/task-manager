@@ -1,0 +1,8 @@
+name: verify
+kind: check
+needs: [worktree, head_sha]
+produces: [verify_log]
+run: ./verify.sh
+pass_when: exit_code == 0
+timeout_minutes: 20
+locks: [simulator]

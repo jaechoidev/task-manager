@@ -1,7 +1,9 @@
+mod engine;
 mod gh;
 mod labels;
 mod plan;
 mod repo;
+mod yaml;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -29,6 +31,22 @@ enum Top {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Take one issue through develop, verify and review, then open a pull request
+    Run {
+        /// Issue number
+        issue: u64,
+        /// A checkout of the project repository
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+        /// Use this workflow file, not factory.yaml on the base branch
+        #[arg(long, value_name = "FILE")]
+        workflow: Option<PathBuf>,
+        /// Stop after review, without pushing or opening a pull request
+        #[arg(long)]
+        no_pr: bool,
+    },
+    /// Show where each issue stands, from the state database
+    Status,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -196,6 +214,15 @@ fn run() -> Result<bool> {
             let checks = repo::init(&opts)?;
             print!("{}", repo::report(&opts.repo, &checks));
             Ok(repo::passed(&checks))
+        }
+
+        Top::Run { issue, repo_dir, workflow, no_pr } => {
+            engine::run(&engine::RunOptions { repo_dir, issue, workflow_file: workflow, no_pr })
+        }
+
+        Top::Status => {
+            engine::status()?;
+            Ok(true)
         }
 
         Top::Repo { command: RepoCommand::Preflight { repo, collaborators, secrets } } => {
