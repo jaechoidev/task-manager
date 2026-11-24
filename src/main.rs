@@ -48,6 +48,25 @@ enum Top {
         /// leave the merge to a person
         #[arg(long)]
         no_merge: bool,
+        /// Start over, even when an interrupted run could be picked up
+        #[arg(long)]
+        restart: bool,
+    },
+    /// Run every ready issue that carries a label, several at once where
+    /// their scopes don't overlap
+    Queue {
+        /// A checkout of the project repository
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+        /// Only issues with this label are picked
+        #[arg(long, default_value = "today")]
+        label: String,
+        /// How many issues may run at once
+        #[arg(long, default_value_t = 2)]
+        parallel: usize,
+        /// Leave every merge to a person
+        #[arg(long)]
+        no_merge: bool,
     },
     /// Show where each issue stands, from the state database
     Status,
@@ -220,8 +239,12 @@ fn run() -> Result<bool> {
             Ok(repo::passed(&checks))
         }
 
-        Top::Run { issue, repo_dir, workflow, no_pr, no_merge } => {
-            engine::run(&engine::RunOptions { repo_dir, issue, workflow_file: workflow, no_pr, no_merge })
+        Top::Run { issue, repo_dir, workflow, no_pr, no_merge, restart } => {
+            engine::run(&engine::RunOptions { repo_dir, issue, workflow_file: workflow, no_pr, no_merge, restart })
+        }
+
+        Top::Queue { repo_dir, label, parallel, no_merge } => {
+            engine::queue::run(&engine::queue::QueueOptions { repo_dir, label, parallel, no_merge })
         }
 
         Top::Status => {

@@ -97,6 +97,24 @@ fn overlap<'a>(a: &'a ScopePath, b: &'a ScopePath) -> Option<&'a str> {
     Some(if a.parts.len() >= b.parts.len() { &a.shown } else { &b.shown })
 }
 
+/// The first path on which two scope lists overlap. A scope entry that can't
+/// be read as a path counts as overlapping, so callers err on the safe side.
+pub fn scopes_overlap(a: &[String], b: &[String]) -> Option<String> {
+    for raw_a in a {
+        for raw_b in b {
+            match (parse_scope(raw_a), parse_scope(raw_b)) {
+                (Ok(pa), Ok(pb)) => {
+                    if let Some(path) = overlap(&pa, &pb) {
+                        return Some(path.to_string());
+                    }
+                }
+                _ => return Some(format!("{raw_a} / {raw_b}")),
+            }
+        }
+    }
+    None
+}
+
 fn valid_flow_name(name: &str) -> bool {
     let n = name.trim();
     !n.is_empty()

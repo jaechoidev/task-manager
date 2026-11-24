@@ -12,12 +12,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const GH: &str = r#"#!/usr/bin/env python3
-# Stands in for gh: one repository, o/r, with one open issue, #7, and the
-# pull request the engine opens, #9. STUB_GITHUB says how GitHub answers.
-import json, os, subprocess, sys
+# Stands in for gh and for GitHub: one repository, o/r. With issue.json it
+# has one open issue, #7. With issues.json it has several. The pull request
+# for issue N is number N + 2. STUB_GITHUB says how checks and reviews answer.
+import glob, json, os, re, subprocess, sys
 
 stub = os.environ["STUB_DIR"]
 mode = os.environ.get("STUB_GITHUB", "green")
+origin = f"{stub}/../origin.git"
 body = sys.stdin.read()
 args = sys.argv[1:]
 if args[:1] == ["repo"]:
@@ -30,8 +32,35 @@ path = args[5] if args[3] == "-H" else args[3]
 with open(f"{stub}/gh.calls", "a") as calls:
     calls.write(f"{method} {path}\n")
 
+def out(value):
+    print(json.dumps(value))
+
+def save(name, number, text):
+    # Under a name for the issue, and under the plain name single-issue tests read.
+    open(f"{stub}/{name}-{number}.json", "w").write(text)
+    open(f"{stub}/{name}.json", "w").write(text)
+
+def issues():
+    if os.path.exists(f"{stub}/issues.json"):
+        return json.load(open(f"{stub}/issues.json"))
+    return {"7": json.load(open(f"{stub}/issue.json"))}
+
+def issue(number):
+    found = dict(issues()[str(number)])
+    found["number"] = int(number)
+    found["state"] = "closed" if os.path.exists(f"{stub}/closed-{number}") else "open"
+    found["labels"] = [{"name": name} for name in found.get("labels", [])]
+    return found
+
+def git(*command):
+    return subprocess.run(["git", "--git-dir", origin, *command], capture_output=True, text=True).stdout.strip()
+
+def branch_of(number):
+    refs = git("for-each-ref", "--format=%(refname:short)", f"refs/heads/factory/issue-{number}-*")
+    return refs.splitlines()[0] if refs else ""
+
 def nth(sha):
-    # 1 for the first commit of the pull request GitHub was asked about.
+    # 1 for the first commit of a pull request GitHub was asked about.
     file = f"{stub}/gh.shas"
     seen = open(file).read().split() if os.path.exists(file) else []
     if sha not in seen:
@@ -39,25 +68,30 @@ def nth(sha):
         open(file, "w").write("\n".join(seen) + "\n")
     return seen.index(sha) + 1
 
-def pr_head():
-    git = ["git", "--git-dir", f"{stub}/../origin.git", "rev-parse", "refs/heads/factory/issue-7-a"]
-    return subprocess.run(git, capture_output=True, text=True).stdout.strip()
-
 def comment(login, verdict, sha, items):
     marker = json.dumps({"v": 1, "verdict": verdict, "sha": sha, "summary": "looked at it", "items": items})
     return {"user": {"login": login}, "body": f"<!-- factory:review {marker} -->\nVerdict: {verdict}"}
 
-def out(value):
-    print(json.dumps(value))
+def match(pattern):
+    return re.fullmatch(pattern, path)
 
-if method == "GET" and path == "repos/o/r/issues/7":
-    print(open(f"{stub}/issue.json").read())
+if method == "GET" and path.startswith("repos/o/r/issues?"):
+    label = re.search(r"labels=([^&]*)", path).group(1)
+    listed = [issue(n) for n in issues()]
+    out([i for i in listed if i["state"] == "open" and any(l["name"] == label for l in i["labels"])])
+elif method == "GET" and (found := match(r"repos/o/r/issues/(\d+)")):
+    out(issue(found.group(1)))
+elif method == "GET" and (found := match(r"repos/o/r/issues/(\d+)/dependencies/blocked_by.*")):
+    out([{"number": n, "state": issue(n)["state"]} for n in issues()[found.group(1)].get("blocked_by", [])])
 elif method == "POST" and path == "repos/o/r/pulls":
-    open(f"{stub}/pr.json", "w").write(body)
-    out({"number": 9, "html_url": "https://example.invalid/o/r/pull/9"})
-elif method == "PATCH" and path == "repos/o/r/pulls/9":
-    open(f"{stub}/pr.update.json", "w").write(body)
+    number = int(re.search(r"factory/issue-(\d+)-", json.loads(body)["head"]).group(1))
+    save("pr", number, body)
+    out({"number": number + 2, "html_url": f"https://example.invalid/o/r/pull/{number + 2}"})
+elif method == "PATCH" and (found := match(r"repos/o/r/pulls/(\d+)")):
+    save("pr.update", int(found.group(1)) - 2, body)
     out({})
+elif method == "GET" and (found := match(r"repos/o/r/pulls/(\d+)")):
+    out({"merged": os.path.exists(f"{stub}/merge-{int(found.group(1)) - 2}.json")})
 elif method == "GET" and "/check-runs" in path:
     n = nth(path.split("/commits/")[1].split("/")[0])
     runs = []
@@ -69,8 +103,9 @@ elif method == "GET" and "/check-runs" in path:
     if mode == "always-red":
         run(12, "build", "failure")
     out({"total_count": len(runs), "check_runs": runs})
-elif method == "GET" and path.startswith("repos/o/r/issues/9/comments"):
-    sha = pr_head()
+elif method == "GET" and (found := match(r"repos/o/r/issues/(\d+)/comments.*")):
+    number = int(found.group(1)) - 2
+    sha = git("rev-parse", branch_of(number))
     n = nth(sha)
     bot = "github-actions[bot]"
     if mode == "no-verdict":
@@ -84,8 +119,18 @@ elif method == "GET" and path.startswith("repos/o/r/issues/9/comments"):
         out([comment(bot, "changes", "0" * 40, ["for another commit"]), comment(bot, "approve", sha, [])])
 elif method == "GET" and "/actions/jobs/" in path:
     print("step one ok\nerror: the build broke on line 3")
-elif method == "PUT" and path == "repos/o/r/pulls/9/merge":
-    open(f"{stub}/merge.json", "w").write(body)
+elif method == "PUT" and (found := match(r"repos/o/r/pulls/(\d+)/merge")):
+    number = int(found.group(1)) - 2
+    if os.environ.get("STUB_REAL_MERGE"):
+        # Squash the branch into dev, as GitHub would, so later issues start from it.
+        work = f"{stub}/merge-work-{number}"
+        run = lambda *c: subprocess.run(["git", *c], cwd=work, check=True, capture_output=True)
+        subprocess.run(["git", "clone", "--quiet", origin, work], check=True)
+        run("merge", "--squash", f"origin/{branch_of(number)}")
+        run("commit", "--quiet", "-m", json.loads(body)["commit_title"])
+        run("push", "--quiet", "origin", "dev")
+    save("merge", number, body)
+    open(f"{stub}/closed-{number}", "w").write("merged")
     out({"merged": True})
 elif method == "DELETE" and path.startswith("repos/o/r/git/refs/heads/"):
     open(f"{stub}/deleted", "w").write(path)
@@ -104,7 +149,23 @@ cat > "$STUB_DIR/codex.prompt.$n"
 out=""; prev=""
 for arg in "$@"; do [ "$prev" = "-o" ] && out="$arg"; prev="$arg"; done
 mkdir -p Sources
+if [ "$STUB_DEV" = "by-issue" ]; then
+  # Each issue gets its own folder. The pause makes overlap in time visible.
+  issue=$(sed -n 's/^# Issue #\([0-9]*\):.*/\1/p' "$STUB_DIR/codex.prompt.$n" | head -1)
+  echo "dev-start $issue" >> "$STUB_DIR/events"
+  sleep 1
+  mkdir -p "Sources/I$issue"
+  printf 'let issue = %s\n// FIXED\n' "$issue" > "Sources/I$issue/File.swift"
+  echo "dev-end $issue" >> "$STUB_DIR/events"
+fi
+if [ "$STUB_DEV" = "limit-once" ] && [ "$n" = 1 ]; then
+  # What Codex does when the account's usage limit is reached.
+  echo '{"type":"error","message":"You have hit your usage limit. Try again at 3:10 PM."}'
+  exit 1
+fi
 case "$STUB_DEV" in
+  limit-once)
+    printf 'let a = 1\n// FIXED\n' > Sources/A.swift ;;
   fix-on-second)
     if [ "$n" = 1 ]; then echo "let a = 1" > Sources/A.swift; else echo "// FIXED" >> Sources/A.swift; fi ;;
   right-first-time)
@@ -173,7 +234,14 @@ const VERIFY: &str = r#"#!/bin/sh
 # Passes only when the developer's file carries the marker. In red mode it
 # reports that the named flows fail, as they do before development.
 if [ "$1" = "--red" ]; then echo "red: $*"; exit 0; fi
-if grep -q FIXED Sources/A.swift 2>/dev/null; then echo "all good"; exit 0; fi
+if [ -f "$STUB_DIR/issues.json" ]; then
+  # Several issues share this "simulator". Leave a trace of who used it when.
+  name=$(basename "$(pwd)")
+  echo "verify-start $name" >> "$STUB_DIR/events"
+  sleep 1
+  echo "verify-end $name" >> "$STUB_DIR/events"
+fi
+if grep -rq FIXED Sources 2>/dev/null; then echo "all good"; exit 0; fi
 echo "Sources/A.swift lacks the FIXED marker"
 exit 1
 "#;
@@ -193,6 +261,9 @@ on_fail:
 ";
 
 const ISSUE_BODY: &str = "<!-- factory:issue {\"v\":1,\"plan\":\"trial\",\"key\":\"a\",\"scope\":[\"Sources/\"],\"accept\":[\"A.swift carries the marker\"]} -->\n\nAdd the file.\n\n## Scope\n\n- `Sources/`\n";
+
+/// One issue of a multi-issue trial: number, key, scope, labels, blocked by.
+type IssueSpec<'a> = (u64, &'a str, &'a str, &'a [&'a str], &'a [u64]);
 
 struct Trial {
     dir: PathBuf,
@@ -266,6 +337,50 @@ impl Trial {
     /// Runs `factory run 7` all the way to GitHub, which answers as `github` says.
     fn run_to_github(&self, dev: &str, github: &str, flags: &[&str]) -> (Output, String) {
         self.factory(flags, &[("STUB_DEV", dev), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", github)])
+    }
+
+    /// Replaces the single issue with several. Each entry is
+    /// `(number, key, scope, labels, blocked by)`.
+    fn with_issues(self, list: &[IssueSpec]) -> Trial {
+        let mut issues = serde_json::Map::new();
+        for (number, key, scope, labels, blocked_by) in list {
+            let marker = serde_json::json!({"v": 1, "plan": "trial", "key": key, "scope": [scope], "accept": ["It carries the marker"]});
+            let body = format!("<!-- factory:issue {marker} -->\n\nDo the work for {key}.\n");
+            issues.insert(number.to_string(), serde_json::json!({"title": format!("Issue {key}"), "body": body, "labels": labels, "blocked_by": blocked_by}));
+        }
+        fs::write(self.dir.join("stub/issues.json"), serde_json::Value::Object(issues).to_string()).unwrap();
+        self
+    }
+
+    /// Runs `factory queue` with real merges into the stand-in origin.
+    fn queue(&self, flags: &[&str]) -> (Output, String) {
+        let output = self
+            .command(env!("CARGO_BIN_EXE_factory"))
+            .arg("queue")
+            .args(flags)
+            .arg("--repo-dir")
+            .arg(self.dir.join("repo"))
+            .envs([("STUB_DEV", "by-issue"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "green"), ("STUB_REAL_MERGE", "1")])
+            .env("FACTORY_POLL_SECONDS", "0")
+            .env("FACTORY_SETTLE_SECONDS", "0")
+            .output()
+            .unwrap();
+        let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        (output, text)
+    }
+
+    /// What the stand-ins did, in order: `dev-start 7`, `verify-end issue-8`, ...
+    fn events(&self) -> Vec<String> {
+        self.stub("events").lines().map(str::to_string).collect()
+    }
+
+    fn position(&self, event: &str) -> usize {
+        self.events().iter().position(|e| e == event).unwrap_or_else(|| panic!("no event '{event}' in {:?}", self.events()))
+    }
+
+    /// Files on the stand-in origin's dev branch.
+    fn dev_files(&self) -> String {
+        self.git(&self.dir.join("origin.git"), &["ls-tree", "-r", "--name-only", "dev"])
     }
 
     fn factory(&self, flags: &[&str], env: &[(&str, &str)]) -> (Output, String) {
@@ -594,4 +709,141 @@ fn a_pull_request_is_named_after_the_change_even_when_a_gate_held_the_first_atte
     assert_eq!(trial.json("pr.json")["title"], "feat(a): attempt 1");
     assert_eq!(trial.json("merge.json")["commit_title"], "feat(a): attempt 1 (#9)");
     assert!(trial.json("pr.json")["body"].as_str().unwrap().contains("`develop` failed: scope gate"));
+}
+
+#[test]
+fn an_interrupted_run_picks_up_at_the_step_it_was_on() {
+    let trial = Trial::new("resume", 3);
+    let mark = trial.dir.join("stub/crash");
+    let cut = [("STUB_DEV", "right-first-time"), ("STUB_REVIEW", "approve"), ("FACTORY_TEST_CRASH_AT", "verify"), ("FACTORY_TEST_CRASH_MARK", mark.to_str().unwrap())];
+    let (output, text) = trial.factory(&["--no-pr"], &cut);
+    assert_eq!(output.status.code(), Some(86), "the run should have been cut off: {text}");
+    assert_eq!(trial.stub("codex.count"), "1");
+
+    let (output, text) = trial.factory(&["--no-pr"], &cut);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("resuming run") && text.contains("at 'verify'"), "{text}");
+    // The developer's commit was kept. Only what had not finished ran.
+    assert_eq!(trial.stub("codex.count"), "1");
+    assert_eq!(trial.commits(), vec!["feat(a): attempt 1"]);
+    assert_eq!(trial.log().matches("\"step\":\"verify\"").count(), 1);
+    assert_eq!(trial.stub("claude.count"), "1");
+}
+
+#[test]
+fn a_run_cut_off_while_waiting_on_github_does_not_open_a_second_pull_request() {
+    let trial = Trial::build("resume-gh", &github_workflow(2), ISSUE_BODY);
+    let mark = trial.dir.join("stub/crash");
+    let cut = [("STUB_DEV", "right-first-time"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "green"), ("FACTORY_TEST_CRASH_AT", "github"), ("FACTORY_TEST_CRASH_MARK", mark.to_str().unwrap())];
+    let (output, text) = trial.factory(&[], &cut);
+    assert_eq!(output.status.code(), Some(86), "{text}");
+    assert!(trial.stub("pr.json").contains("factory/issue-7-a"), "the pull request was open when the run was cut off");
+
+    // Without resume this would be refused, because the branch is on GitHub.
+    let (output, text) = trial.factory(&[], &cut);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("at 'github'"), "{text}");
+    assert!(text.contains("MERGED into dev"), "{text}");
+    assert_eq!(trial.stub("gh.calls").matches("POST repos/o/r/pulls").count(), 1);
+    assert_eq!((trial.stub("codex.count").as_str(), trial.stub("claude.count").as_str()), ("1", "1"));
+    assert_eq!(trial.json("merge.json")["sha"].as_str().unwrap(), trial.pushed_head());
+}
+
+#[test]
+fn restart_starts_over_instead_of_picking_up() {
+    let trial = Trial::new("restart", 3);
+    let mark = trial.dir.join("stub/crash");
+    let cut = [("STUB_DEV", "never-breaks"), ("STUB_REVIEW", "approve"), ("FACTORY_TEST_CRASH_AT", "verify"), ("FACTORY_TEST_CRASH_MARK", mark.to_str().unwrap())];
+    assert_eq!(trial.factory(&["--no-pr"], &cut).0.status.code(), Some(86));
+    let (output, text) = trial.factory(&["--no-pr", "--restart"], &cut);
+    assert!(output.status.success(), "{text}");
+    assert!(!text.contains("resuming run"), "{text}");
+    assert_eq!(trial.stub("codex.count"), "2");
+    assert_eq!(trial.commits().len(), 1);
+}
+
+#[test]
+fn a_usage_limit_is_waited_out_and_is_not_a_failed_attempt() {
+    let trial = Trial::new("limit-wait", 3);
+    let env = [("STUB_DEV", "limit-once"), ("STUB_REVIEW", "approve"), ("FACTORY_RATE_WAIT_SECONDS", "0")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("codex hit a usage limit"), "{text}");
+    assert!(!text.contains("unusable reply"), "{text}");
+    assert_eq!(trial.stub("codex.count"), "2");
+    assert!(trial.log().contains("\"verdict\":\"rate-limited\""));
+    // The limited call left nothing behind. The work is the second call's.
+    assert_eq!(trial.commits(), vec!["feat(a): attempt 2"]);
+}
+
+#[test]
+fn independent_issues_are_developed_at_once_and_share_the_simulator_in_turn() {
+    let trial = Trial::build("q-parallel", &github_workflow(2), ISSUE_BODY)
+        .with_issues(&[(7, "a", "Sources/I7/", &["today"], &[]), (8, "b", "Sources/I8/", &["today"], &[])]);
+    let (output, text) = trial.queue(&["--parallel", "2"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Blocked: none") && text.contains("Pull request open: none"), "{text}");
+    let files = trial.dev_files();
+    assert!(files.contains("Sources/I7/File.swift") && files.contains("Sources/I8/File.swift"), "{files}");
+
+    // Both developers were at work before either had finished.
+    let first_end = trial.position("dev-end 7").min(trial.position("dev-end 8"));
+    assert!(trial.position("dev-start 7") < first_end && trial.position("dev-start 8") < first_end, "{:?}", trial.events());
+    // Verify held the simulator lock: no run started while another was inside.
+    let mut inside = 0;
+    for event in trial.events() {
+        if event.starts_with("verify-start") {
+            inside += 1;
+            assert_eq!(inside, 1, "two verify runs overlapped: {:?}", trial.events());
+        } else if event.starts_with("verify-end") {
+            inside -= 1;
+        }
+    }
+    // The issue that merged second took in the first one's merge and was judged again.
+    assert!(trial.events().iter().filter(|e| e.starts_with("verify-start")).count() >= 3, "{:?}", trial.events());
+}
+
+#[test]
+fn an_issue_starts_only_after_the_one_it_is_blocked_by_has_merged() {
+    let trial = Trial::build("q-blocked", &github_workflow(2), ISSUE_BODY)
+        .with_issues(&[(7, "a", "Sources/I7/", &["today"], &[]), (8, "b", "Sources/I8/", &["today"], &[7])]);
+    let (output, text) = trial.queue(&["--parallel", "2"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.find("#7 a started").unwrap() < text.find("#7 a ended").unwrap(), "{text}");
+    assert!(text.find("#7 a ended").unwrap() < text.find("#8 b started").unwrap(), "{text}");
+    assert!(trial.position("dev-end 7") < trial.position("dev-start 8"));
+    // #8 was cut from a dev that already held #7's work, so nothing had to be merged in.
+    assert_eq!(trial.events().iter().filter(|e| e.starts_with("verify-start")).count(), 2, "{:?}", trial.events());
+    assert!(text.contains("Merged: #7, #8"), "{text}");
+}
+
+#[test]
+fn issues_whose_scopes_overlap_run_one_after_the_other() {
+    let trial = Trial::build("q-overlap", &github_workflow(2), ISSUE_BODY)
+        .with_issues(&[(7, "a", "Sources/", &["today"], &[]), (8, "b", "Sources/I8/", &["today"], &[])]);
+    let (output, text) = trial.queue(&["--parallel", "2"]);
+    assert!(output.status.success(), "{text}");
+    assert!(trial.position("dev-end 7") < trial.position("dev-start 8"), "{:?}", trial.events());
+    assert!(text.contains("Merged: #7, #8"), "{text}");
+}
+
+#[test]
+fn priority_and_labels_decide_what_runs_and_in_what_order() {
+    let trial = Trial::build("q-order", &github_workflow(2), ISSUE_BODY).with_issues(&[
+        (7, "low", "Sources/I7/", &["today", "priority:low"], &[]),
+        (8, "high", "Sources/I8/", &["today", "priority:high"], &[]),
+        (9, "plain", "Sources/I9/", &["today"], &[]),
+        (10, "unpicked", "Sources/I10/", &[], &[]),
+        (11, "held", "Sources/I11/", &["today", "blocked"], &[]),
+        (12, "waiting", "Sources/I12/", &["today"], &[10]),
+    ]);
+    let (output, text) = trial.queue(&["--parallel", "1"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Merged: #8, #9, #7"), "{text}");
+    assert!(trial.position("dev-start 8") < trial.position("dev-start 9") && trial.position("dev-start 9") < trial.position("dev-start 7"));
+    // Not labelled, held for a person, and blocked by an issue nobody picked.
+    assert!(!text.contains("#10 unpicked"), "{text}");
+    assert!(text.contains("#11 held not run: it carries the 'blocked' label"), "{text}");
+    assert!(text.contains("#12 waiting not run: it is blocked by #10, still open"), "{text}");
+    assert!(!trial.events().iter().any(|e| e.ends_with(" 11") || e.ends_with(" 12") || e.ends_with(" 10")), "{:?}", trial.events());
 }

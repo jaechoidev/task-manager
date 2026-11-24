@@ -101,6 +101,38 @@ pub fn call(call: &Call) -> Result<Reply> {
     Ok(Reply { outcome, output, error, input_path, output_path, stdout_path, stderr_path, session_id })
 }
 
+/// Signs that a call failed because a usage or rate limit was reached. Each
+/// CLI words this differently and neither documents a stable format, so this
+/// looks for the phrases both use.
+const LIMIT_SIGNS: &[&str] = &["rate limit", "rate_limit", "usage limit", "usage_limit", "too many requests", "429"];
+
+fn limit_sign(text: &str) -> Option<String> {
+    text.lines()
+        .find(|line| {
+            let lower = line.to_lowercase();
+            LIMIT_SIGNS.iter().any(|sign| lower.contains(sign))
+        })
+        .map(|line| line.trim().chars().take(240).collect())
+}
+
+/// Why a reply with no usable output looks like a usage limit, if it does.
+/// A limit is a reason to wait, not a failure of the work.
+pub fn rate_limited(reply: &Reply) -> Option<String> {
+    if reply.output.is_some() && reply.error.is_none() {
+        return None;
+    }
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+    // In stdout only lines that report an error count: a prompt echoed back
+    // or a file the agent printed could mention a limit for other reasons.
+    let stdout_errors: String = read(&reply.stdout_path).lines().filter(|l| l.to_lowercase().contains("error")).collect::<Vec<_>>().join("\n");
+    reply
+        .error
+        .as_deref()
+        .and_then(limit_sign)
+        .or_else(|| limit_sign(&read(&reply.stderr_path)))
+        .or_else(|| limit_sign(&stdout_errors))
+}
+
 fn codex_args(call: &Call, schema: &Path, output: &Path) -> Vec<String> {
     let sandbox = match call.access {
         Access::ReadOnly => "read-only",
@@ -195,6 +227,37 @@ mod tests {
         let (output, _, error) = read_claude(failed);
         assert!(output.is_none());
         assert!(error.unwrap().contains("401 token invalid"));
+    }
+
+    #[test]
+    fn a_usage_limit_is_told_apart_from_other_failures() {
+        let dir = std::env::temp_dir().join(format!("factory-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reply = |error: Option<&str>, stdout: &str, stderr: &str, output: bool| {
+            std::fs::write(dir.join("out"), stdout).unwrap();
+            std::fs::write(dir.join("err"), stderr).unwrap();
+            Reply {
+                outcome: Outcome { exit_code: Some(1), timed_out: false, duration: Duration::from_secs(1) },
+                output: output.then(|| serde_json::json!({})),
+                error: error.map(str::to_string),
+                input_path: dir.join("in"),
+                output_path: dir.join("o"),
+                stdout_path: dir.join("out"),
+                stderr_path: dir.join("err"),
+                session_id: None,
+            }
+        };
+        // Claude reports it in its result. Codex prints an error event and exits 1.
+        assert!(rate_limited(&reply(Some("claude reported an error: API Error: Rate limit reached"), "", "", false)).is_some());
+        let event = "{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again at 3:10 PM.\"}";
+        assert!(rate_limited(&reply(Some("codex wrote no final message"), event, "", false)).unwrap().contains("usage limit"));
+        assert!(rate_limited(&reply(Some("codex exited with Some(1)"), "", "stream error: 429 Too Many Requests", false)).is_some());
+        // Other failures, and work that merely mentions limits, are not limits.
+        assert!(rate_limited(&reply(Some("claude reported an error: 401 OAuth access token is invalid"), "", "", false)).is_none());
+        let chatter = "{\"type\":\"item\",\"text\":\"I added a rate limit to the API client\"}";
+        assert!(rate_limited(&reply(Some("codex wrote no final message"), chatter, "", false)).is_none());
+        assert!(rate_limited(&reply(None, event, "rate limit", true)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

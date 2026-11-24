@@ -174,6 +174,20 @@ pub fn open_pr(repo: &str, base: &str, head: &str, title: &str, body: &str) -> R
     Ok((number, url))
 }
 
+/// The open pull request for a branch, when there is one already.
+pub fn find_pr(repo: &str, branch: &str) -> Result<Option<(u64, String)>> {
+    let owner = repo.split('/').next().unwrap_or("");
+    let found = gh::api("GET", &format!("repos/{repo}/pulls?state=open&head={owner}:{}", gh::encode(branch)), None)?;
+    Ok(found.as_array().and_then(|list| list.first()).and_then(|pr| {
+        Some((pr.get("number")?.as_u64()?, pr.get("html_url").and_then(Value::as_str).unwrap_or("").to_string()))
+    }))
+}
+
+pub fn is_merged(repo: &str, pr: u64) -> Result<bool> {
+    let value = gh::api("GET", &format!("repos/{repo}/pulls/{pr}"), None)?;
+    Ok(value.get("merged").and_then(Value::as_bool).unwrap_or(false))
+}
+
 pub fn update_pr_body(repo: &str, pr: u64, body: &str) -> Result<()> {
     gh::api("PATCH", &format!("repos/{repo}/pulls/{pr}"), Some(&json!({ "body": body })))?;
     Ok(())

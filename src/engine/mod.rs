@@ -10,7 +10,9 @@ pub mod flows;
 pub mod git;
 pub mod github;
 pub mod issue;
+pub mod lock;
 pub mod proc;
+pub mod queue;
 pub mod rounds;
 pub mod state;
 pub mod util;
@@ -19,8 +21,8 @@ pub mod workflow;
 use crate::gh;
 use anyhow::{anyhow, bail, Context, Result};
 use issue::Issue;
-use rounds::{End, Feedback, Limits, Outcome};
-use serde::Deserialize;
+use rounds::{End, Feedback, Limits, Outcome, Start, Used};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use state::{StepRecord, Store};
 use std::path::{Path, PathBuf};
@@ -44,10 +46,12 @@ pub struct RunOptions {
     pub no_pr: bool,
     /// Follow the pull request on GitHub, but don't merge it.
     pub no_merge: bool,
+    /// Start over even when an interrupted run could be picked up.
+    pub restart: bool,
 }
 
 /// The developer's final message.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DevReport {
     summary: String,
@@ -59,7 +63,7 @@ struct DevReport {
 }
 
 /// The acceptance writer's final message.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcceptanceReport {
     summary: String,
@@ -71,7 +75,7 @@ struct AcceptanceReport {
 }
 
 /// The acceptance writer's answer to a flow change request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ruling {
     decision: String,
@@ -79,6 +83,7 @@ struct Ruling {
 }
 
 /// What the acceptance stage left behind.
+#[derive(Clone, Serialize, Deserialize)]
 struct Acceptance {
     vendor: String,
     sha: String,
@@ -86,7 +91,7 @@ struct Acceptance {
 }
 
 /// The reviewer's final message.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Verdict {
     verdict: String,
@@ -115,6 +120,7 @@ struct Ask<'a> {
 }
 
 /// A fix round that ended in a commit.
+#[derive(Clone, Serialize, Deserialize)]
 struct Fix {
     round: u32,
     /// The step whose failure caused the round.
@@ -125,8 +131,44 @@ struct Fix {
     subject: String,
 }
 
+/// Everything a run knows that is not on disk or on GitHub already, written
+/// before each step so an interrupted run can pick up at that step.
+#[derive(Serialize, Deserialize)]
+struct Progress {
+    /// The steps of the run. A workflow that changed since can't be resumed.
+    names: Vec<String>,
+    /// The step that was about to run.
+    index: usize,
+    used: Used,
+    feedback: Option<Feedback>,
+    base_sha: String,
+    expected: String,
+    head_sha: Option<String>,
+    acceptance: Option<Acceptance>,
+    red: Option<String>,
+    ids: Vec<String>,
+    fixes: Vec<Fix>,
+    pr: Option<(u64, String)>,
+    merged: bool,
+    dev: Option<DevReport>,
+    dev_vendor: Option<String>,
+    dev_subject: Option<String>,
+    first_subject: Option<String>,
+    dev_session: Option<String>,
+    earlier_review: Option<Verdict>,
+    ruling: Option<(Ruling, Option<String>)>,
+    verify: Option<String>,
+    review: Option<(String, Verdict)>,
+}
+
+/// How long to wait before trying a rate-limited call again, in minutes. The
+/// run stops when these are used up, about six hours in.
+const RATE_LIMIT_WAITS: &[u64] = &[1, 5, 15, 30, 60, 60, 60, 60, 60];
+
 struct Run<'a> {
     store: &'a Store,
+    /// Where the engine keeps its files, for locks.
+    home: PathBuf,
     repo: String,
     issue: &'a Issue,
     run_id: String,
@@ -221,7 +263,7 @@ fn commit_subject(proposed: &str, issue: &Issue) -> String {
     line.to_string()
 }
 
-fn repo_name(repo_dir: &Path) -> Result<String> {
+pub(crate) fn repo_name(repo_dir: &Path) -> Result<String> {
     let output = Command::new("gh")
         .args(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
         .current_dir(repo_dir)
@@ -372,6 +414,74 @@ impl Run<'_> {
         })
     }
 
+    /// Held around git commands that touch what every worktree of the
+    /// repository shares: fetched refs, the worktree list, branches.
+    fn git_lock(&self) -> Result<lock::Held> {
+        lock::acquire(&self.home, &format!("git-{}", util::repo_dir_name(&self.repo)), &|| {})
+    }
+
+    /// Writes where the run stands, before the step at `index` begins.
+    fn save(&self, names: &[String], index: usize, used: Used, feedback: Option<&Feedback>) -> Result<()> {
+        let progress = Progress {
+            names: names.to_vec(),
+            index,
+            used,
+            feedback: feedback.cloned(),
+            base_sha: self.base_sha.clone(),
+            expected: self.expected.clone(),
+            head_sha: self.head_sha.clone(),
+            acceptance: self.acceptance.clone(),
+            red: self.red.clone(),
+            ids: self.ids.clone(),
+            fixes: self.fixes.clone(),
+            pr: self.pr.clone(),
+            merged: self.merged,
+            dev: self.dev.clone(),
+            dev_vendor: self.dev_vendor.clone(),
+            dev_subject: self.dev_subject.clone(),
+            first_subject: self.first_subject.clone(),
+            dev_session: self.dev_session.clone(),
+            earlier_review: self.earlier_review.clone(),
+            ruling: self.ruling.clone(),
+            verify: self.verify.clone(),
+            review: self.review.clone(),
+        };
+        // Written whole or not at all, so a crash never leaves half a file.
+        let file = self.run_dir.join("progress.json");
+        let partial = self.run_dir.join("progress.json.partial");
+        std::fs::write(&partial, serde_json::to_string_pretty(&progress)?)?;
+        std::fs::rename(&partial, &file)?;
+        Ok(())
+    }
+
+    /// Takes up what an interrupted run knew, and puts the worktree back to
+    /// the engine's last commit. Whatever a step left half done is discarded,
+    /// because that step runs again from its start.
+    fn restore(&mut self, progress: Progress) -> Result<Start> {
+        let _ = git::git(&self.worktree, &["merge", "--abort"]);
+        git::git(&self.worktree, &["reset", "--quiet", "--hard", &progress.expected])?;
+        git::git(&self.worktree, &["clean", "--quiet", "-fd"])?;
+        self.base_sha = progress.base_sha;
+        self.expected = progress.expected;
+        self.head_sha = progress.head_sha;
+        self.acceptance = progress.acceptance;
+        self.red = progress.red;
+        self.ids = progress.ids;
+        self.fixes = progress.fixes;
+        self.pr = progress.pr;
+        self.merged = progress.merged;
+        self.dev = progress.dev;
+        self.dev_vendor = progress.dev_vendor;
+        self.dev_subject = progress.dev_subject;
+        self.first_subject = progress.first_subject;
+        self.dev_session = progress.dev_session;
+        self.earlier_review = progress.earlier_review;
+        self.ruling = progress.ruling;
+        self.verify = progress.verify;
+        self.review = progress.review;
+        Ok(Start { index: progress.index, used: progress.used, feedback: progress.feedback })
+    }
+
     /// The part of a file name that says which round it belongs to.
     fn round_tag(&self) -> String {
         if self.round == 0 {
@@ -394,10 +504,15 @@ impl Run<'_> {
         let mut resume = ask.resume;
         let mut last_error = String::new();
 
-        for attempt in 1..=2u32 {
+        let mut attempt = 0u32;
+        let mut waits = RATE_LIMIT_WAITS.iter();
+        let mut call_number = 0u32;
+        while attempt < 2 {
+            attempt += 1;
+            call_number += 1;
             let how = if resume.is_some() { ", continuing its session" } else { "" };
             println!("  {name}: {} call, attempt {attempt}{how}", vendor.name());
-            let stem = format!("{:02}-{name}{}-{attempt}", index + 1, self.round_tag());
+            let stem = format!("{:02}-{name}{}-{call_number}", index + 1, self.round_tag());
             let reply = agent::call(&agent::Call {
                 vendor,
                 model: step.model.as_deref(),
@@ -410,17 +525,34 @@ impl Run<'_> {
                 timeout,
                 resume,
             })?;
-            let parsed = match (&reply.output, &reply.error) {
-                (Some(value), None) => serde_json::from_value::<T>(value.clone()).map_err(|e| format!("reply does not match the schema: {e}")),
-                (_, Some(error)) => Err(error.clone()),
-                (None, None) => Err("no reply".to_string()),
-            };
             let files = [
                 Some(reply.input_path.as_path()),
                 Some(reply.output_path.as_path()),
                 Some(reply.stdout_path.as_path()),
                 Some(reply.stderr_path.as_path()),
             ];
+            // A usage limit is a reason to wait, not a failed attempt.
+            if let Some(sign) = agent::rate_limited(&reply) {
+                self.record(step, name, attempt, "rate-limited", Evidence { outcome: Some(&reply.outcome), files, session: reply.session_id.clone() })?;
+                let Some(minutes) = waits.next() else {
+                    return Ok(Err(format!("{} is still rate limited after every wait. Last sign: {sign}", vendor.name())));
+                };
+                let wait = match std::env::var("FACTORY_RATE_WAIT_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                    Some(seconds) => Duration::from_secs(seconds),
+                    None => Duration::from_secs(minutes * 60),
+                };
+                println!("  {name}: {} hit a usage limit ({sign}). Waiting {} before trying again", vendor.name(), seconds(wait));
+                self.store.set_stage(&self.repo, self.issue.number, name, "waiting", Some(&format!("{} usage limit: {sign}", vendor.name())))?;
+                std::thread::sleep(wait);
+                self.store.set_stage(&self.repo, self.issue.number, name, "running", None)?;
+                attempt -= 1;
+                continue;
+            }
+            let parsed = match (&reply.output, &reply.error) {
+                (Some(value), None) => serde_json::from_value::<T>(value.clone()).map_err(|e| format!("reply does not match the schema: {e}")),
+                (_, Some(error)) => Err(error.clone()),
+                (None, None) => Err("no reply".to_string()),
+            };
             match parsed {
                 Ok(found) => {
                     println!("  {name}: replied in {}", seconds(reply.outcome.duration));
@@ -806,6 +938,15 @@ impl Run<'_> {
         let quoted: Vec<String> = new.iter().map(|f| format!("'{f}'")).collect();
         let command = template.replace("{{new_flows}}", &quoted.join(" "));
         let judges_code = step.def.produces.iter().any(|p| p == "verify_log");
+        // Shared resources the module names, such as the simulator. Taken in
+        // one order everywhere, and held until the command has finished.
+        let mut wanted = step.def.locks.clone();
+        wanted.sort();
+        wanted.dedup();
+        let mut held = Vec::new();
+        for name in &wanted {
+            held.push(lock::acquire(&self.home, name, &|| println!("  {}: waiting for the {name} lock, another issue holds it", step.name))?);
+        }
         let stem = format!("{:02}-{}{}", index + 1, step.name, self.round_tag());
         let stdout = self.run_dir.join(format!("{stem}.stdout.log"));
         let stderr = self.run_dir.join(format!("{stem}.stderr.log"));
@@ -819,6 +960,7 @@ impl Run<'_> {
             stderr: &stderr,
             timeout: Duration::from_secs(step.def.timeout_minutes.unwrap_or(20) * 60),
         })?;
+        drop(held);
         let passed = outcome.ok();
         let files = [None, None, Some(stdout.as_path()), Some(stderr.as_path())];
         self.record(step, &step.name, 1, if passed { "pass" } else { "fail" }, Evidence { outcome: Some(&outcome), files, session: None })?;
@@ -960,6 +1102,7 @@ impl Run<'_> {
     /// every check runs again. `name` is the step doing the asking.
     fn sync(&mut self, name: &str) -> Result<Outcome> {
         let started = Instant::now();
+        let _git = self.git_lock()?;
         git::git(&self.worktree, &["fetch", "--quiet", "origin"])?;
         if git::is_ancestor(&self.worktree, &self.base_ref, "HEAD")? {
             if name == "sync" {
@@ -993,11 +1136,22 @@ impl Run<'_> {
     /// when it is already open.
     fn publish(&mut self) -> Result<Outcome> {
         let started = Instant::now();
-        if let Err(e) = git::git(&self.worktree, &["push", "--quiet", "-u", "origin", &self.branch]) {
+        let pushed = {
+            let _git = self.git_lock()?;
+            git::git(&self.worktree, &["push", "--quiet", "-u", "origin", &self.branch])
+        };
+        if let Err(e) = pushed {
             self.engine_step("pr", "push-failed", started)?;
             return Ok(Outcome::Stop(format!("could not push {}: {e:#}", self.branch)));
         }
         self.pushed = Some(Instant::now());
+        // A run interrupted right after opening the pull request finds it here.
+        if self.pr.is_none() {
+            self.pr = github::find_pr(&self.repo, &self.branch)?;
+            if let Some((number, url)) = &self.pr {
+                self.store.set_pr(&self.repo, self.issue.number, *number, url)?;
+            }
+        }
         let body = self.pr_body();
         std::fs::write(self.run_dir.join(format!("pr-body{}.md", self.round_tag())), &body)?;
         match &self.pr {
@@ -1112,6 +1266,13 @@ impl Run<'_> {
         let head = self.head_sha.clone().ok_or_else(|| anyhow!("no commit to merge"))?;
         let title = format!("{} (#{pr})", self.dev_subject.clone().unwrap_or_else(|| self.issue.title.clone()));
         let message = format!("Closes #{}", self.issue.number);
+        // A run interrupted right after merging finds the work already done.
+        if github::is_merged(&self.repo, pr).unwrap_or(false) {
+            println!("  merge: {url} was already merged");
+            self.merged = true;
+            self.engine_step("merge", "merged", started)?;
+            return Ok(Outcome::Pass);
+        }
         if let Err(e) = github::merge(&self.repo, pr, &head, &settings.merge, &title, &message) {
             self.engine_step("merge", "refused", started)?;
             return Ok(Outcome::Stop(format!("GitHub refused to merge #{pr} at {head}: {e:#}")));
@@ -1211,6 +1372,13 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
 
     let issue = issue::load(&repo, opts.issue)?;
     println!("run {repo}#{} {}/{}: {}", issue.number, issue.plan, issue.key, issue.title);
+    let name = util::repo_dir_name(&repo);
+    // One process per issue. The system drops the lock if this process dies.
+    let Some(_issue_lock) = lock::try_acquire(&home, &format!("issue-{name}-{}", issue.number))? else {
+        bail!("issue #{} is already being run by another process", issue.number);
+    };
+    // Other runs share this checkout's refs and worktree list.
+    let git_lock = lock::acquire(&home, &format!("git-{name}"), &|| {})?;
 
     git::git(&repo_dir, &["fetch", "--quiet", "origin"])?;
     let base = git::git(&repo_dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
@@ -1249,28 +1417,73 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         }
     }
 
-    let branch = format!("factory/issue-{}-{}", issue.number, issue.key);
-    if git::remote_branch_exists(&repo_dir, &branch)? {
-        bail!("branch {branch} is already on GitHub from an earlier run. Close its pull request and delete the branch before running this issue again");
+    let dev_index = steps
+        .iter()
+        .position(|s| s.def.role == Some(Role::Dev))
+        .ok_or_else(|| anyhow!("the workflow has no dev step"))?;
+    // After the workflow's own steps come the engine's: take in a moved base
+    // branch, push and open the pull request, wait on GitHub, merge. A repo
+    // with no `github` block stops with the pull request open.
+    let mut names: Vec<String> = steps.iter().map(|s| s.name.clone()).collect();
+    if !opts.no_pr {
+        names.extend(["sync".to_string(), "pr".to_string()]);
+    }
+    let github_from = names.len();
+    let follows = github.is_some() && !opts.no_pr;
+    if follows {
+        names.push("github".to_string());
+        on_fail.insert("github".to_string(), steps[dev_index].name.clone());
+        if !opts.no_merge {
+            names.push("merge".to_string());
+        }
     }
 
-    let run_id = util::run_id();
-    let name = util::repo_dir_name(&repo);
+    let branch = format!("factory/issue-{}-{}", issue.number, issue.key);
     let worktree = home.join("worktrees").join(&name).join(format!("issue-{}", issue.number));
-    let run_dir = home.join("runs").join(&name).join(format!("issue-{}", issue.number)).join(&run_id);
-    std::fs::create_dir_all(&run_dir)?;
-    git::fresh_worktree(&repo_dir, &worktree, &branch, &base_ref)?;
-    println!("  worktree {} on {branch}, from {base} at {}", worktree.display(), &base_sha[..10]);
-    println!("  files for this run: {}", run_dir.display());
-
-    store.start_issue(&repo, issue.number, &issue.plan, &issue.key, &issue.title, &run_id, &branch, &worktree.display().to_string(), &base_sha)?;
+    let runs = home.join("runs").join(&name).join(format!("issue-{}", issue.number));
+    // An earlier run that was cut off still says it is running or waiting.
+    // This process holds the issue's lock, so nothing else is running it.
+    let interrupted = match store.issue(&repo, issue.number)? {
+        Some(row) if !opts.restart && matches!(row.status.as_str(), "running" | "waiting") => {
+            let dir = runs.join(&row.run_id);
+            let saved = std::fs::read_to_string(dir.join("progress.json")).ok().and_then(|text| serde_json::from_str::<Progress>(&text).ok());
+            saved.filter(|_| worktree.exists()).map(|progress| (row.run_id, dir, progress))
+        }
+        _ => None,
+    };
+    if let Some((run_id, _, progress)) = &interrupted {
+        if progress.names != names {
+            bail!("run {run_id} of issue #{} was interrupted, and the workflow's steps have changed since. Use --restart to start over", issue.number);
+        }
+    }
+    let (run_id, run_dir) = match &interrupted {
+        Some((run_id, dir, _)) => (run_id.clone(), dir.clone()),
+        None => {
+            if git::remote_branch_exists(&repo_dir, &branch)? {
+                bail!("branch {branch} is already on GitHub from an earlier run. Close its pull request and delete the branch before running this issue again");
+            }
+            // Named by the second it starts. Two runs of one issue in the
+            // same second still get their own files.
+            let stamp = util::run_id();
+            let run_id = (1..).map(|n| if n == 1 { stamp.clone() } else { format!("{stamp}-{n}") }).find(|id| !runs.join(id).exists()).unwrap_or(stamp.clone());
+            let run_dir = runs.join(&run_id);
+            std::fs::create_dir_all(&run_dir)?;
+            git::fresh_worktree(&repo_dir, &worktree, &branch, &base_ref)?;
+            println!("  worktree {} on {branch}, from {base} at {}", worktree.display(), &base_sha[..10]);
+            println!("  files for this run: {}", run_dir.display());
+            store.start_issue(&repo, issue.number, &issue.plan, &issue.key, &issue.title, &run_id, &branch, &worktree.display().to_string(), &base_sha)?;
+            (run_id, run_dir)
+        }
+    };
+    drop(git_lock);
     label(&repo, issue.number, Some("in-progress"), Some("blocked"));
 
     let mut run = Run {
         store: &store,
+        home: home.clone(),
         repo: repo.clone(),
         issue: &issue,
-        run_id,
+        run_id: run_id.clone(),
         run_dir,
         worktree: worktree.clone(),
         repo_dir: repo_dir.clone(),
@@ -1300,30 +1513,25 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         review: None,
     };
 
-    let dev_index = steps
-        .iter()
-        .position(|s| s.def.role == Some(Role::Dev))
-        .ok_or_else(|| anyhow!("the workflow has no dev step"))?;
-    // After the workflow's own steps come the engine's: take in a moved base
-    // branch, push and open the pull request, wait on GitHub, merge. A repo
-    // with no `github` block stops with the pull request open.
-    let mut names: Vec<String> = steps.iter().map(|s| s.name.clone()).collect();
-    if !opts.no_pr {
-        names.extend(["sync".to_string(), "pr".to_string()]);
-    }
-    let github_from = names.len();
-    let follows = github.is_some() && !opts.no_pr;
-    if follows {
-        names.push("github".to_string());
-        on_fail.insert("github".to_string(), steps[dev_index].name.clone());
-        if !opts.no_merge {
-            names.push("merge".to_string());
+    let start = match interrupted {
+        Some((_, _, progress)) => {
+            let start = run.restore(progress)?;
+            println!(
+                "  resuming run {run_id} at '{}', on commit {}",
+                names.get(start.index).map(String::as_str).unwrap_or("the end"),
+                &run.expected[..run.expected.len().min(10)]
+            );
+            Some(start)
         }
-    }
+        None => None,
+    };
     let limits = Limits { local: fix_rounds, github: github_fix_rounds, github_from };
-    let (end, used) = rounds::drive(&names, dev_index, &on_fail, limits, &mut |index, turn| {
+    let (end, used) = rounds::drive(&names, dev_index, &on_fail, limits, start, &mut |index, turn| {
         let name = &names[index];
         run.round = turn.pass;
+        run.save(&names, index, turn.used, turn.pending)?;
+        #[cfg(debug_assertions)]
+        test_crash(name);
         if let Some(feedback) = turn.feedback {
             println!("  fix round {} of {}: back to {name} after {} failed", feedback.round, feedback.limit, feedback.from);
         }
@@ -1404,13 +1612,27 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     if let Err(e) = github::delete_branch(&repo, &branch) {
         eprintln!("warning: could not delete the branch {branch} on GitHub: {e}");
     }
-    let cleanup = git::git(&run.repo_dir, &["worktree", "remove", "--force", &worktree.display().to_string()])
-        .and_then(|_| git::git(&run.repo_dir, &["branch", "-D", &branch]));
+    let cleanup = run.git_lock().and_then(|_held| {
+        git::git(&run.repo_dir, &["worktree", "remove", "--force", &worktree.display().to_string()])
+            .and_then(|_| git::git(&run.repo_dir, &["branch", "-D", &branch]))
+    });
     if let Err(e) = cleanup {
         eprintln!("warning: could not remove the worktree or its branch: {e:#}");
     }
     println!("MERGED into {base}: {url}");
     Ok(true)
+}
+
+/// Lets a test cut a run off at a chosen step, once. Not in release builds.
+#[cfg(debug_assertions)]
+fn test_crash(step: &str) {
+    let (Ok(at), Ok(mark)) = (std::env::var("FACTORY_TEST_CRASH_AT"), std::env::var("FACTORY_TEST_CRASH_MARK")) else {
+        return;
+    };
+    if at == step && !Path::new(&mark).exists() {
+        let _ = std::fs::write(&mark, "cut off here");
+        std::process::exit(86);
+    }
 }
 
 pub fn status() -> Result<()> {

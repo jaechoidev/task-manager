@@ -108,6 +108,8 @@ impl Store {
     pub fn open(home: &Path) -> Result<Store> {
         std::fs::create_dir_all(home).with_context(|| format!("creating {}", home.display()))?;
         let db = Connection::open(home.join("state.db")).context("opening the state database")?;
+        // Several runs write here at once. Wait for another writer, don't fail.
+        db.busy_timeout(std::time::Duration::from_secs(30))?;
         db.execute_batch(SCHEMA)?;
         // Databases from before fix rounds have no `round` column.
         let has_round = db.prepare("SELECT 1 FROM pragma_table_info('steps') WHERE name = 'round'")?.exists([])?;
@@ -197,6 +199,11 @@ impl Store {
         let mut file = OpenOptions::new().create(true).append(true).open(&self.log)?;
         writeln!(file, "{}", serde_json::to_string(step)?)?;
         Ok(())
+    }
+
+    /// The row of one issue, when it has been run before.
+    pub fn issue(&self, repo: &str, number: u64) -> Result<Option<IssueRow>> {
+        Ok(self.issues()?.into_iter().find(|row| row.repo == repo && row.number == number))
     }
 
     pub fn issues(&self) -> Result<Vec<IssueRow>> {

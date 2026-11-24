@@ -28,6 +28,16 @@ pub fn summary_of(body: &str) -> String {
         .to_string()
 }
 
+/// The open issues this one is blocked by, from GitHub's native links.
+pub fn open_blockers(repo: &str, number: u64) -> Result<Vec<u64>> {
+    let blockers = gh::api_list(&format!("repos/{repo}/issues/{number}/dependencies/blocked_by"))?;
+    Ok(blockers
+        .iter()
+        .filter(|b| b.get("state").and_then(Value::as_str) == Some("open"))
+        .filter_map(|b| b.get("number").and_then(Value::as_u64))
+        .collect())
+}
+
 /// Fails unless the issue was made by `plan create`, is open, and nothing it
 /// is blocked by is still open.
 pub fn load(repo: &str, number: u64) -> Result<Issue> {
@@ -47,13 +57,7 @@ pub fn load(repo: &str, number: u64) -> Result<Issue> {
         .ok_or_else(|| anyhow!("issue #{number} was not created by `factory plan create`: its first line is missing"))?;
     let key = marker.key.clone().ok_or_else(|| anyhow!("issue #{number} is a plan's parent issue; run one of its sub-issues"))?;
 
-    let blockers = gh::api_list(&format!("repos/{repo}/issues/{number}/dependencies/blocked_by"))?;
-    let open: Vec<String> = blockers
-        .iter()
-        .filter(|b| b.get("state").and_then(Value::as_str) == Some("open"))
-        .filter_map(|b| b.get("number").and_then(Value::as_u64))
-        .map(|n| format!("#{n}"))
-        .collect();
+    let open: Vec<String> = open_blockers(repo, number)?.iter().map(|n| format!("#{n}")).collect();
     if !open.is_empty() {
         bail!("issue #{number} is not ready: it is blocked by {}, still open", open.join(", "));
     }

@@ -5,6 +5,7 @@
 //! Nothing here calls an agent or touches git, so every path can be tested.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Most fix rounds a workflow file may ask for, in either budget. A limit can
@@ -31,7 +32,7 @@ pub enum Outcome {
 }
 
 /// Why the developer is being called again.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Feedback {
     /// The step that failed.
     pub from: String,
@@ -48,6 +49,18 @@ pub struct Turn<'a> {
     pub pass: u32,
     /// Set only for the developer step of a fix round.
     pub feedback: Option<&'a Feedback>,
+    /// Where the run stands, for saving. `pending` is feedback the developer
+    /// has not been given yet, or is being given now.
+    pub used: Used,
+    pub pending: Option<&'a Feedback>,
+}
+
+/// Where an interrupted run picks up: the step that was about to run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Start {
+    pub index: usize,
+    pub used: Used,
+    pub feedback: Option<Feedback>,
 }
 
 /// The two budgets of fix rounds. Failures found on GitHub, after the pull
@@ -72,7 +85,7 @@ pub enum End {
 }
 
 /// How many times the run went back, by cause.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Used {
     pub local: u32,
     pub github: u32,
@@ -91,14 +104,17 @@ pub type RunStep<'a> = dyn FnMut(usize, &Turn) -> Result<Outcome> + 'a;
 /// Runs the steps in order. A step that asks for rework sends the run back to
 /// the developer step, which then runs again with the reason, followed by
 /// every step after it. A step that says the branch changed sends the run
-/// back to the step after the developer.
-pub fn drive(names: &[String], dev: usize, on_fail: &BTreeMap<String, String>, limits: Limits, run: &mut RunStep) -> Result<(End, Used)> {
-    let mut index = 0;
-    let mut used = Used::default();
-    let mut feedback: Option<Feedback> = None;
+/// back to the step after the developer. `start` picks up an interrupted run.
+pub fn drive(names: &[String], dev: usize, on_fail: &BTreeMap<String, String>, limits: Limits, start: Option<Start>, run: &mut RunStep) -> Result<(End, Used)> {
+    let Start { mut index, mut used, mut feedback } = start.unwrap_or(Start { index: 0, used: Used::default(), feedback: None });
     while index < names.len() {
         let name = &names[index];
-        let turn = Turn { pass: used.passes(), feedback: if index == dev { feedback.as_ref() } else { None } };
+        let turn = Turn {
+            pass: used.passes(),
+            feedback: if index == dev { feedback.as_ref() } else { None },
+            used,
+            pending: feedback.as_ref(),
+        };
         let reason = match run(index, &turn)? {
             Outcome::Pass => {
                 if index == dev {
@@ -172,7 +188,7 @@ mod tests {
         let mut left: BTreeMap<String, Vec<Outcome>> =
             script.iter().map(|(name, outcomes)| (name.to_string(), outcomes.iter().rev().cloned().collect())).collect();
         let mut calls = Vec::new();
-        let result = drive(&names, 2, &on_fail(), limits, &mut |index, turn| {
+        let result = drive(&names, 2, &on_fail(), limits, None, &mut |index, turn| {
             let name = &names[index];
             calls.push(format!("{name}@{}{}", turn.pass, turn.feedback.map(|f| format!("!{}", f.from)).unwrap_or_default()));
             Ok(left.get_mut(name).and_then(Vec::pop).unwrap_or(Outcome::Pass))
@@ -267,7 +283,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut github_failures = 1;
         let mut verify_failures = 1;
-        drive(&names, 2, &on_fail(), limits(3, 2), &mut |index, turn| {
+        drive(&names, 2, &on_fail(), limits(3, 2), None, &mut |index, turn| {
             if let Some(feedback) = turn.feedback {
                 seen.push((feedback.from.clone(), feedback.round, feedback.limit, turn.pass));
             }
@@ -285,6 +301,36 @@ mod tests {
         })
         .unwrap();
         assert_eq!(seen, vec![("verify".to_string(), 1, 3, 1), ("github".to_string(), 1, 2, 2)]);
+    }
+
+    #[test]
+    fn an_interrupted_run_picks_up_where_it_was() {
+        // It stopped while waiting on GitHub, in its second pass, with one
+        // local round already spent.
+        let names = names();
+        let start = Start { index: 7, used: used(1, 0, 0), feedback: None };
+        let mut calls = Vec::new();
+        let result = drive(&names, 2, &on_fail(), limits(3, 2), Some(start), &mut |index, turn| {
+            calls.push(format!("{}@{}", names[index], turn.pass));
+            Ok(Outcome::Pass)
+        })
+        .unwrap();
+        assert_eq!(result, (End::Passed, used(1, 0, 0)));
+        assert_eq!(calls, vec!["github@1", "merge@1"]);
+
+        // It stopped inside a fix round. The developer gets the same feedback again.
+        let feedback = Feedback { from: "verify".into(), reason: "flow failed".into(), round: 2, limit: 3 };
+        let start = Start { index: 2, used: used(2, 0, 0), feedback: Some(feedback) };
+        let mut seen = Vec::new();
+        drive(&names, 2, &on_fail(), limits(3, 2), Some(start), &mut |index, turn| {
+            if index == 2 {
+                seen.push(turn.feedback.map(|f| (f.reason.clone(), f.round)));
+                assert_eq!(turn.pending, turn.feedback);
+            }
+            Ok(Outcome::Pass)
+        })
+        .unwrap();
+        assert_eq!(seen, vec![Some(("flow failed".to_string(), 2))]);
     }
 
     #[test]
@@ -311,7 +357,7 @@ mod tests {
         assert_eq!(calls, vec!["acceptance@0", "red@0"]);
 
         let names = names();
-        let (end, _) = drive(&names, 2, &BTreeMap::new(), limits(3, 2), &mut |index, _| {
+        let (end, _) = drive(&names, 2, &BTreeMap::new(), limits(3, 2), None, &mut |index, _| {
             Ok(if names[index] == "verify" { rework("x") } else { Outcome::Pass })
         })
         .unwrap();
