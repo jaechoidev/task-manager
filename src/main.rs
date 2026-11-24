@@ -130,7 +130,12 @@ enum Top {
         repo_dirs: Vec<PathBuf>,
     },
     /// Show where each issue stands, from the state database
-    Status,
+    Status {
+        /// First ask GitHub about pull requests a person merged or closed by
+        /// hand, and correct the database
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -449,7 +454,11 @@ fn run() -> Result<bool> {
             Ok(true)
         }
 
-        Top::Status => {
+        Top::Status { refresh } => {
+            if refresh {
+                let changed = engine::reconcile()?;
+                println!("{changed} issue(s) corrected from GitHub");
+            }
             engine::status()?;
             Ok(true)
         }
@@ -464,6 +473,21 @@ fn run() -> Result<bool> {
 }
 
 fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, so `factory status | head` would panic when head
+    // closes the pipe. Take the system's default instead: exit quietly.
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+        }
+        const SIGPIPE: i32 = 13;
+        const SIG_DFL: usize = 0;
+        // SAFETY: called once, before any thread exists, with constant arguments.
+        unsafe {
+            signal(SIGPIPE, SIG_DFL);
+        }
+    }
+
     match run() {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),

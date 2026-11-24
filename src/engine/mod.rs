@@ -1971,6 +1971,47 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     }
 }
 
+/// What a row should say, given where its pull request stands on GitHub.
+/// `None` means the row is already right, or is not the engine's to change.
+pub(crate) fn reconciled(stage: &str, status: &str, pr: &str) -> Option<(&'static str, &'static str)> {
+    // Only rows that ended with a pull request waiting. A run in progress is
+    // left to the process that is running it.
+    let waiting = matches!(status, "open" | "green" | "failed");
+    match (waiting, pr) {
+        (true, "merged") if stage != "merged" => Some(("merged", "done")),
+        (true, "closed") if matches!(status, "open" | "green") => Some(("pr", "dropped")),
+        _ => None,
+    }
+}
+
+/// Brings the state database in line with GitHub for pull requests that a
+/// person merged or closed by hand. Returns how many rows changed.
+pub fn reconcile() -> Result<usize> {
+    let home = util::home()?;
+    let store = Store::open(&home)?;
+    let mut changed = 0;
+    for row in store.issues()? {
+        let Some(number) = row.pr_url.as_deref().and_then(|url| url.rsplit('/').next()).and_then(|n| n.parse::<u64>().ok()) else { continue };
+        if !matches!(row.status.as_str(), "open" | "green" | "failed") {
+            continue;
+        }
+        let state = match github::pr_state(&row.repo, number) {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("warning: could not read {}: {e}", row.pr_url.as_deref().unwrap_or(""));
+                continue;
+            }
+        };
+        if let Some((stage, status)) = reconciled(&row.stage, &row.status, state) {
+            let note = if state == "merged" { None } else { Some("its pull request was closed without merging") };
+            store.set_stage(&row.repo, row.number, stage, status, note)?;
+            println!("{}#{} {}: its pull request is {state} on GitHub, was recorded as {} ({})", row.repo, row.number, row.key, row.stage, row.status);
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 /// The issues waiting for a person: every run that ended blocked, with why.
 pub fn blocked() -> Result<()> {
     let home = util::home()?;
@@ -2144,6 +2185,22 @@ mod tests {
 
         assert_eq!(first_line("\n\n  scope gate: x\nmore"), "scope gate: x");
         assert_eq!(first_line(&"a".repeat(200)).chars().count(), 163);
+    }
+
+    #[test]
+    fn a_row_follows_what_a_person_did_on_github() {
+        // Merged by hand while the engine thought the pull request was open, or stuck.
+        assert_eq!(reconciled("pr", "open", "merged"), Some(("merged", "done")));
+        assert_eq!(reconciled("github", "green", "merged"), Some(("merged", "done")));
+        assert_eq!(reconciled("github", "failed", "merged"), Some(("merged", "done")));
+        // Closed without merging: off the list of open pull requests, but a stuck issue stays stuck.
+        assert_eq!(reconciled("pr", "open", "closed"), Some(("pr", "dropped")));
+        assert_eq!(reconciled("verify", "failed", "closed"), None);
+        // Nothing to change, and a run in progress is never touched.
+        assert_eq!(reconciled("pr", "open", "open"), None);
+        assert_eq!(reconciled("merged", "done", "merged"), None);
+        assert_eq!(reconciled("github", "running", "merged"), None);
+        assert_eq!(reconciled("develop", "waiting", "closed"), None);
     }
 
     #[test]

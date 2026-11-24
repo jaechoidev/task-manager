@@ -44,7 +44,7 @@ factory status
 | `module list` | Lists the built-in modules and the repository's own | |
 | `module new` | Opens a pull request that adds a new module's files. `--dry-run` prints them | |
 | `serve` | Serves the local API that the app and other clients use | |
-| `status` | Shows where each issue stands, from the state database | |
+| `status` | Shows where each issue stands, from the state database. `--refresh` first corrects it from GitHub, for pull requests a person merged or closed by hand | |
 
 Exit code 2 means the command itself could not run.
 

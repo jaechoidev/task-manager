@@ -183,6 +183,18 @@ pub fn find_pr(repo: &str, branch: &str) -> Result<Option<(u64, String)>> {
     }))
 }
 
+/// Where a pull request stands on GitHub: `merged`, `closed` or `open`.
+pub fn pr_state(repo: &str, pr: u64) -> Result<&'static str> {
+    let value = gh::api("GET", &format!("repos/{repo}/pulls/{pr}"), None)?;
+    Ok(if value.get("merged").and_then(Value::as_bool) == Some(true) {
+        "merged"
+    } else if value.get("state").and_then(Value::as_str) == Some("closed") {
+        "closed"
+    } else {
+        "open"
+    })
+}
+
 pub fn is_merged(repo: &str, pr: u64) -> Result<bool> {
     let value = gh::api("GET", &format!("repos/{repo}/pulls/{pr}"), None)?;
     Ok(value.get("merged").and_then(Value::as_bool).unwrap_or(false))
