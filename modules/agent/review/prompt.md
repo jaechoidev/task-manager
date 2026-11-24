@@ -33,6 +33,10 @@ The change has already passed the scope gate, the build and the flows. Judge wha
 
 If the flows miss an acceptance criterion, say so in `items` and ask for a flow that covers the gap. Don't ask the developer to edit a flow: it may not.
 
+# Earlier review of this issue
+
+{{previous_review}}
+
 # The developer's report
 
 {{dev_report}}
@@ -49,7 +53,7 @@ Read any file you need for context.
 
 Reply with only the JSON object described by the output schema:
 
-- `verdict`: `approve` when every acceptance criterion is met and you found no bug. Otherwise `changes`.
+- `verdict`: `approve` when every acceptance criterion is met and you found no bug. Otherwise `changes`. Ask for a change only when a criterion is unmet or there is a bug. A matter of taste goes in `items` with `approve`.
 - `head_sha`: the commit you reviewed, copied from above.
 - `summary`: your reasoning in two to five sentences.
 - `items`: for `changes`, one entry per requested change, each naming the file and what to do. For `approve`, things a person may still want to check, or an empty list.

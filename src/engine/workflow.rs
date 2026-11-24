@@ -1,6 +1,7 @@
 //! Loads a repo's workflow (`factory.yaml`) and the modules it names, and
 //! checks the chain before anything runs.
 
+use super::rounds::{DEFAULT_FIX_ROUNDS, MAX_FIX_ROUNDS};
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +17,7 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("check/acceptance-red", "module.yaml", include_str!("../../modules/check/acceptance-red/module.yaml")),
     ("agent/dev", "module.yaml", include_str!("../../modules/agent/dev/module.yaml")),
     ("agent/dev", "prompt.md", include_str!("../../modules/agent/dev/prompt.md")),
+    ("agent/dev", "fix.md", include_str!("../../modules/agent/dev/fix.md")),
     ("agent/dev", "report.schema.json", include_str!("../../modules/agent/dev/report.schema.json")),
     ("agent/review", "module.yaml", include_str!("../../modules/agent/review/module.yaml")),
     ("agent/review", "prompt.md", include_str!("../../modules/agent/review/prompt.md")),
@@ -109,6 +111,9 @@ pub struct ModuleDef {
     /// agent: file names next to module.yaml.
     pub prompt: Option<String>,
     pub output_schema: Option<String>,
+    /// dev: the prompt for a fix round. Without it, a fix round reuses
+    /// `prompt` with the failure added at the end.
+    pub fix_prompt: Option<String>,
     /// acceptance: the prompt and schema for ruling on a flow change request.
     pub ruling_prompt: Option<String>,
     pub ruling_schema: Option<String>,
@@ -135,6 +140,15 @@ struct FactoryFile {
     workflow: Vec<BTreeMap<String, StepSpec>>,
     #[serde(default)]
     on_fail: BTreeMap<String, String>,
+    #[serde(default)]
+    limits: Limits,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Limits {
+    /// How many times a failure may send the issue back to the developer.
+    fix_rounds: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +161,7 @@ pub struct Step {
     pub model: Option<String>,
     pub prompt: Option<String>,
     pub schema: Option<String>,
+    pub fix_prompt: Option<String>,
     pub ruling_prompt: Option<String>,
     pub ruling_schema: Option<String>,
 }
@@ -154,9 +169,10 @@ pub struct Step {
 #[derive(Debug, Clone)]
 pub struct Workflow {
     pub steps: Vec<Step>,
-    /// Where a failed step returns to. Checked now, used once fix loops exist.
-    #[allow(dead_code)]
+    /// Where a failed step returns to.
     pub on_fail: BTreeMap<String, String>,
+    /// How many times a failure may send the issue back to the developer.
+    pub fix_rounds: u32,
 }
 
 /// `read(module, file)` returns a module file's text, or `None` when the
@@ -206,6 +222,7 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
         let mut vendor = None;
         let mut prompt = None;
         let mut schema = None;
+        let mut fix_prompt = None;
         let mut ruling_prompt = None;
         let mut ruling_schema = None;
         match def.kind {
@@ -233,6 +250,7 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
                 for (field, name_of, slot, required) in [
                     ("prompt", &def.prompt, &mut prompt, true),
                     ("output_schema", &def.output_schema, &mut schema, true),
+                    ("fix_prompt", &def.fix_prompt, &mut fix_prompt, false),
                     ("ruling_prompt", &def.ruling_prompt, &mut ruling_prompt, false),
                     ("ruling_schema", &def.ruling_schema, &mut ruling_schema, false),
                 ] {
@@ -272,6 +290,7 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
             model: spec.model.clone(),
             prompt,
             schema,
+            fix_prompt,
             ruling_prompt,
             ruling_schema,
         });
@@ -318,10 +337,15 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
         }
     }
 
+    let fix_rounds = file.limits.fix_rounds.unwrap_or(DEFAULT_FIX_ROUNDS);
+    if fix_rounds > MAX_FIX_ROUNDS {
+        errors.push(format!("limits.fix_rounds is {fix_rounds}, and the most the engine allows is {MAX_FIX_ROUNDS}"));
+    }
+
     if !errors.is_empty() {
         bail!("factory.yaml is not valid:\n  - {}", errors.join("\n  - "));
     }
-    Ok(Workflow { steps, on_fail: file.on_fail })
+    Ok(Workflow { steps, on_fail: file.on_fail, fix_rounds })
 }
 
 #[cfg(test)]
@@ -406,6 +430,19 @@ on_fail:
         assert!(acceptance.ruling_prompt.as_deref().unwrap().contains("{{request}}"));
         assert!(acceptance.ruling_schema.as_deref().unwrap().contains("decision"));
         assert!(workflow.steps[1].def.run.as_deref().unwrap().contains("{{new_flows}}"));
+    }
+
+    #[test]
+    fn fix_rounds_have_a_default_and_a_ceiling() {
+        let workflow = parse(WITH_ACCEPTANCE, &builtin).unwrap();
+        assert_eq!(workflow.fix_rounds, 3);
+        assert_eq!(workflow.on_fail.get("verify").map(String::as_str), Some("develop"));
+        assert!(workflow.steps[2].fix_prompt.as_deref().unwrap().contains("{{feedback}}"));
+
+        let none = format!("{WITH_ACCEPTANCE}limits:\n  fix_rounds: 0\n");
+        assert_eq!(parse(&none, &builtin).unwrap().fix_rounds, 0);
+        let many = format!("{WITH_ACCEPTANCE}limits:\n  fix_rounds: 9\n");
+        assert!(errors(&many).contains("the most the engine allows is 5"));
     }
 
     #[test]

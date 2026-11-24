@@ -1,14 +1,15 @@
 //! The issue loop, run by code. An agent saying "done" is never a pass.
 //!
 //! This version takes one issue through acceptance flows, develop, verify and
-//! review, then opens a pull request. There is no fix loop yet: a failed step
-//! stops the run with its state recorded.
+//! review, then opens a pull request. A failed verify or a review that asks
+//! for changes sends the issue back to the developer, up to a round limit.
 
 pub mod agent;
 pub mod flows;
 pub mod git;
 pub mod issue;
 pub mod proc;
+pub mod rounds;
 pub mod state;
 pub mod util;
 pub mod workflow;
@@ -16,6 +17,7 @@ pub mod workflow;
 use crate::gh;
 use anyhow::{anyhow, bail, Context, Result};
 use issue::Issue;
+use rounds::{End, Feedback, Outcome};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use state::{StepRecord, Store};
@@ -26,6 +28,9 @@ use workflow::{Access, Kind, Role, Step, Workflow};
 
 /// Longest diff handed to a reviewer inline. The reviewer can read the rest.
 const MAX_DIFF_CHARS: usize = 150_000;
+/// How much of a failed check's output the developer is shown.
+const LOG_TAIL_LINES: usize = 120;
+const LOG_TAIL_CHARS: usize = 12_000;
 
 pub struct RunOptions {
     /// A checkout of the project repository.
@@ -95,9 +100,25 @@ struct Evidence<'a> {
     session: Option<String>,
 }
 
-enum StepResult {
-    Pass,
-    Fail(String),
+/// One agent call: what to send and how to name it.
+struct Ask<'a> {
+    /// The step's name in the log and in file names.
+    name: &'a str,
+    prompt: &'a str,
+    schema: Option<&'a str>,
+    /// A session to continue.
+    resume: Option<&'a str>,
+}
+
+/// A fix round that ended in a commit.
+struct Fix {
+    round: u32,
+    /// The step whose failure caused the round.
+    from: String,
+    /// The first line of what failed.
+    why: String,
+    commit: String,
+    subject: String,
 }
 
 struct Run<'a> {
@@ -118,9 +139,17 @@ struct Run<'a> {
     /// Every accessibility ID development must implement: the plan's, plus
     /// any the acceptance writer added.
     ids: Vec<String>,
+    /// 0 for the first pass, then one per fix round.
+    round: u32,
+    max_rounds: u32,
+    fixes: Vec<Fix>,
     dev: Option<DevReport>,
     dev_vendor: Option<String>,
     dev_subject: Option<String>,
+    /// The developer's session, continued in fix rounds.
+    dev_session: Option<String>,
+    /// The review before the current one, when it asked for changes.
+    earlier_review: Option<Verdict>,
     /// An accepted or rejected flow change request, with the commit of an
     /// accepted change.
     ruling: Option<(Ruling, Option<String>)>,
@@ -198,6 +227,27 @@ fn label(repo: &str, number: u64, add: Option<&str>, remove: Option<&str>) {
     }
 }
 
+/// The end of a log file, for a prompt.
+fn tail(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n");
+    if out.len() > LOG_TAIL_CHARS {
+        let cut = (out.len() - LOG_TAIL_CHARS..out.len()).find(|&i| out.is_char_boundary(i)).unwrap_or(0);
+        out = out[cut..].to_string();
+    }
+    out.trim().to_string()
+}
+
+fn first_line(text: &str) -> String {
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let mut out: String = line.chars().take(160).collect();
+    if line.chars().count() > 160 {
+        out.push_str("...");
+    }
+    out
+}
+
 fn seconds(duration: Duration) -> String {
     format!("{:.0} s", duration.as_secs_f64())
 }
@@ -219,6 +269,7 @@ impl Run<'_> {
             vendor: step.vendor.map(|v| v.name().to_string()),
             model: step.model.clone(),
             subscription: step.vendor.map(|_| "default".to_string()),
+            round: self.round,
             attempt,
             sha: Some(self.expected.clone()),
             exit_code: outcome.and_then(|o| o.exit_code),
@@ -233,8 +284,9 @@ impl Run<'_> {
         })
     }
 
-    /// Logs one of the engine's fixed gates. `failure` is why it failed.
-    fn gate(&self, name: &str, failure: Option<String>) -> Result<StepResult> {
+    /// Logs one of the engine's fixed gates. `failure` is why it failed. A
+    /// failed gate stops the run. See `rework` for one the developer can fix.
+    fn gate(&self, name: &str, failure: Option<String>) -> Result<Outcome> {
         self.store.record(&StepRecord {
             ts: util::now(),
             repo: self.repo.clone(),
@@ -246,6 +298,7 @@ impl Run<'_> {
             vendor: None,
             model: None,
             subscription: None,
+            round: self.round,
             attempt: 1,
             sha: Some(self.expected.clone()),
             exit_code: None,
@@ -259,24 +312,45 @@ impl Run<'_> {
             session_id: None,
         })?;
         Ok(match failure {
-            Some(reason) => StepResult::Fail(format!("{name} gate: {reason}")),
-            None => StepResult::Pass,
+            Some(reason) => Outcome::Stop(format!("{name} gate: {reason}")),
+            None => Outcome::Pass,
         })
     }
 
+    /// A failed gate that goes back to the developer.
+    fn rework(&self, name: &str, reason: String) -> Result<Outcome> {
+        Ok(match self.gate(name, Some(reason))? {
+            Outcome::Stop(reason) => Outcome::Rework(reason),
+            other => other,
+        })
+    }
+
+    /// The part of a file name that says which round it belongs to.
+    fn round_tag(&self) -> String {
+        if self.round == 0 {
+            String::new()
+        } else {
+            format!("-r{}", self.round)
+        }
+    }
+
     /// Calls an agent and parses its reply. An unusable reply gets one retry.
-    /// `verdict_of` names what goes in the log for a usable reply.
-    fn ask<T: for<'de> Deserialize<'de>>(&self, index: usize, step: &Step, name: &str, prompt: &str, schema: Option<&str>, verdict_of: fn(&T) -> String) -> Result<Result<(T, Value), String>> {
+    /// `verdict_of` names what goes in the log for a usable reply. Returns
+    /// the reply and the session it came from.
+    fn ask<T: for<'de> Deserialize<'de>>(&self, index: usize, step: &Step, ask: &Ask, verdict_of: fn(&T) -> String) -> Result<Result<(T, Option<String>), String>> {
+        let name = ask.name;
         let vendor = step.vendor.ok_or_else(|| anyhow!("step '{}' has no vendor", step.name))?;
-        let schema = schema.unwrap_or("{}");
+        let schema = ask.schema.unwrap_or("{}");
         let access = step.def.access.unwrap_or(Access::ReadOnly);
         let timeout = Duration::from_secs(step.def.timeout_minutes.unwrap_or(30) * 60);
-        let mut prompt = prompt.to_string();
+        let mut prompt = ask.prompt.to_string();
+        let mut resume = ask.resume;
         let mut last_error = String::new();
 
         for attempt in 1..=2u32 {
-            println!("  {name}: {} call, attempt {attempt}", vendor.name());
-            let stem = format!("{:02}-{name}-{attempt}", index + 1);
+            let how = if resume.is_some() { ", continuing its session" } else { "" };
+            println!("  {name}: {} call, attempt {attempt}{how}", vendor.name());
+            let stem = format!("{:02}-{name}{}-{attempt}", index + 1, self.round_tag());
             let reply = agent::call(&agent::Call {
                 vendor,
                 model: step.model.as_deref(),
@@ -287,11 +361,10 @@ impl Run<'_> {
                 dir: &self.run_dir,
                 stem: &stem,
                 timeout,
+                resume,
             })?;
             let parsed = match (&reply.output, &reply.error) {
-                (Some(value), None) => serde_json::from_value::<T>(value.clone())
-                    .map(|typed| (typed, value.clone()))
-                    .map_err(|e| format!("reply does not match the schema: {e}")),
+                (Some(value), None) => serde_json::from_value::<T>(value.clone()).map_err(|e| format!("reply does not match the schema: {e}")),
                 (_, Some(error)) => Err(error.clone()),
                 (None, None) => Err("no reply".to_string()),
             };
@@ -304,8 +377,9 @@ impl Run<'_> {
             match parsed {
                 Ok(found) => {
                     println!("  {name}: replied in {}", seconds(reply.outcome.duration));
-                    self.record(step, name, attempt, &verdict_of(&found.0), Evidence { outcome: Some(&reply.outcome), files, session: reply.session_id })?;
-                    return Ok(Ok(found));
+                    let session = reply.session_id.clone();
+                    self.record(step, name, attempt, &verdict_of(&found), Evidence { outcome: Some(&reply.outcome), files, session: reply.session_id })?;
+                    return Ok(Ok((found, session)));
                 }
                 Err(error) => {
                     println!("  {name}: unusable reply ({error})");
@@ -314,7 +388,14 @@ impl Run<'_> {
                     if reply.outcome.timed_out {
                         return Ok(Err(error));
                     }
-                    prompt = format!("{prompt}\n\n# Your previous reply was rejected\n\n{error}\n\nReply again with only the JSON object.");
+                    if resume.is_some() && reply.output.is_none() {
+                        // The session could not be continued. The prompt
+                        // stands on its own, so start a new one.
+                        println!("  {name}: the session could not be continued, starting a new one");
+                        resume = None;
+                    } else {
+                        prompt = format!("{prompt}\n\n# Your previous reply was rejected\n\n{error}\n\nReply again with only the JSON object.");
+                    }
                     last_error = error;
                 }
             }
@@ -387,20 +468,21 @@ impl Run<'_> {
     }
 
     /// Writes the issue's new acceptance flows, before any code exists.
-    fn acceptance(&mut self, index: usize, step: &Step) -> Result<StepResult> {
+    fn acceptance(&mut self, index: usize, step: &Step) -> Result<Outcome> {
         let new = self.flow_paths(true);
         if new.is_empty() {
             println!("  {}: skipped, the issue adds no flow", step.name);
             self.note(step, "skipped")?;
-            return Ok(StepResult::Pass);
+            return Ok(Outcome::Pass);
         }
         let values = self.issue_values();
         let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
 
-        let (report, _) = match self.ask::<AcceptanceReport>(index, step, &step.name, &prompt, step.schema.as_deref(), |_| "replied".to_string())? {
+        let ask = Ask { name: &step.name, prompt: &prompt, schema: step.schema.as_deref(), resume: None };
+        let (report, _) = match self.ask::<AcceptanceReport>(index, step, &ask, |_| "replied".to_string())? {
             Ok(found) => found,
-            Err(error) => return Ok(StepResult::Fail(error)),
+            Err(error) => return Ok(Outcome::Stop(error)),
         };
 
         if git::head(&self.worktree)? != self.expected {
@@ -456,17 +538,58 @@ impl Run<'_> {
         self.expected = sha.clone();
         let vendor = step.vendor.map(|v| v.name()).unwrap_or("?").to_string();
         self.acceptance = Some(Acceptance { vendor, sha, report });
-        Ok(StepResult::Pass)
+        Ok(Outcome::Pass)
     }
 
-    fn develop(&mut self, index: usize, step: &Step) -> Result<StepResult> {
-        let values = self.issue_values();
-        let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
-
-        let (report, _) = match self.ask::<DevReport>(index, step, &step.name, &prompt, step.schema.as_deref(), |_| "replied".to_string())? {
+    /// The developer's turn. With `feedback`, this is a fix round: the
+    /// developer continues its session and is told what failed.
+    fn develop(&mut self, index: usize, step: &Step, feedback: Option<&Feedback>) -> Result<Outcome> {
+        let mut values = self.issue_values();
+        let prompt = match feedback {
+            None => {
+                let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                render(step.prompt.as_deref().unwrap_or(""), &pairs)
+            }
+            Some(feedback) => {
+                let state = match &self.head_sha {
+                    Some(head) if *head == self.expected => format!("Your earlier work is committed as `{head}`. Build on it."),
+                    Some(_) => "Your earlier work is committed, and the acceptance writer has since changed a flow at your request. Build on what is in the directory.".to_string(),
+                    None => "Nothing of yours is committed yet. Your earlier changes are still in the directory, because a gate rejected them.".to_string(),
+                };
+                values.extend([
+                    ("round", self.round.to_string()),
+                    ("max_rounds", self.max_rounds.to_string()),
+                    ("failed_step", feedback.from.clone()),
+                    ("state", state),
+                    // Untrusted text, such as a log, goes last.
+                    ("feedback", feedback.reason.clone()),
+                ]);
+                let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                match step.fix_prompt.as_deref() {
+                    Some(template) => render(template, &pairs),
+                    None => format!(
+                        "{}\n\n# Your earlier work did not pass, at the `{}` step\n\n{}\n\nFix it and reply again with the JSON object.",
+                        render(step.prompt.as_deref().unwrap_or(""), &pairs),
+                        feedback.from,
+                        feedback.reason
+                    ),
+                }
+            }
+        };
+        let resume = if feedback.is_some() { self.dev_session.clone() } else { None };
+        let ask = Ask { name: &step.name, prompt: &prompt, schema: step.schema.as_deref(), resume: resume.as_deref() };
+        let (report, session) = match self.ask::<DevReport>(index, step, &ask, |_| "replied".to_string())? {
             Ok(found) => found,
-            Err(error) => return Ok(StepResult::Fail(error)),
+            Err(error) => return Ok(Outcome::Stop(error)),
+        };
+        if session.is_some() {
+            self.dev_session = session;
+        }
+        // A gate the developer can fix sends it back with the reason, and
+        // with the failure it was already working on, which still stands.
+        let earlier = match feedback {
+            Some(f) if f.from != step.name => format!("\n\nThe failure you were fixing still stands:\n\n{}", f.reason),
+            _ => String::new(),
         };
 
         // Fixed gates. None of these can be turned off by a workflow file.
@@ -475,16 +598,23 @@ impl Run<'_> {
         }
         let changed = git::changed_files(&self.worktree, &self.expected)?;
         if changed.is_empty() {
+            // Trying again would get the same answer, so a person decides.
             return self.gate("changes", Some(format!("the developer changed no files. Its notes: {}", report.notes)));
         }
         let flows: Vec<&String> = changed.iter().filter(|f| f.starts_with(".maestro/")).collect();
         if !flows.is_empty() {
-            return self.gate("locked-flows", Some(format!("acceptance flows are locked, but the change touches {flows:?}")));
+            return self.rework(
+                "locked-flows",
+                format!("acceptance flows are locked, but your change touches {flows:?}. Undo that, and use flow_change_request if a flow is wrong.{earlier}"),
+            );
         }
         self.gate("locked-flows", None)?;
         let outside = outside_scope(&changed, &self.issue.marker.scope);
         if !outside.is_empty() {
-            return self.gate("scope", Some(format!("files outside the issue's scope were changed: {}", outside.join(", "))));
+            return self.rework(
+                "scope",
+                format!("you changed files outside the issue's scope: {}. Undo those changes.{earlier}", outside.join(", ")),
+            );
         }
         self.gate("scope", None)?;
         println!("  scope gate: {} file(s), all inside scope", changed.len());
@@ -496,7 +626,10 @@ impl Run<'_> {
             }
         }
         if !absent.is_empty() {
-            return self.gate("ids-implemented", Some(format!("these accessibility IDs are not string literals anywhere in the issue's scope: {absent:?}")));
+            return self.rework(
+                "ids-implemented",
+                format!("these accessibility IDs are not string literals anywhere in the issue's scope: {absent:?}. Flows find elements by exactly these IDs.{earlier}"),
+            );
         }
         self.gate("ids-implemented", None)?;
 
@@ -506,11 +639,20 @@ impl Run<'_> {
         println!("  committed {} \"{subject}\"", &head[..head.len().min(10)]);
         self.store.set_head(&self.repo, self.issue.number, &head)?;
         self.expected = head.clone();
-        self.head_sha = Some(head);
+        self.head_sha = Some(head.clone());
         self.dev_vendor = step.vendor.map(|v| v.name().to_string());
-        self.dev_subject = Some(subject);
+        match feedback {
+            Some(feedback) => self.fixes.push(Fix {
+                round: self.round,
+                from: feedback.from.clone(),
+                why: first_line(&feedback.reason),
+                commit: head,
+                subject,
+            }),
+            None => self.dev_subject = Some(subject),
+        }
         self.dev = Some(report);
-        Ok(StepResult::Pass)
+        Ok(Outcome::Pass)
     }
 
     fn dev_report(&self) -> Result<String> {
@@ -526,7 +668,7 @@ impl Run<'_> {
 
     /// The developer may not edit a flow. When it says one is wrong, the
     /// acceptance writer rules. `step` is the acceptance step.
-    fn rule(&mut self, index: usize, step: &Step, request: &str) -> Result<StepResult> {
+    fn rule(&mut self, index: usize, step: &Step, request: &str) -> Result<Outcome> {
         let name = "flow-ruling";
         let head = self.head_sha.clone().ok_or_else(|| anyhow!("a ruling needs the developer's commit"))?;
         let mut values = self.issue_values();
@@ -534,9 +676,10 @@ impl Run<'_> {
         let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let prompt = render(step.ruling_prompt.as_deref().unwrap_or(""), &pairs);
 
-        let (ruling, _) = match self.ask::<Ruling>(index, step, name, &prompt, step.ruling_schema.as_deref(), |r| r.decision.clone())? {
+        let ask = Ask { name, prompt: &prompt, schema: step.ruling_schema.as_deref(), resume: None };
+        let (ruling, _) = match self.ask::<Ruling>(index, step, &ask, |r| r.decision.clone())? {
             Ok(found) => found,
-            Err(error) => return Ok(StepResult::Fail(error)),
+            Err(error) => return Ok(Outcome::Stop(error)),
         };
         println!("  {name}: {} ({})", ruling.decision, ruling.reason.trim());
         if git::head(&self.worktree)? != self.expected {
@@ -547,9 +690,12 @@ impl Run<'_> {
                 let problem = self.same_commit("the acceptance writer")?;
                 let reason = ruling.reason.trim().to_string();
                 self.ruling = Some((ruling, None));
-                Ok(StepResult::Fail(problem.unwrap_or(format!(
-                    "the acceptance writer rejected the developer's flow change request, so the code must change: {reason}"
-                ))))
+                Ok(match problem {
+                    Some(problem) => Outcome::Stop(problem),
+                    None => Outcome::Rework(format!(
+                        "The acceptance writer rejected your flow change request, so the code must change to meet the flow as it is. Its reason: {reason}"
+                    )),
+                })
             }
             "accept" => {
                 let allowed: Vec<String> = self.issue.marker.flows.iter().map(|f| flows::path(&f.file)).collect();
@@ -576,9 +722,9 @@ impl Run<'_> {
                 self.expected = sha.clone();
                 self.head_sha = Some(sha.clone());
                 self.ruling = Some((ruling, Some(sha)));
-                Ok(StepResult::Pass)
+                Ok(Outcome::Pass)
             }
-            other => Ok(StepResult::Fail(format!("the acceptance writer returned an unknown decision '{other}'"))),
+            other => Ok(Outcome::Stop(format!("the acceptance writer returned an unknown decision '{other}'"))),
         }
     }
 
@@ -596,7 +742,7 @@ impl Run<'_> {
         Ok(None)
     }
 
-    fn check(&mut self, index: usize, step: &Step) -> Result<StepResult> {
+    fn check(&mut self, index: usize, step: &Step) -> Result<Outcome> {
         let template = step.def.run.clone().unwrap_or_default();
         // A check on the new flows: they must fail before development.
         let red = template.contains("{{new_flows}}");
@@ -604,13 +750,13 @@ impl Run<'_> {
         if red && new.is_empty() {
             println!("  {}: skipped, the issue adds no flow", step.name);
             self.note(step, "skipped")?;
-            return Ok(StepResult::Pass);
+            return Ok(Outcome::Pass);
         }
         // Flow names were checked to be plain file names before the run began.
         let quoted: Vec<String> = new.iter().map(|f| format!("'{f}'")).collect();
         let command = template.replace("{{new_flows}}", &quoted.join(" "));
         let judges_code = step.def.produces.iter().any(|p| p == "verify_log");
-        let stem = format!("{:02}-{}", index + 1, step.name);
+        let stem = format!("{:02}-{}{}", index + 1, step.name, self.round_tag());
         let stdout = self.run_dir.join(format!("{stem}.stdout.log"));
         let stderr = self.run_dir.join(format!("{stem}.stderr.log"));
         println!("  {}: running {command}", step.name);
@@ -628,14 +774,33 @@ impl Run<'_> {
         self.record(step, &step.name, 1, if passed { "pass" } else { "fail" }, Evidence { outcome: Some(&outcome), files, session: None })?;
 
         if !passed {
-            let why = if outcome.timed_out { "timed out".to_string() } else { format!("exit code {:?}", outcome.exit_code) };
+            let why = match outcome.exit_code {
+                _ if outcome.timed_out => "timed out".to_string(),
+                Some(code) => format!("exit code {code}"),
+                None => "killed by a signal".to_string(),
+            };
             if judges_code {
                 self.verify = Some(format!("failed ({why})"));
             }
-            return Ok(StepResult::Fail(format!("{command} failed: {why}. Logs: {} and {}", stdout.display(), stderr.display())));
+            println!("  {}: failed, {why}", step.name);
+            let logs = format!("Full logs: {} and {}", stdout.display(), stderr.display());
+            if outcome.timed_out {
+                // A hang is rarely something a code change fixes.
+                return Ok(Outcome::Stop(format!("`{command}` timed out. {logs}")));
+            }
+            let mut shown = tail(&stdout);
+            let errors = tail(&stderr);
+            if !errors.is_empty() {
+                shown.push_str("\n\n--- stderr ---\n");
+                shown.push_str(&errors);
+            }
+            return Ok(Outcome::Rework(format!(
+                "`{command}` failed: {why}, on commit `{}`.\n\nThe end of its output:\n\n```\n{shown}\n```\n\nIf flows ran, Maestro's report and its screenshots of each failure are under `build/verify/` in your directory.\n\n{logs}",
+                self.expected
+            )));
         }
         if let Some(problem) = self.same_commit(&command)? {
-            return Ok(StepResult::Fail(problem));
+            return Ok(Outcome::Stop(problem));
         }
         let result = format!("passed (exit 0, {})", seconds(outcome.duration));
         if red {
@@ -645,7 +810,7 @@ impl Run<'_> {
             self.verify = Some(result);
         }
         println!("  {}: passed in {}", step.name, seconds(outcome.duration));
-        Ok(StepResult::Pass)
+        Ok(Outcome::Pass)
     }
 
     /// What the reviewer is told about the acceptance flows.
@@ -672,7 +837,7 @@ impl Run<'_> {
         out
     }
 
-    fn review(&mut self, index: usize, step: &Step) -> Result<StepResult> {
+    fn review(&mut self, index: usize, step: &Step) -> Result<Outcome> {
         let head = self.head_sha.clone().ok_or_else(|| anyhow!("review needs a commit"))?;
         let mut diff = git::diff(&self.worktree, &self.base_sha, &head)?;
         if diff.len() > MAX_DIFF_CHARS {
@@ -688,34 +853,50 @@ impl Run<'_> {
             ("base_sha", self.base_sha.clone()),
             ("verify_result", verify),
             ("acceptance", self.acceptance_note()),
+            (
+                "previous_review",
+                match &self.earlier_review {
+                    Some(earlier) => format!(
+                        "An earlier commit, `{}`, was reviewed and these changes were asked for. The developer has worked on them since. Check each one, and don't ask for something new that the earlier review could have raised unless it is a bug or an unmet criterion.\n\n{}",
+                        earlier.head_sha.trim(),
+                        bullets(&earlier.items, false)
+                    ),
+                    None => "None. This is the first review.".to_string(),
+                },
+            ),
             ("dev_report", dev_report),
             ("diff", diff),
         ]);
         let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
 
-        let (verdict, _) = match self.ask::<Verdict>(index, step, &step.name, &prompt, step.schema.as_deref(), |v| v.verdict.clone())? {
+        let ask = Ask { name: &step.name, prompt: &prompt, schema: step.schema.as_deref(), resume: None };
+        let (verdict, _) = match self.ask::<Verdict>(index, step, &ask, |v| v.verdict.clone())? {
             Ok(found) => found,
-            Err(error) => return Ok(StepResult::Fail(error)),
+            Err(error) => return Ok(Outcome::Stop(error)),
         };
         if let Some(problem) = self.same_commit("the reviewer")? {
-            return Ok(StepResult::Fail(problem));
+            return Ok(Outcome::Stop(problem));
         }
         // One SHA for every signal: a verdict on another commit is worthless.
         let reviewed = verdict.head_sha.trim();
         if reviewed.len() < 7 || !head.starts_with(reviewed) {
-            return Ok(StepResult::Fail(format!("the reviewer judged commit '{reviewed}', not {head}")));
+            return Ok(Outcome::Stop(format!("the reviewer judged commit '{reviewed}', not {head}")));
         }
         let vendor = step.vendor.map(|v| v.name()).unwrap_or("?").to_string();
         println!("  {}: {} by {vendor}", step.name, verdict.verdict);
         let result = match verdict.verdict.as_str() {
-            "approve" => StepResult::Pass,
-            "changes" => StepResult::Fail(format!(
-                "review asked for changes:\n{}\n{}",
-                verdict.summary,
-                bullets(&verdict.items, false)
-            )),
-            other => StepResult::Fail(format!("the reviewer returned an unknown verdict '{other}'")),
+            "approve" => Outcome::Pass,
+            "changes" => {
+                let items: Vec<String> = verdict.items.iter().enumerate().map(|(i, item)| format!("R{}: {}", i + 1, item.trim())).collect();
+                self.earlier_review = Some(verdict.clone());
+                Outcome::Rework(format!(
+                    "The reviewer ({vendor}) asked for changes on commit `{head}`.\n\n{}\n\nFix each of these:\n\n{}",
+                    verdict.summary.trim(),
+                    bullets(&items, false)
+                ))
+            }
+            other => Outcome::Stop(format!("the reviewer returned an unknown verdict '{other}'")),
         };
         self.review = Some((vendor, verdict));
         Ok(result)
@@ -755,6 +936,19 @@ impl Run<'_> {
         out.push_str(&format!("- `./verify.sh`, run by the engine on this commit: {}\n", self.verify.as_deref().unwrap_or("not run")));
         if let Some((vendor, verdict)) = &self.review {
             out.push_str(&format!("- Review ({vendor}): {} on `{}`\n", verdict.verdict, verdict.head_sha.trim()));
+        }
+        if !self.fixes.is_empty() {
+            out.push_str("\n## Fix rounds\n\n");
+            for fix in &self.fixes {
+                out.push_str(&format!(
+                    "{}. `{}` failed: {}\n   Fixed in `{}` \"{}\"\n",
+                    fix.round,
+                    fix.from,
+                    fix.why.replace('`', "'"),
+                    &fix.commit[..fix.commit.len().min(10)],
+                    fix.subject
+                ));
+            }
         }
         out.push_str("\n## For a human to check\n\n");
         let mut notes: Vec<String> = Vec::new();
@@ -816,7 +1010,7 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     let read_module = |module: &str, file: &str| {
         read_base(&format!("modules/{module}/{file}")).or_else(|| workflow::builtin(module, file))
     };
-    let Workflow { steps, .. } = workflow::parse(&workflow_text, &read_module)?;
+    let Workflow { steps, on_fail, fix_rounds } = workflow::parse(&workflow_text, &read_module)?;
     let acceptance_step = steps.iter().find(|s| s.def.role == Some(Role::Acceptance));
 
     // Flow names end up in file paths and in a shell command.
@@ -865,40 +1059,65 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         acceptance: None,
         red: None,
         ids: issue.marker.accessibility_ids.clone(),
+        round: 0,
+        max_rounds: fix_rounds,
+        fixes: Vec::new(),
         dev: None,
         dev_vendor: None,
         dev_subject: None,
+        dev_session: None,
+        earlier_review: None,
         ruling: None,
         verify: None,
         review: None,
     };
 
-    for (index, step) in steps.iter().enumerate() {
+    let names: Vec<String> = steps.iter().map(|s| s.name.clone()).collect();
+    let dev_index = steps
+        .iter()
+        .position(|s| s.def.role == Some(Role::Dev))
+        .ok_or_else(|| anyhow!("the workflow has no dev step"))?;
+    let (end, rounds_used) = rounds::drive(&names, dev_index, &on_fail, fix_rounds, &mut |index, round, feedback| {
+        let step = &steps[index];
+        run.round = round;
+        if let Some(feedback) = feedback {
+            println!("  fix round {round} of {fix_rounds}: back to {} after {} failed", step.name, feedback.from);
+        }
         store.set_stage(&repo, issue.number, &step.name, "running", None)?;
         let result = match (step.def.kind, step.def.role) {
             (Kind::Agent, Some(Role::Acceptance)) => run.acceptance(index, step),
-            (Kind::Agent, Some(Role::Dev)) => run.develop(index, step).and_then(|result| {
+            (Kind::Agent, Some(Role::Dev)) => run.develop(index, step, feedback).and_then(|outcome| {
                 // A flow change request is ruled on before anything judges the code.
                 let request = run.dev.as_ref().and_then(|d| d.flow_change_request.clone()).filter(|r| !r.trim().is_empty());
-                match (result, request, acceptance_step.filter(|s| s.ruling_prompt.is_some())) {
-                    (StepResult::Pass, Some(request), Some(writer)) => run.rule(index, writer, &request),
-                    (result, _, _) => Ok(result),
+                match (outcome, request, acceptance_step.filter(|s| s.ruling_prompt.is_some())) {
+                    (Outcome::Pass, Some(request), Some(writer)) => run.rule(index, writer, &request),
+                    (outcome, _, _) => Ok(outcome),
                 }
             }),
             (Kind::Agent, Some(Role::Review)) => run.review(index, step),
             (Kind::Check, _) => run.check(index, step),
             _ => Err(anyhow!("step '{}' has a kind the engine can't run yet", step.name)),
         };
-        let failure = match result {
-            Ok(StepResult::Pass) => continue,
-            Ok(StepResult::Fail(reason)) => reason,
-            Err(e) => format!("engine error: {e:#}"),
-        };
-        store.set_stage(&repo, issue.number, &step.name, "failed", Some(&failure))?;
+        // An engine error stops the run like any failure no fix round can help.
+        Ok(result.unwrap_or_else(|e| Outcome::Stop(format!("engine error: {e:#}"))))
+    })?;
+    let stopped = match end {
+        End::Passed => None,
+        End::Blocked { step, reason } => Some((step, reason)),
+        End::OutOfRounds { step, reason } => {
+            let rounds = if fix_rounds == 1 { "1 fix round was".to_string() } else { format!("{fix_rounds} fix rounds were") };
+            Some((step.clone(), format!("{rounds} used and '{step}' still fails. The last failure:\n{reason}")))
+        }
+    };
+    if let Some((step, failure)) = stopped {
+        store.set_stage(&repo, issue.number, &step, "failed", Some(&failure))?;
         label(&repo, issue.number, Some("blocked"), Some("in-progress"));
-        println!("FAILED at {}: {failure}", step.name);
-        println!("  no fix loop yet, so the run stops here. Worktree kept at {}", worktree.display());
+        println!("FAILED at {step}, after {rounds_used} fix round(s): {failure}");
+        println!("  a person decides from here. Worktree kept at {}", worktree.display());
         return Ok(false);
+    }
+    if rounds_used > 0 {
+        println!("  passed after {rounds_used} fix round(s)");
     }
 
     if opts.no_pr {
@@ -953,13 +1172,18 @@ pub fn status() -> Result<()> {
         if let Some(url) = &row.pr_url {
             println!("  pull request {url}");
         }
-        for (step, vendor, attempt, verdict, exit_code, duration_ms, _) in store.steps(&row.repo, row.number, &row.run_id)? {
+        let mut shown_round = 0;
+        for (step, vendor, attempt, verdict, exit_code, duration_ms, round) in store.steps(&row.repo, row.number, &row.run_id)? {
+            if round != shown_round {
+                println!("    fix round {round}");
+                shown_round = round;
+            }
             let who = vendor.map(|v| format!(" [{v}]")).unwrap_or_default();
             let code = exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
             println!("    {step}{who} attempt {attempt}: {verdict}, exit {code}, {:.1} s", duration_ms as f64 / 1000.0);
         }
         if let Some(failure) = &row.failure {
-            println!("  failure: {}", failure.lines().next().unwrap_or(""));
+            println!("  failure: {}", first_line(failure));
         }
     }
     Ok(())
@@ -993,6 +1217,28 @@ mod tests {
                 "TodoTrial.xcodeproj/project.pbxproj"
             ]
         );
+    }
+
+    #[test]
+    fn log_tails_keep_the_end() {
+        let dir = std::env::temp_dir().join(format!("factory-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("log.txt");
+        let text: String = (1..=500).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&file, text).unwrap();
+        let shown = tail(&file);
+        assert!(shown.ends_with("line 500"), "{shown}");
+        assert_eq!(shown.lines().count(), LOG_TAIL_LINES);
+        assert!(!shown.contains("line 380\n"));
+
+        // One very long line is cut from the front, on a character boundary.
+        std::fs::write(&file, "é".repeat(LOG_TAIL_CHARS)).unwrap();
+        assert!(tail(&file).len() <= LOG_TAIL_CHARS);
+        assert_eq!(tail(&dir.join("missing.txt")), "");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(first_line("\n\n  scope gate: x\nmore"), "scope gate: x");
+        assert_eq!(first_line(&"a".repeat(200)).chars().count(), 163);
     }
 
     #[test]

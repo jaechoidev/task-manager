@@ -2,7 +2,7 @@
 
 A deterministic task manager. Software owns the loop and every gate. An LLM is called only for bounded steps.
 
-So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request. Fix loops, the queue and the daemon are not built yet.
+So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, with fix rounds when verify or review fails. The GitHub loop, the queue and the daemon are not built yet.
 
 ## Commands
 
@@ -21,7 +21,7 @@ factory status
 | `repo preflight` | Reads every setting back from GitHub. Changes nothing | 1 when a setting is wrong |
 | `plan validate` | Checks plan files and prints the parallel batches. No network | 1 when a plan is invalid |
 | `plan create` | Creates issues, parent links and blocked-by links from valid plans. Safe to rerun | 1 when a plan is invalid |
-| `run` | Takes one issue through acceptance flows, develop, verify and review, then opens a pull request into the default branch | 1 when a step fails |
+| `run` | Takes one issue through acceptance flows, develop, verify and review, with fix rounds, then opens a pull request into the default branch | 1 when the issue ends blocked |
 | `status` | Shows where each issue stands, from the state database | |
 
 Exit code 2 means the command itself could not run.
@@ -65,12 +65,40 @@ The acceptance and red steps are skipped for an issue that adds no flow, and a r
 
 What the engine does itself, and no workflow file can turn off:
 
-- Only the engine commits, pushes and opens pull requests. Agents are sandboxed and get no git or network commands.
+- Only the engine commits, pushes and opens pull requests. Agents are confined to the worktree and get no git or network commands. See "How agents are confined".
 - After acceptance: the writer must have written exactly the flow files the issue names as new, and nothing else. A flow may use only plain Maestro commands: no AI commands and no scripts. Every ID a flow looks for must be in the issue's list, declared by the writer as added, or already in the code.
 - After develop: git history must be untouched, `.maestro/` must be untouched, every changed file must be inside the issue's scope, and every accessibility ID must appear as a string literal inside that scope.
 - After every step: the branch must still be at the engine's latest commit, with a clean tree.
 - The reviewer must name the commit it judged, and it must be that commit.
 - Agent output must match its JSON schema. One retry, then the step fails.
+
+### Fix rounds
+
+A failure the developer can fix sends the issue back to the dev step. The developer continues its own session, so it keeps what it learned, and is told what failed. Every step after it then runs again on the new commit: verify first, then a fresh review. No verdict carries over from an earlier commit.
+
+| What failed | The developer is told |
+| --- | --- |
+| A check, such as verify | The command, its exit code, the end of its output, and where Maestro's failure screenshots are |
+| Review asked for changes | The reviewer's summary and its numbered items |
+| A gate on the developer's own change: scope, locked flows, missing IDs | Which gate and why. Nothing was committed |
+| The acceptance writer rejected a flow change request | The writer's reason |
+
+`on_fail` in `factory.yaml` says where each step's failure goes. Only a return to the dev step is built, so a failed red check still stops the run.
+
+The rounds are limited: 3 by default, set with `limits.fix_rounds` in `factory.yaml`, 5 at most. The limit is shared by every kind of failure. When the rounds run out, the run stops and the issue is labelled `blocked`.
+
+Some failures are never retried, because another attempt would not help: an agent whose reply is unusable twice, a developer who changes no files, a check that times out, a reviewer who names the wrong commit, and any change to git history.
+
+Later reviews see what the earlier review asked for, and are told not to raise new matters of taste.
+
+### How agents are confined
+
+| Vendor | Writes | Reads | Shell |
+| --- | --- | --- | --- |
+| Codex | Its OS sandbox blocks writes outside the worktree | Anywhere on the machine | Inside the sandbox, no network |
+| Claude | Its file tools refuse paths outside the worktree | Its file tools refuse paths outside the worktree | A writer may run `maestro check-syntax`. A reader gets none |
+
+Claude has no OS sandbox, so two settings do the work: `permissions.blockWritesOutsideWorkingDirectories` and `permissions.blockReadsOutsideWorkingDirectories`. Allowing the `Write` tool without them lets it write anywhere. A resumed Codex call names its sandbox again, because `codex exec resume` has no `--sandbox` flag.
 
 ### Accessibility IDs
 
@@ -81,9 +109,9 @@ The plan names the IDs for the elements an issue adds. The acceptance writer use
 The developer may not edit a flow. When it thinks one is wrong, it says so in `flow_change_request` in its report. The engine then asks the acceptance writer to rule:
 
 - **Accept**: the writer edits the flow. It may change only the flows the issue lists, and only use IDs that are in the code. The engine commits the change as its own commit, and verify and review judge that commit.
-- **Reject**: the code must change. Without a fix loop, the run stops here.
+- **Reject**: the code must change. The issue goes back to the developer with the writer's reason, as a fix round.
 
-There is no fix loop yet. A failed step stops the run, records why, labels the issue `blocked` and keeps the worktree.
+A run that ends blocked records why, labels the issue `blocked` and keeps the worktree.
 
 Files live under `~/.factory` (or `FACTORY_HOME`):
 
@@ -91,7 +119,7 @@ Files live under `~/.factory` (or `FACTORY_HOME`):
 | --- | --- |
 | `state.db` | SQLite: one row per issue, one row per step |
 | `requests.jsonl` | One line per agent call, check or gate |
-| `runs/<repo>/issue-<n>/<run-id>/` | Prompts, schemas, replies, logs and the PR body of one run |
+| `runs/<repo>/issue-<n>/<run-id>/` | Prompts, schemas, replies, logs and the PR body of one run. Files from fix round 2 carry `-r2` in their names |
 | `worktrees/<repo>/issue-<n>/` | The issue's worktree |
 
 ## Modules
@@ -143,7 +171,8 @@ cargo install --path .
 | `src/plan/render.rs` | Text, markdown and JSON reports |
 | `src/plan/create.rs` | Issue bodies, creation and links, behind a `Github` trait |
 | `src/repo.rs` | `repo init` and the preflight |
-| `src/engine/mod.rs` | The run loop and the fixed gates |
+| `src/engine/mod.rs` | The steps and the fixed gates |
+| `src/engine/rounds.rs` | The fix loop: what runs next, and when the rounds run out |
 | `src/engine/flows.rs` | What the engine checks in a flow file without running it |
 | `src/engine/workflow.rs` | `factory.yaml` and `module.yaml` loading and checks |
 | `src/engine/agent.rs` | Headless calls to `codex exec` and `claude -p` |

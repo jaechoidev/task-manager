@@ -1,8 +1,16 @@
 //! One headless agent call: a prompt in, schema-checked JSON out.
 //!
-//! Agents are sandboxed. A read-only call can't change files. A
+//! Agents are confined. A read-only call can't change files. A
 //! workspace-write call can only write inside its worktree. Neither is given
 //! git or network commands: the engine commits, pushes and opens the PR.
+//!
+//! How each vendor is confined:
+//! - Codex runs in its own OS sandbox, which blocks writes outside the
+//!   worktree. It can still read files anywhere on the machine.
+//! - Claude has no OS sandbox. Two settings make its file tools refuse reads
+//!   and writes outside the worktree, and it gets no shell beyond a syntax
+//!   check. Listing `Write` as an allowed tool is not enough by itself: that
+//!   allows writes anywhere.
 
 use super::proc::{self, Outcome};
 use super::workflow::{Access, Vendor};
@@ -25,7 +33,14 @@ pub struct Call<'a> {
     /// File name prefix, for example `01-develop-1`.
     pub stem: &'a str,
     pub timeout: Duration,
+    /// A session of the same vendor to continue, so the agent keeps what it
+    /// learned in earlier rounds.
+    pub resume: Option<&'a str>,
 }
+
+/// Settings every Claude call runs with, whatever its tools.
+const CLAUDE_SETTINGS: &str =
+    r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true,"blockReadsOutsideWorkingDirectories":true}}"#;
 
 pub struct Reply {
     pub outcome: Outcome,
@@ -91,12 +106,13 @@ fn codex_args(call: &Call, schema: &Path, output: &Path) -> Vec<String> {
         Access::ReadOnly => "read-only",
         Access::WorkspaceWrite => "workspace-write",
     };
-    let mut args: Vec<String> = ["exec", "--cd", &text(call.cwd), "--sandbox", sandbox]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    args.extend(["--output-schema".into(), text(schema), "-o".into(), text(output)]);
-    args.extend(["--json".into(), "--color".into(), "never".into()]);
+    let mut args: Vec<String> = match call.resume {
+        None => ["exec", "--cd", &text(call.cwd), "--sandbox", sandbox, "--color", "never"].iter().map(|s| s.to_string()).collect(),
+        // `exec resume` has no --sandbox, --cd or --color. The sandbox comes
+        // from a config override and the directory from the process.
+        Some(session) => vec!["exec".into(), "resume".into(), session.into(), "-c".into(), format!("sandbox_mode=\"{sandbox}\"")],
+    };
+    args.extend(["--output-schema".into(), text(schema), "-o".into(), text(output), "--json".into()]);
     if let Some(model) = call.model {
         args.extend(["-m".into(), model.into()]);
     }
@@ -106,20 +122,20 @@ fn codex_args(call: &Call, schema: &Path, output: &Path) -> Vec<String> {
 
 fn claude_args(call: &Call) -> Vec<String> {
     // In print mode a tool that is not allowed is refused, never asked about.
+    // No shell for a reader: `git diff --output=FILE` alone would let it write
+    // anywhere. A writer gets only Maestro's syntax check. It may not run
+    // ./verify.sh, because it could edit that script first and so run anything.
     let (mode, tools): (&str, &[&str]) = match call.access {
-        Access::ReadOnly => (
-            "dontAsk",
-            &["Read", "Glob", "Grep", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)"],
-        ),
-        Access::WorkspaceWrite => (
-            "acceptEdits",
-            &["Read", "Glob", "Grep", "Edit", "Write", "Bash(./verify.sh)", "Bash(maestro check-syntax:*)"],
-        ),
+        Access::ReadOnly => ("dontAsk", &["Read", "Glob", "Grep"]),
+        Access::WorkspaceWrite => ("acceptEdits", &["Read", "Glob", "Grep", "Edit", "Write", "Bash(maestro check-syntax:*)"]),
     };
-    let mut args: Vec<String> = ["-p", "--output-format", "json", "--json-schema", call.schema]
+    let mut args: Vec<String> = ["-p", "--output-format", "json", "--json-schema", call.schema, "--settings", CLAUDE_SETTINGS]
         .iter()
         .map(|s| s.to_string())
         .collect();
+    if let Some(session) = call.resume {
+        args.extend(["--resume".into(), session.into()]);
+    }
     // Skip the user's MCP servers, plugins and skills. They add cost and are
     // not part of the task.
     args.extend(["--strict-mcp-config", "--setting-sources", "project,local", "--disable-slash-commands"].map(String::from));
@@ -194,14 +210,33 @@ mod tests {
             dir: &dir,
             stem: "s",
             timeout: Duration::from_secs(1),
+            resume: None,
         };
         let codex = codex_args(&call, Path::new("schema.json"), Path::new("out.json")).join(" ");
         assert!(codex.contains("--sandbox workspace-write"), "{codex}");
         assert!(!codex.contains("danger"), "{codex}");
 
-        let review = Call { vendor: Vendor::Claude, access: Access::ReadOnly, ..call };
+        // A resumed Codex call must name its sandbox again.
+        let resumed = Call { resume: Some("abc-123"), ..call };
+        let codex = codex_args(&resumed, Path::new("schema.json"), Path::new("out.json")).join(" ");
+        assert!(codex.starts_with("exec resume abc-123 -c sandbox_mode=\"workspace-write\""), "{codex}");
+        assert!(codex.ends_with("--json -"), "{codex}");
+        assert!(!codex.contains("--cd") && !codex.contains("danger"), "{codex}");
+
+        let review = Call { vendor: Vendor::Claude, access: Access::ReadOnly, resume: None, ..call };
         let claude = claude_args(&review).join(" ");
         assert!(claude.contains("--permission-mode dontAsk"), "{claude}");
-        assert!(!claude.contains("Edit") && !claude.contains("Write"), "{claude}");
+        assert!(!claude.contains("Edit") && !claude.contains("Write ") && !claude.contains("Bash"), "{claude}");
+
+        // Every Claude call is confined to its directory, and never gets a
+        // shell that could run a script it edited.
+        let writer = Call { vendor: Vendor::Claude, resume: Some("s-9"), ..call };
+        let claude = claude_args(&writer).join(" ");
+        for args in [&claude, &claude_args(&review).join(" ")] {
+            assert!(args.contains("blockWritesOutsideWorkingDirectories\":true"), "{args}");
+            assert!(args.contains("blockReadsOutsideWorkingDirectories\":true"), "{args}");
+            assert!(!args.contains("verify.sh") && !args.contains("git "), "{args}");
+        }
+        assert!(claude.contains("--resume s-9") && claude.contains("--permission-mode acceptEdits"), "{claude}");
     }
 }

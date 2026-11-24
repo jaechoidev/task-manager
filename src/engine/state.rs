@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS steps (
     kind         TEXT NOT NULL,
     module       TEXT NOT NULL,
     vendor       TEXT,
+    round        INTEGER NOT NULL DEFAULT 0,
     attempt      INTEGER NOT NULL,
     sha          TEXT,
     exit_code    INTEGER,
@@ -67,6 +68,8 @@ pub struct StepRecord {
     pub model: Option<String>,
     /// Which account ran the call. Only one per vendor exists so far.
     pub subscription: Option<String>,
+    /// 0 for the first pass, then one per fix round.
+    pub round: u32,
     pub attempt: u32,
     pub sha: Option<String>,
     pub exit_code: Option<i32>,
@@ -106,6 +109,11 @@ impl Store {
         std::fs::create_dir_all(home).with_context(|| format!("creating {}", home.display()))?;
         let db = Connection::open(home.join("state.db")).context("opening the state database")?;
         db.execute_batch(SCHEMA)?;
+        // Databases from before fix rounds have no `round` column.
+        let has_round = db.prepare("SELECT 1 FROM pragma_table_info('steps') WHERE name = 'round'")?.exists([])?;
+        if !has_round {
+            db.execute_batch("ALTER TABLE steps ADD COLUMN round INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(Store { db, log: home.join("requests.jsonl") })
     }
 
@@ -163,8 +171,8 @@ impl Store {
     pub fn record(&self, step: &StepRecord) -> Result<()> {
         self.db.execute(
             "INSERT INTO steps (repo, number, run_id, step, kind, module, vendor, attempt, sha, exit_code, timed_out,
-                                verdict, duration_ms, input_path, output_path, session_id, finished_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                                verdict, duration_ms, input_path, output_path, session_id, finished_at, round)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 step.repo,
                 step.issue,
@@ -182,7 +190,8 @@ impl Store {
                 step.input,
                 step.output,
                 step.session_id,
-                step.ts
+                step.ts,
+                step.round
             ],
         )?;
         let mut file = OpenOptions::new().create(true).append(true).open(&self.log)?;
@@ -213,11 +222,11 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Steps of one run, oldest first: (step, vendor, attempt, verdict, exit code, duration ms, sha).
+    /// Steps of one run, oldest first: (step, vendor, attempt, verdict, exit code, duration ms, round).
     #[allow(clippy::type_complexity)]
-    pub fn steps(&self, repo: &str, number: u64, run_id: &str) -> Result<Vec<(String, Option<String>, u32, String, Option<i32>, u64, Option<String>)>> {
+    pub fn steps(&self, repo: &str, number: u64, run_id: &str) -> Result<Vec<(String, Option<String>, u32, String, Option<i32>, u64, u32)>> {
         let mut statement = self.db.prepare(
-            "SELECT step, vendor, attempt, verdict, exit_code, duration_ms, sha FROM steps
+            "SELECT step, vendor, attempt, verdict, exit_code, duration_ms, round FROM steps
              WHERE repo = ?1 AND number = ?2 AND run_id = ?3 ORDER BY id",
         )?;
         let rows = statement.query_map(params![repo, number, run_id], |row| {
@@ -251,6 +260,7 @@ mod tests {
                     vendor: None,
                     model: None,
                     subscription: None,
+                    round: 2,
                     attempt: 1,
                     sha: Some("def".into()),
                     exit_code: Some(65),
@@ -271,9 +281,32 @@ mod tests {
         assert_eq!((issues[0].stage.as_str(), issues[0].status.as_str()), ("verify", "failed"));
         assert_eq!(issues[0].failure.as_deref(), Some("exit 65"));
         let steps = store.steps("o/r", 4, "run1").unwrap();
-        assert_eq!(steps[0].3, "fail");
+        assert_eq!((steps[0].3.as_str(), steps[0].6), ("fail", 2));
         let log = std::fs::read_to_string(home.join("requests.jsonl")).unwrap();
         assert!(log.contains("\"module\":\"check/verify\""));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_older_database_gains_the_round_column() {
+        let home = std::env::temp_dir().join(format!("factory-state-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        {
+            let db = Connection::open(home.join("state.db")).unwrap();
+            db.execute_batch(&SCHEMA.replace("    round        INTEGER NOT NULL DEFAULT 0,\n", "")).unwrap();
+            db.execute_batch(
+                "INSERT INTO steps (repo, number, run_id, step, kind, module, attempt, timed_out, verdict, duration_ms, finished_at)
+                 VALUES ('o/r', 4, 'run0', 'develop', 'agent', 'agent/dev', 1, 0, 'replied', 5, 't')",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&home).unwrap();
+        let steps = store.steps("o/r", 4, "run0").unwrap();
+        assert_eq!((steps[0].0.as_str(), steps[0].6), ("develop", 0));
+        // Opening again must not try to add the column twice.
+        drop(store);
+        Store::open(&home).unwrap();
         let _ = std::fs::remove_dir_all(&home);
     }
 }
