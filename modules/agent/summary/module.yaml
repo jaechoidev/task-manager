@@ -1,0 +1,9 @@
+name: summary
+kind: agent
+role: summary
+needs: [issue, worktree, head_sha]
+produces: [pr_summary]
+prompt: prompt.md
+output_schema: summary.schema.json
+access: read-only
+timeout_minutes: 10

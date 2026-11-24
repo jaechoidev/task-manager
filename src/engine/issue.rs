@@ -13,6 +13,7 @@ pub struct Issue {
     pub key: String,
     /// The prose between the contract line and the first heading.
     pub summary: String,
+    pub labels: Vec<String>,
     pub marker: Marker,
 }
 
@@ -68,6 +69,11 @@ pub fn load(repo: &str, number: u64) -> Result<Issue> {
         plan: marker.plan.clone(),
         key,
         summary: summary_of(body),
+        labels: value
+            .get("labels")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(|l| l.get("name").and_then(Value::as_str)).map(str::to_string).collect())
+            .unwrap_or_default(),
         marker,
     })
 }

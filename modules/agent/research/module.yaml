@@ -1,0 +1,10 @@
+name: research
+kind: agent
+role: research
+needs: [issue, worktree]
+produces: [research_notes]
+prompt: prompt.md
+output_schema: report.schema.json
+access: workspace-write   # it writes one file, the notes
+web: true                 # it may search and read the web, where the vendor supports that
+timeout_minutes: 20

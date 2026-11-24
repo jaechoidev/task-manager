@@ -91,6 +91,22 @@ enum Top {
     },
     /// List the issues that are waiting for a person, with why
     Blocked,
+    /// Write the day's handoff document from the state database
+    Handoff {
+        /// The day, as YYYY-MM-DD in UTC. Today when absent
+        #[arg(long)]
+        date: Option<String>,
+        /// The folder to write into. The configured folder when absent
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Open or refresh the pull request that promotes the default branch
+    /// into main. It is never merged by factory
+    Promote {
+        /// A checkout of the project repository
+        #[arg(long, default_value = ".")]
+        repo_dir: PathBuf,
+    },
     /// Show where each issue stands, from the state database
     Status,
 }
@@ -286,6 +302,19 @@ fn run() -> Result<bool> {
             engine::blocked()?;
             Ok(true)
         }
+
+        Top::Handoff { date, out } => {
+            let files = engine::handoff::export(&engine::handoff::HandoffOptions { date, out })?;
+            if files.is_empty() {
+                println!("no issue was worked on that day");
+            }
+            for file in files {
+                println!("{}", file.display());
+            }
+            Ok(true)
+        }
+
+        Top::Promote { repo_dir } => engine::handoff::promote(&repo_dir),
 
         Top::Status => {
             engine::status()?;

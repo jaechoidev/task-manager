@@ -36,6 +36,9 @@ pub struct Call<'a> {
     /// A session of the same vendor to continue, so the agent keeps what it
     /// learned in earlier rounds.
     pub resume: Option<&'a str>,
+    /// Whether the agent may search and read the web. Only Claude gets web
+    /// tools this way. Codex runs without network either way.
+    pub web: bool,
 }
 
 /// Settings every Claude call runs with, whatever its tools.
@@ -161,6 +164,10 @@ fn claude_args(call: &Call) -> Vec<String> {
         Access::ReadOnly => ("dontAsk", &["Read", "Glob", "Grep"]),
         Access::WorkspaceWrite => ("acceptEdits", &["Read", "Glob", "Grep", "Edit", "Write", "Bash(maestro check-syntax:*)"]),
     };
+    let mut tools: Vec<&str> = tools.to_vec();
+    if call.web {
+        tools.extend(["WebSearch", "WebFetch"]);
+    }
     let mut args: Vec<String> = ["-p", "--output-format", "json", "--json-schema", call.schema, "--settings", CLAUDE_SETTINGS]
         .iter()
         .map(|s| s.to_string())
@@ -274,6 +281,7 @@ mod tests {
             stem: "s",
             timeout: Duration::from_secs(1),
             resume: None,
+            web: false,
         };
         let codex = codex_args(&call, Path::new("schema.json"), Path::new("out.json")).join(" ");
         assert!(codex.contains("--sandbox workspace-write"), "{codex}");
@@ -301,5 +309,10 @@ mod tests {
             assert!(!args.contains("verify.sh") && !args.contains("git "), "{args}");
         }
         assert!(claude.contains("--resume s-9") && claude.contains("--permission-mode acceptEdits"), "{claude}");
+        // Web tools are given only when a module asks for them.
+        assert!(!claude.contains("WebSearch"), "{claude}");
+        let researcher = Call { vendor: Vendor::Claude, web: true, resume: None, ..call };
+        let claude = claude_args(&researcher).join(" ");
+        assert!(claude.contains("WebSearch WebFetch") && claude.contains("blockWritesOutsideWorkingDirectories"), "{claude}");
     }
 }

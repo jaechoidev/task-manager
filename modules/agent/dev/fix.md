@@ -30,6 +30,10 @@ Change only what the failure needs. Don't rewrite what already works.
 
 {{accessibility_ids}}
 
+## Research
+
+{{research}}
+
 ## Acceptance flows
 
 {{flows}}

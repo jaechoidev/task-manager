@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["what_changed", "how_it_went", "for_a_human"],
+  "properties": {
+    "what_changed": { "type": "string" },
+    "how_it_went": { "type": "string" },
+    "for_a_human": { "type": "array", "items": { "type": "string" } }
+  }
+}

@@ -25,6 +25,12 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("agent/review", "prompt.md", include_str!("../../modules/agent/review/prompt.md")),
     ("agent/review", "verdict.schema.json", include_str!("../../modules/agent/review/verdict.schema.json")),
     ("check/verify", "module.yaml", include_str!("../../modules/check/verify/module.yaml")),
+    ("agent/research", "module.yaml", include_str!("../../modules/agent/research/module.yaml")),
+    ("agent/research", "prompt.md", include_str!("../../modules/agent/research/prompt.md")),
+    ("agent/research", "report.schema.json", include_str!("../../modules/agent/research/report.schema.json")),
+    ("agent/summary", "module.yaml", include_str!("../../modules/agent/summary/module.yaml")),
+    ("agent/summary", "prompt.md", include_str!("../../modules/agent/summary/prompt.md")),
+    ("agent/summary", "summary.schema.json", include_str!("../../modules/agent/summary/summary.schema.json")),
     ("judgment/stuck", "module.yaml", include_str!("../../modules/judgment/stuck/module.yaml")),
     ("judgment/stuck", "prompt.md", include_str!("../../modules/judgment/stuck/prompt.md")),
     ("judgment/stuck", "decision.schema.json", include_str!("../../modules/judgment/stuck/decision.schema.json")),
@@ -67,10 +73,14 @@ pub enum Access {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// Answers open questions before anything else, when the issue needs it.
+    Research,
     /// Writes the acceptance flows before development.
     Acceptance,
     Dev,
     Review,
+    /// Writes the pull request's summary. Not a step of the sequence.
+    Summary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +133,8 @@ pub struct ModuleDef {
     pub ruling_prompt: Option<String>,
     pub ruling_schema: Option<String>,
     pub access: Option<Access>,
+    /// agent: whether it may search and read the web.
+    pub web: Option<bool>,
     pub timeout_minutes: Option<u64>,
     /// Shared resources. Declared now, enforced once issues run in parallel.
     #[serde(default)]
@@ -153,6 +165,9 @@ struct FactoryFile {
     /// Who decides what happens to an issue that is stuck. Absent, a stuck
     /// issue goes straight to a person.
     judgment: Option<StepSpec>,
+    /// Who writes the pull request's summary. Absent, the body holds only
+    /// what the engine records.
+    summary: Option<StepSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +219,8 @@ pub struct Workflow {
     /// the issue over.
     pub judgment: Option<Step>,
     pub judgments: u32,
+    /// The module that writes the pull request's summary.
+    pub summary: Option<Step>,
 }
 
 /// `read(module, file)` returns a module file's text, or `None` when the
@@ -264,13 +281,19 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
                     None => problem("an agent step needs a vendor".into()),
                 }
                 if def.role.is_none() {
-                    problem("an agent module needs a role (acceptance, dev or review)".into());
+                    problem("an agent module needs a role (research, acceptance, dev or review)".into());
                 }
                 if def.access.is_none() {
                     problem("an agent module needs access (read-only or workspace-write)".into());
                 }
                 if def.role == Some(Role::Review) && def.access != Some(Access::ReadOnly) {
                     problem("a review module must be read-only".into());
+                }
+                if def.role == Some(Role::Summary) {
+                    problem("a summary module goes in the `summary:` block, not in the workflow".into());
+                }
+                if def.role == Some(Role::Research) && def.access != Some(Access::WorkspaceWrite) {
+                    problem("a research module must be workspace-write, since it writes its notes".into());
                 }
                 if def.role == Some(Role::Acceptance) && def.access != Some(Access::WorkspaceWrite) {
                     problem("an acceptance module must be workspace-write, since it writes flow files".into());
@@ -359,6 +382,14 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
                     [_] => errors.push("the acceptance step must come before the dev step".into()),
                     _ => errors.push("the workflow has more than one acceptance step".into()),
                 }
+                // Research comes before anyone writes flows or code from it.
+                let first_user = position(Role::Acceptance).first().copied().unwrap_or(*dev).min(*dev);
+                match position(Role::Research).as_slice() {
+                    [] => {}
+                    [research] if *research < first_user => {}
+                    [_] => errors.push("the research step must come before the acceptance and dev steps".into()),
+                    _ => errors.push("the workflow has more than one research step".into()),
+                }
                 if position(Role::Review).iter().any(|review| review < dev) {
                     errors.push("a review step can't come before the dev step".into());
                 }
@@ -401,33 +432,35 @@ pub fn parse(text: &str, read: &dyn Fn(&str, &str) -> Option<String>) -> Result<
     if judgments > MAX_JUDGMENTS {
         errors.push(format!("limits.judgments is {judgments}, and the most the engine allows is {MAX_JUDGMENTS}"));
     }
-    let judgment = match &file.judgment {
+    let mut side = |block: &str, spec: &Option<StepSpec>, kind: Kind, role: Option<Role>| match spec {
         None => None,
-        Some(spec) => match judgment_step(spec, read) {
+        Some(spec) => match side_step(block, spec, kind, role, read) {
             Ok(step) => Some(step),
             Err(problem) => {
-                errors.push(format!("judgment ({}): {problem}", spec.module));
+                errors.push(format!("{block} ({}): {problem}", spec.module));
                 None
             }
         },
     };
+    let judgment = side("judgment", &file.judgment, Kind::Judgment, None);
+    let summary = side("summary", &file.summary, Kind::Agent, Some(Role::Summary));
 
     if !errors.is_empty() {
         bail!("factory.yaml is not valid:\n  - {}", errors.join("\n  - "));
     }
-    Ok(Workflow { steps, on_fail: file.on_fail, fix_rounds, github_fix_rounds, github, judgment, judgments })
+    Ok(Workflow { steps, on_fail: file.on_fail, fix_rounds, github_fix_rounds, github, judgment, judgments, summary })
 }
 
-/// Loads the module named in the `judgment:` block. It is not a step of the
-/// sequence: the engine calls it when a run is stuck.
-fn judgment_step(spec: &StepSpec, read: &dyn Fn(&str, &str) -> Option<String>) -> std::result::Result<Step, String> {
+/// Loads a module the engine calls itself, outside the sequence of steps:
+/// the judgment for a stuck run, or the summary of a pull request.
+fn side_step(block: &str, spec: &StepSpec, kind: Kind, role: Option<Role>, read: &dyn Fn(&str, &str) -> Option<String>) -> std::result::Result<Step, String> {
     let text = read(&spec.module, "module.yaml").ok_or("the module does not exist")?;
     let def: ModuleDef = crate::yaml::from_str(&text)?;
-    if def.kind != Kind::Judgment {
-        return Err(format!("it is a {} module, not a judgment module", def.kind.name()));
+    if def.kind != kind || def.role != role {
+        return Err(format!("it is a {} module, not a {block} module", def.kind.name()));
     }
     if def.access != Some(Access::ReadOnly) {
-        return Err("a judgment module must be read-only".into());
+        return Err(format!("a {block} module must be read-only"));
     }
     let vendor = match spec.vendor.as_deref() {
         Some(name) => Vendor::parse(name).ok_or(format!("unknown vendor '{name}' (use codex or claude)"))?,
@@ -443,7 +476,7 @@ fn judgment_step(spec: &StepSpec, read: &dyn Fn(&str, &str) -> Option<String>) -
         return Err("output_schema is not valid JSON".into());
     }
     Ok(Step {
-        name: "judgment".to_string(),
+        name: block.to_string(),
         module: spec.module.clone(),
         def,
         vendor: Some(vendor),
@@ -587,6 +620,24 @@ on_fail:
         // A judgment is never a step of the sequence.
         let as_step = GOOD.replace("- verify:  { module: check/verify }", "- verify:  { module: judgment/stuck, vendor: claude }");
         assert!(errors(&as_step).contains("judgment modules are not supported"), "{}", errors(&as_step));
+    }
+
+    #[test]
+    fn research_and_summary_have_their_places() {
+        let with = format!("{}summary: {{ module: agent/summary, vendor: claude }}\n", WITH_ACCEPTANCE.replace("workflow:\n", "workflow:\n  - research:   { module: agent/research, vendor: claude }\n"));
+        let workflow = parse(&with, &builtin).unwrap();
+        assert_eq!(workflow.steps[0].def.role, Some(Role::Research));
+        assert_eq!(workflow.steps[0].def.web, Some(true));
+        assert_eq!(workflow.summary.unwrap().name, "summary");
+
+        // Research after the flows are written is too late.
+        let late = WITH_ACCEPTANCE.replace("  - red:        {", "  - research:   { module: agent/research, vendor: claude }\n  - red:        {");
+        assert!(errors(&late).contains("the research step must come before the acceptance and dev steps"), "{}", errors(&late));
+        // A summary is not a step, and the summary block takes only a summary module.
+        let as_step = GOOD.replace("on_fail:", "  - sum: { module: agent/summary, vendor: claude }\non_fail:");
+        assert!(errors(&as_step).contains("goes in the `summary:` block"), "{}", errors(&as_step));
+        let wrong = format!("{GOOD}summary: {{ module: agent/review, vendor: claude }}\n");
+        assert!(errors(&wrong).contains("not a summary module"), "{}", errors(&wrong));
     }
 
     #[test]

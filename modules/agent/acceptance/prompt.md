@@ -32,6 +32,10 @@ The plan names these IDs for the elements this issue adds:
 - You may also use any ID that is already in the app's source code.
 - If a flow needs an element that has no ID yet, choose one that follows the naming rule in AGENTS.md and list it in `added_ids`. The developer must then implement it. Add as few as you can.
 
+## Research
+
+{{research}}
+
 ## Where the developer may work
 
 {{scope}}

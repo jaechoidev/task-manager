@@ -195,6 +195,11 @@ pub fn close_pr(repo: &str, pr: u64, why: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn update_pr(repo: &str, pr: u64, title: &str, body: &str) -> Result<()> {
+    gh::api("PATCH", &format!("repos/{repo}/pulls/{pr}"), Some(&json!({ "title": title, "body": body })))?;
+    Ok(())
+}
+
 pub fn update_pr_body(repo: &str, pr: u64, body: &str) -> Result<()> {
     gh::api("PATCH", &format!("repos/{repo}/pulls/{pr}"), Some(&json!({ "body": body })))?;
     Ok(())

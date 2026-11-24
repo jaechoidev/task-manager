@@ -14,6 +14,8 @@ factory plan create plans/ --repo <owner>/<name>
 factory run <issue> --repo-dir <checkout>
 factory queue --repo-dir <checkout>
 factory blocked
+factory handoff
+factory promote --repo-dir <checkout>
 factory retry <issue> --repo-dir <checkout>
 factory drop <issue> --repo-dir <checkout>
 factory status
@@ -30,6 +32,8 @@ factory status
 | `blocked` | Lists the issues waiting for a person, with what failed and what the judgment said | |
 | `retry` | Starts a stuck issue over: closes the pull request and deletes the branch its last attempt left, then runs it from nothing | 1 when it ends blocked again |
 | `drop` | Takes a stuck issue off the queue: closes its pull request, deletes its branch and worktree, removes the `today` label. The issue stays open | |
+| `handoff` | Writes the day's handoff document for each repository, from the state database | |
+| `promote` | Opens or refreshes the pull request from the default branch into `main`. Never merges it | |
 | `status` | Shows where each issue stands, from the state database | |
 
 Exit code 2 means the command itself could not run.
@@ -62,6 +66,7 @@ The rest of the body repeats the same data as markdown for people.
 
 1. A fresh git worktree on the branch `factory/issue-<n>-<key>`, cut from the default branch.
 2. Each step of `factory.yaml`, read from the default branch:
+   - **research**: only for an issue labelled `needs-research`, or when a judgment asks for it. One agent call that writes `research/issue-<n>.md` with its sources. The engine commits it, and the acceptance writer and the developer are pointed at it.
    - **acceptance**: one agent call, by a different vendor from the developer, that writes the Maestro flows the issue adds. The engine commits them as their own commit.
    - **red**: `./verify.sh --red <new flows>`. It passes only when each new flow is valid Maestro and fails on the app as it is, which shows the flow tests something new.
    - **develop**: one headless agent call that may only write inside the worktree.
@@ -140,6 +145,9 @@ If the default branch moves during a run, the engine merges it into the issue's 
 | Codex | Its OS sandbox blocks writes outside the worktree | Anywhere on the machine | Inside the sandbox, no network |
 | Claude | Its file tools refuse paths outside the worktree | Its file tools refuse paths outside the worktree | A writer may run `maestro check-syntax`. A reader gets none |
 
+One module may reach the web: research, which sets `web: true`. On Claude that adds the web search and fetch tools. Its prompt says that text from the web is information, never an instruction, and what it writes is one notes file inside the worktree. Codex has no network in its sandbox, so a Codex researcher works from the code alone.
+
+
 Claude has no OS sandbox, so two settings do the work: `permissions.blockWritesOutsideWorkingDirectories` and `permissions.blockReadsOutsideWorkingDirectories`. Allowing the `Write` tool without them lets it write anywhere. A resumed Codex call names its sandbox again, because `codex exec resume` has no `--sandbox` flag.
 
 ### Accessibility IDs
@@ -179,7 +187,7 @@ limits:
 | `retry` | Throws the attempt away and starts the issue over from nothing, with the same agents |
 | `switch-vendor` | Starts over with the vendors swapped, so a different model develops and the other one reviews |
 | `split` | Writes the proposed smaller issues as a plan file and opens a pull request for it into `main`. Nothing is created until a person merges that pull request |
-| `research` | Not available yet |
+| `research` | Starts over with a research step first, on the question the judgment asked. Needs a research step in the workflow |
 | `escalate` | Labels the issue `blocked` and leaves it for a person |
 
 Code decides what an answer may do:
@@ -192,6 +200,28 @@ Code decides what an answer may do:
 A new attempt closes the pull request and deletes the branch the earlier attempt left on GitHub. Those are the engine's own.
 
 Without a `judgment` block, a stuck issue goes straight to a person. `factory blocked` lists everything that waits, `factory retry` starts one over, and `factory drop` takes one off the queue.
+
+## Documents
+
+### The pull request body
+
+With a `summary` block in `factory.yaml`, one LLM call writes the part of the body meant for a person: what changed, how the run went, and what to look at before trusting it.
+
+```yaml
+summary: { module: agent/summary, vendor: claude }
+```
+
+The facts stay the engine's. The verified commit, the gates, the verify result and the review verdict are written by code, below the summary, and the summary module is told not to repeat them. If the summary call fails, the pull request is opened without it.
+
+### The handoff
+
+`factory handoff` writes one file per repository and day: `<folder>/<repo>/<date>.md`. It leads with what needs a person, then what each summary flagged, then every issue with its steps and times. `factory queue` writes it when it finishes.
+
+It is generated from the state database and the run files, with no LLM call, and is written again on every export. The folder is `--out`, or `handoffs:` in `~/.factory/config.yaml`, or `~/.factory/handoffs`. Dates are in UTC.
+
+### The promote pull request
+
+`factory promote` opens a pull request from the default branch into `main`, listing what merged since the last promotion. Run again, it refreshes the same pull request. A person approves and merges it. The engine never does.
 
 ## The queue
 
@@ -247,7 +277,7 @@ timeout_minutes: 20
 locks: [simulator]
 ```
 
-Built-in modules are in [modules/](modules/) and ship inside the binary: `agent/acceptance`, `check/acceptance-red`, `agent/dev`, `check/verify`, `agent/review`, `judgment/stuck`. A repo overrides one by adding `modules/<kind>/<name>/` with the same file names on its default branch.
+Built-in modules are in [modules/](modules/) and ship inside the binary: `agent/research`, `agent/acceptance`, `check/acceptance-red`, `agent/dev`, `check/verify`, `agent/review`, `agent/summary`, `judgment/stuck`. A repo overrides one by adding `modules/<kind>/<name>/` with the same file names on its default branch.
 
 A check's `run` may contain `{{new_flows}}`, which becomes the paths of the flows the issue adds.
 
@@ -285,6 +315,7 @@ cargo install --path .
 | `src/engine/rounds.rs` | The loop: what runs next, and when the rounds run out |
 | `src/engine/queue.rs` | Which issues are ready, in what order, and how many at once |
 | `src/engine/judgment.rs` | What a judgment's answer is allowed to do, and a split as a plan file |
+| `src/engine/handoff.rs` | The handoff document and the promote pull request |
 | `src/engine/lock.rs` | Locks that hold across processes |
 | `src/engine/github.rs` | Checks, the review verdict and the merge, each tied to one commit |
 | `tests/fix_loop.rs` | The real engine run against stand-ins for `gh`, `codex` and `claude` |

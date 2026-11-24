@@ -237,6 +237,7 @@ if grep -q "^You decide what happens next" "$STUB_DIR/claude.prompt.$n"; then
   bad="[$(part part-one Sources/P1/),$(part part-two Sources/P1/)]"
   case "$STUB_JUDGE" in
     retry) reply '{"action":"retry","reason":"The developer went down a wrong path.","split":[]}' ;;
+    research) reply '{"action":"research","reason":"Find out which marker verify wants.","split":[]}' ;;
     switch) reply '{"action":"switch-vendor","reason":"The same developer failed the same way.","split":[]}' ;;
     dance) reply '{"action":"merge-anyway","reason":"It is close enough.","split":[]}' ;;
     split) reply "{\"action\":\"split\",\"reason\":\"It mixes two changes.\",\"split\":$good}" ;;
@@ -245,6 +246,29 @@ if grep -q "^You decide what happens next" "$STUB_DIR/claude.prompt.$n"; then
       else reply "{\"action\":\"split\",\"reason\":\"It mixes two changes.\",\"split\":$good}"; fi ;;
     *) reply '{"action":"escalate","reason":"A person should look.","split":[]}' ;;
   esac
+  exit 0
+fi
+if grep -q "^You are the researcher" "$STUB_DIR/claude.prompt.$n"; then
+  echo research >> "$STUB_DIR/claude.roles"
+  cp "$STUB_DIR/claude.prompt.$n" "$STUB_DIR/research.prompt"
+  issue=$(sed -n 's/^# Issue #\([0-9]*\):.*/\1/p' "$STUB_DIR/claude.prompt.$n" | head -1)
+  mkdir -p research
+  if [ "$STUB_RESEARCH" = "no-sources" ]; then
+    printf '## Findings\n\nTrust me.\n' > "research/issue-$issue.md"
+    reply '{"summary":"Trust me.","sources":[],"open_questions":[]}'
+  else
+    printf '## Findings\n\nUse the store.\n\n## Sources\n\n- verify.sh: what the check looks for\n' > "research/issue-$issue.md"
+    reply '{"summary":"Use the store.","sources":["verify.sh: what the check looks for"],"open_questions":["Is it fast enough?"]}'
+  fi
+  exit 0
+fi
+if grep -q "^You write the summary" "$STUB_DIR/claude.prompt.$n"; then
+  echo summary >> "$STUB_DIR/claude.roles"
+  if [ "$STUB_SUMMARY" = "broken" ]; then
+    echo '{"type":"result","is_error":true,"result":"overloaded"}'
+  else
+    reply '{"what_changed":"Adds the marker file.","how_it_went":"A clean pass.","for_a_human":["Look at A.swift once"]}'
+  fi
   exit 0
 fi
 if grep -q "^You are the developer" "$STUB_DIR/claude.prompt.$n"; then
@@ -1059,4 +1083,115 @@ fn drop_takes_an_issue_off_the_queue_and_removes_what_the_engine_made() {
     // It no longer waits for a person, and its run files are still there.
     assert!(trial.cli(&["blocked"], &[]).1.contains("no issue is waiting for a person"));
     assert!(trial.dir.join("home/runs/o__r/issue-7").exists());
+}
+
+/// A workflow with a research step, a summary and the GitHub loop.
+fn full_workflow() -> String {
+    "workflow:\n  - research: { module: agent/research, vendor: claude }\n  - develop:  { module: agent/dev, vendor: codex }\n  - verify:   { module: check/verify }\n  - review:   { module: agent/review, vendor: claude }\non_fail:\n  verify: develop\n  review: develop\ngithub:\n  review_check: review\nsummary: { module: agent/summary, vendor: claude }\njudgment: { module: judgment/stuck, vendor: claude }\nlimits:\n  fix_rounds: 0\n".to_string()
+}
+
+fn labelled(trial: &Trial, labels: &[&str]) {
+    let issue = serde_json::json!({ "number": 7, "state": "open", "title": "Add the file", "body": ISSUE_BODY, "labels": labels });
+    fs::write(trial.dir.join("stub/issue.json"), issue.to_string()).unwrap();
+}
+
+#[test]
+fn an_issue_that_asks_for_research_gets_notes_before_anyone_develops() {
+    let trial = Trial::build("research", &full_workflow(), ISSUE_BODY);
+    labelled(&trial, &["needs-research"]);
+    let (output, text) = trial.run_to_github("right-first-time", "green", &[]);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(trial.pushed(), vec!["docs(research): notes for #7", "feat(a): attempt 1"]);
+    assert_eq!(trial.stub("claude.roles"), "research\nreview\nsummary");
+    // The researcher may use the web and writes one file. The developer is pointed at it.
+    assert!(trial.stub("claude.args.1").contains("WebSearch WebFetch"), "{}", trial.stub("claude.args.1"));
+    assert!(trial.stub("research.prompt").contains("The issue is labelled `needs-research`"));
+    let developer = trial.stub("codex.prompt.1");
+    assert!(developer.contains("Read `research/issue-7.md` before you start. Its main finding: Use the store."), "{developer}");
+
+    // The pull request leads with the summary written for a person, and
+    // keeps the facts the engine recorded.
+    let body = trial.json("pr.json")["body"].as_str().unwrap().to_string();
+    assert!(body.starts_with("Closes #7\n\n## Summary\n\nAdds the marker file.\n\nA clean pass."), "{body}");
+    assert!(body.contains("## Research") && body.contains("`research/issue-7.md`"), "{body}");
+    assert!(body.contains("## Verification") && body.contains("Scope gate: passed"), "{body}");
+    assert!(body.contains("- Look at A.swift once") && body.contains("- Open question from research: Is it fast enough?"), "{body}");
+    assert!(text.contains("MERGED into dev"), "{text}");
+
+    // The day's handoff repeats it, from what was recorded.
+    let out = trial.dir.join("handoffs");
+    let (output, listed) = trial.cli(&["handoff", "--out", out.to_str().unwrap()], &[]);
+    assert!(output.status.success(), "{listed}");
+    let file = fs::read_dir(out.join("r")).unwrap().next().unwrap().unwrap().path();
+    let handoff = fs::read_to_string(&file).unwrap();
+    assert!(handoff.contains("| #7 Add the file | Merged | https://example.invalid/o/r/pull/9 |"), "{handoff}");
+    assert!(handoff.contains("- Look at A.swift once") && handoff.contains("Adds the marker file."), "{handoff}");
+    assert!(handoff.contains("## Needs a person\n\nNothing."), "{handoff}");
+}
+
+#[test]
+fn research_is_skipped_unless_asked_for_and_must_name_its_sources() {
+    let trial = Trial::build("research-skip", &full_workflow(), ISSUE_BODY);
+    let (output, text) = trial.run_to_github("right-first-time", "green", &[]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("research: skipped, the issue does not ask for research"), "{text}");
+    assert_eq!(trial.stub("claude.roles"), "review\nsummary");
+    assert!(trial.stub("codex.prompt.1").contains("None was needed for this issue."));
+
+    let trial = Trial::build("research-bare", &full_workflow(), ISSUE_BODY);
+    labelled(&trial, &["needs-research"]);
+    let (output, text) = trial.factory(&[], &[("STUB_DEV", "right-first-time"), ("STUB_REVIEW", "approve"), ("STUB_RESEARCH", "no-sources"), ("STUB_JUDGE", "escalate")]);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("must list its sources under `## Sources`"), "{text}");
+    assert_eq!(trial.stub("codex.count"), "", "nobody develops from notes without sources");
+}
+
+#[test]
+fn a_judgment_can_send_an_issue_to_research_first() {
+    let trial = Trial::build("research-judged", &full_workflow(), ISSUE_BODY);
+    let env = [("STUB_DEV", "fix-on-second"), ("STUB_REVIEW", "approve"), ("STUB_JUDGE", "research"), ("STUB_GITHUB", "green")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("judgment: research. Find out which marker verify wants."), "{text}");
+    // The first attempt had no research. The second starts with it, on the judgment's question.
+    assert_eq!(trial.stub("claude.roles"), "judgment\nresearch\nreview");
+    assert!(trial.stub("judge.prompt.1").contains("`research`, `split`, `escalate`"), "{}", trial.stub("judge.prompt.1"));
+    assert!(trial.stub("research.prompt").contains("Find out which marker verify wants."));
+    assert_eq!(trial.commits(), vec!["docs(research): notes for #7", "feat(a): attempt 2"]);
+}
+
+#[test]
+fn a_failed_summary_never_holds_up_a_pull_request() {
+    let trial = Trial::build("summary-broken", &full_workflow(), ISSUE_BODY);
+    let env = [("STUB_DEV", "right-first-time"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "green"), ("STUB_SUMMARY", "broken")];
+    let (output, text) = trial.factory(&[], &env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("summary: none"), "{text}");
+    let body = trial.json("pr.json")["body"].as_str().unwrap().to_string();
+    assert!(body.starts_with("Closes #7\n\n## What changed\n\nattempt 1"), "{body}");
+    assert!(text.contains("MERGED into dev"), "{text}");
+}
+
+#[test]
+fn promote_opens_one_pull_request_into_main_and_never_merges_it() {
+    let trial = Trial::build("promote", &github_workflow(2), ISSUE_BODY);
+    let (output, text) = trial.cli(&["promote"], &[]);
+    assert!(output.status.success() && text.contains("nothing to promote"), "{text}");
+
+    let merged = [("STUB_DEV", "right-first-time"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "green"), ("STUB_REAL_MERGE", "1")];
+    assert!(trial.factory(&[], &merged).0.status.success());
+    let (output, text) = trial.cli(&["promote"], &[]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("opened https://example.invalid/o/r/pull/92: 1 change(s). A person approves and merges it"), "{text}");
+    let opened = trial.json("pr-90.json");
+    assert_eq!((opened["base"].as_str(), opened["head"].as_str()), (Some("main"), Some("dev")));
+    assert_eq!(opened["title"], "promote: dev to main (1 change)");
+    assert!(opened["body"].as_str().unwrap().contains("- feat(a): attempt 1 (#9)"), "{opened}");
+
+    // Asked again, it refreshes that pull request and opens no second one.
+    let (_, text) = trial.cli(&["promote"], &[]);
+    assert!(text.contains("refreshed https://example.invalid/o/r/pull/92"), "{text}");
+    let calls = trial.stub("gh.calls");
+    assert_eq!(calls.matches("POST repos/o/r/pulls\n").count(), 2, "one for the issue, one for the promotion: {calls}");
+    assert!(!calls.contains("PUT repos/o/r/pulls/92/merge"), "{calls}");
 }

@@ -9,6 +9,7 @@ pub mod agent;
 pub mod flows;
 pub mod git;
 pub mod github;
+pub mod handoff;
 pub mod issue;
 pub mod judgment;
 pub mod lock;
@@ -94,6 +95,33 @@ struct Acceptance {
     report: AcceptanceReport,
 }
 
+/// The researcher's final message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResearchReport {
+    summary: String,
+    sources: Vec<String>,
+    open_questions: Vec<String>,
+}
+
+/// What the research step left behind.
+#[derive(Clone, Serialize, Deserialize)]
+struct Research {
+    vendor: String,
+    sha: String,
+    report: ResearchReport,
+}
+
+/// The summary module's final message: the part of a pull request's body
+/// written for a person.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Summary {
+    pub what_changed: String,
+    pub how_it_went: String,
+    pub for_a_human: Vec<String>,
+}
+
 /// The reviewer's final message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +176,12 @@ struct Progress {
     base_sha: String,
     expected: String,
     head_sha: Option<String>,
+    #[serde(default)]
+    research: Option<Research>,
+    #[serde(default)]
+    research_question: Option<String>,
+    #[serde(default)]
+    summary: Option<Summary>,
     acceptance: Option<Acceptance>,
     red: Option<String>,
     ids: Vec<String>,
@@ -189,6 +223,10 @@ struct Run<'a> {
     expected: String,
     /// The commit verify and review judge. Set once development is committed.
     head_sha: Option<String>,
+    research: Option<Research>,
+    /// A question a judgment wants answered before this attempt develops.
+    research_question: Option<String>,
+    summary: Option<Summary>,
     acceptance: Option<Acceptance>,
     /// The result of the check that new flows fail before development.
     red: Option<String>,
@@ -304,7 +342,7 @@ fn tail(path: &Path) -> String {
     out.trim().to_string()
 }
 
-fn first_line(text: &str) -> String {
+pub(crate) fn first_line(text: &str) -> String {
     let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     let mut out: String = line.chars().take(160).collect();
     if line.chars().count() > 160 {
@@ -434,6 +472,9 @@ impl Run<'_> {
             base_sha: self.base_sha.clone(),
             expected: self.expected.clone(),
             head_sha: self.head_sha.clone(),
+            research: self.research.clone(),
+            research_question: self.research_question.clone(),
+            summary: self.summary.clone(),
             acceptance: self.acceptance.clone(),
             red: self.red.clone(),
             ids: self.ids.clone(),
@@ -468,6 +509,9 @@ impl Run<'_> {
         self.base_sha = progress.base_sha;
         self.expected = progress.expected;
         self.head_sha = progress.head_sha;
+        self.research = progress.research;
+        self.research_question = progress.research_question;
+        self.summary = progress.summary;
         self.acceptance = progress.acceptance;
         self.red = progress.red;
         self.ids = progress.ids;
@@ -528,6 +572,7 @@ impl Run<'_> {
                 stem: &stem,
                 timeout,
                 resume,
+                web: step.def.web.unwrap_or(false),
             })?;
             let files = [
                 Some(reply.input_path.as_path()),
@@ -609,6 +654,18 @@ impl Run<'_> {
             ("new_flows", bullets(&new, true)),
             ("existing_flows", bullets(&existing, true)),
             ("issue_flows", bullets(&all, true)),
+            ("research_file", self.research_file()),
+            (
+                "research",
+                match &self.research {
+                    Some(research) => format!(
+                        "A researcher looked into this issue first. Read `{}` before you start. Its main finding: {}",
+                        self.research_file(),
+                        research.report.summary.trim()
+                    ),
+                    None => "None was needed for this issue.".to_string(),
+                },
+            ),
             (
                 "acceptance_notes",
                 match self.acceptance.as_ref().map(|a| a.report.notes.trim()).filter(|n| !n.is_empty()) {
@@ -617,6 +674,95 @@ impl Run<'_> {
                 },
             ),
         ]
+    }
+
+    fn research_file(&self) -> String {
+        format!("research/issue-{}.md", self.issue.number)
+    }
+
+    /// Answers what has to be known before the work starts. It runs only for
+    /// an issue labelled `needs-research`, or when a judgment asked for it.
+    fn research(&mut self, index: usize, step: &Step) -> Result<Outcome> {
+        let labelled = self.issue.labels.iter().any(|l| l == "needs-research");
+        let question = match (&self.research_question, labelled) {
+            (Some(question), _) => format!("An earlier attempt at this issue got stuck, and this question has to be answered first:\n\n{}", question.trim()),
+            (None, true) => "The issue is labelled `needs-research`. Find out what a developer needs to know before starting: which existing code the change touches, and how any framework API it depends on behaves.".to_string(),
+            (None, false) => {
+                println!("  {}: skipped, the issue does not ask for research", step.name);
+                self.note(step, "skipped")?;
+                return Ok(Outcome::Pass);
+            }
+        };
+        let file = self.research_file();
+        let mut values = self.issue_values();
+        values.push(("question", question));
+        let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
+        let ask = Ask { name: &step.name, prompt: &prompt, schema: step.schema.as_deref(), resume: None };
+        let (report, _) = match self.ask::<ResearchReport>(index, step, &ask, |_| "replied".to_string())? {
+            Ok(found) => found,
+            Err(error) => return Ok(Outcome::Stop(error)),
+        };
+        if git::head(&self.worktree)? != self.expected {
+            return self.gate("history", Some("the researcher changed git history; only the engine commits".into()));
+        }
+        let changed = git::changed_files(&self.worktree, &self.expected)?;
+        if changed != [file.clone()] {
+            return self.gate("research-notes", Some(format!("the researcher must write exactly `{file}`, and it changed {changed:?}")));
+        }
+        let notes = std::fs::read_to_string(self.worktree.join(&file)).unwrap_or_default();
+        if !notes.contains("## Sources") || report.sources.is_empty() {
+            return self.gate("research-notes", Some(format!("`{file}` must list its sources under `## Sources`, and it does not")));
+        }
+        self.gate("research-notes", None)?;
+        let subject = format!("docs(research): notes for #{}", self.issue.number);
+        let sha = git::commit_all(&self.worktree, &subject, &format!("Issue #{}", self.issue.number))?;
+        println!("  committed {} \"{subject}\": {} source(s)", &sha[..sha.len().min(10)], report.sources.len());
+        self.expected = sha.clone();
+        let vendor = step.vendor.map(|v| v.name()).unwrap_or("?").to_string();
+        self.research = Some(Research { vendor, sha, report });
+        Ok(Outcome::Pass)
+    }
+
+    /// Asks the summary module for the part of the pull request's body that
+    /// is written for a person. A pull request is never held up by this: if
+    /// the call fails, the body holds only what the engine records.
+    fn summarize(&mut self, index: usize, step: &Step) -> Result<()> {
+        let history: Vec<String> = self
+            .store
+            .steps(&self.repo, self.issue.number, &self.run_id)?
+            .iter()
+            .map(|(step, vendor, _, verdict, _, duration_ms, round)| {
+                let who = vendor.as_deref().map(|v| format!(" ({v})")).unwrap_or_default();
+                format!("pass {}: {step}{who}: {verdict}, {:.0} s", round + 1, *duration_ms as f64 / 1000.0)
+            })
+            .collect();
+        let fixes: Vec<String> = self.fixes.iter().map(|f| format!("`{}` failed: {} Fixed in \"{}\"", f.from, f.why, f.subject)).collect();
+        let review = match &self.review {
+            Some((vendor, verdict)) => format!("{} by {vendor}: {}\n{}", verdict.verdict, verdict.summary.trim(), bullets(&verdict.items, false)),
+            None => "No review ran.".to_string(),
+        };
+        let mut values = self.issue_values();
+        values.extend([
+            ("history", bullets(&history, false)),
+            ("dev_report", self.dev_report().unwrap_or_else(|_| "None.".to_string())),
+            ("fixes", bullets(&fixes, false)),
+            ("acceptance", self.acceptance_note()),
+            ("review", review),
+            ("head_sha", self.head_sha.clone().unwrap_or_default()),
+            ("verify_result", self.verify.clone().unwrap_or_else(|| "not run".to_string())),
+        ]);
+        let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
+        let ask = Ask { name: "summary", prompt: &prompt, schema: step.schema.as_deref(), resume: None };
+        match self.ask::<Summary>(index, step, &ask, |_| "replied".to_string())? {
+            Ok((summary, _)) => {
+                std::fs::write(self.run_dir.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
+                self.summary = Some(summary);
+            }
+            Err(problem) => println!("  summary: none ({problem}). The pull request body holds only what the engine recorded"),
+        }
+        Ok(())
     }
 
     /// Records a step that made no call and ran no command.
@@ -1138,7 +1284,13 @@ impl Run<'_> {
 
     /// Pushes the branch and opens the pull request, or refreshes its body
     /// when it is already open.
-    fn publish(&mut self) -> Result<Outcome> {
+    fn publish(&mut self, index: usize, summary: Option<&Step>) -> Result<Outcome> {
+        if let Some(step) = summary {
+            self.summarize(index, step)?;
+            if let Some(problem) = self.same_commit("the summary")? {
+                return Ok(Outcome::Stop(problem));
+            }
+        }
         let started = Instant::now();
         let pushed = {
             let _git = self.git_lock()?;
@@ -1381,10 +1533,22 @@ impl Run<'_> {
 
     fn pr_body(&self) -> String {
         let head = self.head_sha.as_deref().unwrap_or("?");
-        let mut out = format!("Closes #{}\n\n## What changed\n\n", self.issue.number);
-        if let Some(dev) = &self.dev {
-            out.push_str(dev.summary.trim());
-            out.push_str("\n\n");
+        let mut out = format!("Closes #{}\n\n", self.issue.number);
+        match (&self.summary, &self.dev) {
+            (Some(summary), _) => {
+                out.push_str(&format!("## Summary\n\n{}\n\n{}\n\n", summary.what_changed.trim(), summary.how_it_went.trim()));
+            }
+            (None, Some(dev)) => out.push_str(&format!("## What changed\n\n{}\n\n", dev.summary.trim())),
+            (None, None) => {}
+        }
+        if let Some(research) = &self.research {
+            out.push_str(&format!(
+                "## Research\n\n- Notes by {} in `{}`, commit `{}`: {}\n\n",
+                research.vendor,
+                self.research_file(),
+                research.sha,
+                research.report.summary.trim()
+            ));
         }
         if let Some(acceptance) = &self.acceptance {
             out.push_str("## Acceptance flows\n\n");
@@ -1429,6 +1593,12 @@ impl Run<'_> {
         }
         out.push_str("\n## For a human to check\n\n");
         let mut notes: Vec<String> = Vec::new();
+        if let Some(summary) = &self.summary {
+            notes.extend(summary.for_a_human.iter().map(|item| item.trim().to_string()));
+        }
+        if let Some(research) = &self.research {
+            notes.extend(research.report.open_questions.iter().map(|q| format!("Open question from research: {}", q.trim())));
+        }
         if let Some(dev) = &self.dev {
             if !dev.notes.trim().is_empty() {
                 notes.push(format!("Developer: {}", dev.notes.trim()));
@@ -1494,7 +1664,8 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     let read_module = |module: &str, file: &str| {
         read_base(&format!("modules/{module}/{file}")).or_else(|| workflow::builtin(module, file))
     };
-    let Workflow { mut steps, mut on_fail, fix_rounds, github_fix_rounds, github, judgment, judgments } = workflow::parse(&workflow_text, &read_module)?;
+    let Workflow { mut steps, mut on_fail, fix_rounds, github_fix_rounds, github, judgment, judgments, summary } = workflow::parse(&workflow_text, &read_module)?;
+    let can_research = steps.iter().any(|s| s.def.role == Some(Role::Research));
     let has_acceptance = steps.iter().any(|s| s.def.role == Some(Role::Acceptance));
 
     // Flow names end up in file paths and in a shell command.
@@ -1541,6 +1712,7 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     // ask for another, which starts from nothing.
     let mut attempt = 1u32;
     let mut earlier: Vec<String> = Vec::new();
+    let mut research_question: Option<String> = None;
     let mut git_lock = Some(git_lock);
     loop {
     // An earlier run that was cut off still says it is running or waiting.
@@ -1612,6 +1784,9 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         expected: base_sha.clone(),
         base_sha: base_sha.clone(),
         head_sha: None,
+        research: None,
+        research_question: research_question.clone(),
+        summary: None,
         acceptance: None,
         red: None,
         ids: issue.marker.accessibility_ids.clone(),
@@ -1658,12 +1833,13 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         let result = match steps.get(index) {
             None => match name.as_str() {
                 "sync" => run.sync("sync"),
-                "pr" => run.publish(),
+                "pr" => run.publish(index, summary.as_ref()),
                 "github" => run.github(),
                 "merge" => run.merge(),
                 other => Err(anyhow!("'{other}' is not a step the engine knows")),
             },
             Some(step) => match (step.def.kind, step.def.role) {
+                (Kind::Agent, Some(Role::Research)) => run.research(index, step),
                 (Kind::Agent, Some(Role::Acceptance)) => run.acceptance(index, step),
                 (Kind::Agent, Some(Role::Dev)) => run.develop(index, step, turn.feedback).and_then(|outcome| {
                     // A flow change request is ruled on before anything judges the code.
@@ -1695,7 +1871,7 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         // A stuck issue goes to the judgment module, when the workflow has
         // one. It may ask for a new attempt. Anything else ends with a person.
         if let Some(judge) = &judgment {
-            let menu = judgment::Menu { attempts_left: judgments.saturating_sub(attempt - 1), research: false };
+            let menu = judgment::Menu { attempts_left: judgments.saturating_sub(attempt - 1), research: can_research };
             let mut notes = earlier.clone();
             let mut decided = (judgment::Action::Escalate, String::new());
             for round in 0..2 {
@@ -1720,7 +1896,10 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
             }
             let (action, reason) = decided;
             println!("  judgment: {}. {}", action.name(), first_line(&reason));
-            if matches!(action, judgment::Action::Retry | judgment::Action::SwitchVendor) {
+            if matches!(action, judgment::Action::Retry | judgment::Action::SwitchVendor | judgment::Action::Research) {
+                if action == judgment::Action::Research {
+                    research_question = Some(reason.clone());
+                }
                 earlier.push(format!("Attempt {attempt} stopped at `{step}`: {} The judgment chose `{}`: {}", first_line(&failure), action.name(), first_line(&reason)));
                 if action == judgment::Action::SwitchVendor {
                     for step in steps.iter_mut() {

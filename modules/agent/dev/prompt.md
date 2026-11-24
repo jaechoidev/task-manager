@@ -20,6 +20,10 @@ A change to any other file fails the run. If the work can't be done inside these
 
 {{accessibility_ids}}
 
+## Research
+
+{{research}}
+
 ## Acceptance flows
 
 {{flows}}

@@ -230,6 +230,11 @@ pub fn run(opts: &QueueOptions) -> Result<bool> {
 
     let list = |numbers: &[u64]| if numbers.is_empty() { "none".to_string() } else { numbers.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ") };
     println!("queue done. Merged: {}. Pull request open: {}. Blocked: {}", list(&merged), list(&opened), list(&failed));
+    // The day's handoff, written again with what just happened.
+    match super::handoff::export(&super::handoff::HandoffOptions { date: None, out: None }) {
+        Ok(files) => files.iter().for_each(|file| println!("handoff: {}", file.display())),
+        Err(e) => eprintln!("warning: could not write the handoff: {e:#}"),
+    }
     Ok(failed.is_empty())
 }
 
