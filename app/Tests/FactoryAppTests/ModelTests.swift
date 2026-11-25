@@ -230,8 +230,8 @@ final class ModelTests: XCTestCase {
         XCTAssertTrue(names("agent/dev", in: text))
         XCTAssertFalse(names("check/verify", in: text))
         XCTAssertTrue(names("check/verifyy", in: text))
-        XCTAssertEqual(engineLine(address: "http://127.0.0.1:7878", reached: true, updated: Date(timeIntervalSince1970: 100), now: Date(timeIntervalSince1970: 102)), "Engine at 127.0.0.1:7878 · updated 2 s ago")
-        XCTAssertEqual(engineLine(address: "http://127.0.0.1:7878", reached: false, updated: nil, now: Date()), "No answer from the engine at 127.0.0.1:7878")
+        XCTAssertEqual(engineLine(address: "http://127.0.0.1:7878", reached: true), "Engine at 127.0.0.1:7878")
+        XCTAssertEqual(engineLine(address: "http://127.0.0.1:7878", reached: false), "No answer from the engine at 127.0.0.1:7878")
     }
 
     func testUsageShowsTokensWhenTheEngineCountsThem() throws {

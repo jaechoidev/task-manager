@@ -77,13 +77,14 @@ struct RootView: View {
                 .help("Which project's issues, schedule and workflow are shown")
             }
             ToolbarItemGroup(placement: .primaryAction) {
-                TimelineView(.periodic(from: .now, by: 1)) { moment in
-                    let reached = model.problem == nil
-                    HStack(spacing: 6) {
-                        Circle().fill(reached ? Theme.green : Theme.red).frame(width: 7, height: 7)
-                        Text(engineLine(address: model.address, reached: reached, updated: model.updatedAt, now: moment.date))
-                            .font(.system(size: 13)).foregroundStyle(Theme.secondary)
-                    }
+                // The app asks again every two seconds, so "how long ago" would
+                // only flicker. The dot and the line change when it matters:
+                // when the engine stops answering.
+                let reached = model.problem == nil
+                HStack(spacing: 6) {
+                    Circle().fill(reached ? Theme.green : Theme.red).frame(width: 7, height: 7)
+                    Text(engineLine(address: model.address, reached: reached))
+                        .font(.system(size: 13)).foregroundStyle(Theme.secondary)
                 }
                 Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                     .help("Ask the engine again now")
@@ -185,10 +186,9 @@ struct RootView: View {
 }
 
 /// The line in the toolbar that says whether the engine answers.
-func engineLine(address: String, reached: Bool, updated: Date?, now: Date) -> String {
+func engineLine(address: String, reached: Bool) -> String {
     let host = address.replacingOccurrences(of: "http://", with: "").replacingOccurrences(of: "https://", with: "")
-    guard reached, let updated else { return "No answer from the engine at \(host)" }
-    return "Engine at \(host) · \(agoLine(max(0, Int(now.timeIntervalSince(updated)))))"
+    return reached ? "Engine at \(host)" : "No answer from the engine at \(host)"
 }
 
 /// What the menu bar shows: how many issues need a person, and what runs.

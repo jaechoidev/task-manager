@@ -529,8 +529,3 @@ func problemStep(_ problem: String) -> String? {
     return String(problem[open.upperBound..<close])
 }
 
-/// How long ago the engine last answered, in words.
-func agoLine(_ seconds: Int) -> String {
-    if seconds < 1 { return "updated just now" }
-    return "updated \(duration(Double(seconds))) ago"
-}

@@ -18,8 +18,6 @@ final class AppModel: ObservableObject {
     @Published var problem: String?
     /// What the last retry or drop did.
     @Published var notice: String?
-    /// When the engine last answered.
-    @Published var updatedAt: Date?
     /// Only this repository's issues are listed. Nil lists every project's.
     @Published var project: String?
 
@@ -92,7 +90,6 @@ final class AppModel: ObservableObject {
             self.repos = health.repos
             self.issues = issues
             self.problem = nil
-            self.updatedAt = Date()
             if let project, !health.repos.contains(project), !issues.contains(where: { $0.repo == project }) {
                 self.project = nil
             }

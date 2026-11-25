@@ -6,7 +6,7 @@ A window and a menu bar item onto the engine. It is a client of `factory serve` 
 
 | Part | What is there |
 | --- | --- |
-| Toolbar | A project picker (all projects, or one), whether the engine answers and how long ago, and a button to ask again now |
+| Toolbar | A project picker (all projects, or one), whether the engine answers, and a button to ask again now. The app asks again every two seconds by itself, so it does not say how long ago |
 | Sidebar | A filter, the three places to go (Schedule, Workflow, Usage), and every issue the engine has run, grouped: needs you, running and waiting, pull request open, done. Each issue has a mark for its state. With more than one repository, each row says which |
 | Issue | Its state, the pass it is on and its pull request. A strip of the workflow's steps with how each went. The summary written for a person. A "to look at" list you can tick off (kept on this machine). Every step, grouped by pass, with who answered on which model and a bar for its time. The end of the newest output, opened while the issue is at work |
 | Needs you | For a stuck issue: what failed, what the judgment said, and two buttons, "Start over" and "Take off the queue" |
