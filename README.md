@@ -24,6 +24,9 @@ factory workflow validate --repo-dir <checkout>
 factory workflow propose --file <factory.yaml> --repo-dir <checkout>
 factory module list --repo-dir <checkout>
 factory module new <kind>/<name> --repo-dir <checkout>
+factory project add <checkout> [--label <label>] [--max-parallel <n>]
+factory project list
+factory schedule [--parallel <n>] [--in-order] [--watch]
 factory capacity [--write] [--prepare]
 factory providers
 factory providers check <name> [--tier <tier>]
@@ -39,6 +42,8 @@ factory status
 | `plan create` | Creates issues, parent links and blocked-by links from valid plans. Safe to rerun | 1 when a plan is invalid |
 | `run` | Takes one issue through acceptance flows, develop, verify and review, opens a pull request, waits for GitHub on the same commit and merges. `--no-merge` leaves the merge to a person, `--no-pr` stops before pushing | 1 when the issue ends blocked |
 | `queue` | Runs every ready issue labelled `today`, most urgent first, up to `--parallel` at once | 1 when an issue ended blocked |
+| `schedule` | Runs the ready issues of every registered project, with one set of places for all of them. `--watch` keeps it running | 1 when an issue ended blocked |
+| `project` | `add`, `list` and `remove` the checkouts `schedule` works on | 1 when a listed folder is not a checkout |
 | `blocked` | Lists the issues waiting for a person, with what failed and what the judgment said | |
 | `retry` | Starts a stuck issue over: closes the pull request and deletes the branch its last attempt left, then runs it from nothing | 1 when it ends blocked again |
 | `drop` | Takes a stuck issue off the queue: closes its pull request, deletes its branch and worktree, removes the `today` label. The issue stays open | |
@@ -297,6 +302,33 @@ What keeps parallel runs apart:
 
 Locks are files under `~/.factory/locks/`, held with the operating system's file lock. The system releases them when a process exits, so a crash leaves none behind.
 
+### Several projects on one machine
+
+`factory queue` works on one repository. `factory schedule` works on every project the machine has registered, and is the same scheduler with more than one project.
+
+```
+factory project add ~/code/todo-trial
+factory project add ~/code/other-app --max-parallel 1
+factory project list
+factory schedule
+```
+
+The simulators and the agent subscriptions are already shared between projects, because the pools and the quota ledger belong to the machine. What `schedule` adds is one set of places for all projects, `--parallel` of them, and a rule for who gets the next free one.
+
+| Mode | Who gets the next free place |
+| --- | --- |
+| Side by side, the default | The project with the fewest issues running. With the same number, the one registered first |
+| `--in-order` | The first registered project that has anything running or ready. Nobody else starts until it has neither |
+
+- **A project's own limit.** `--max-parallel` on a project caps its issues, whatever is free.
+- **Parked issues are not in the way.** A project whose issues are all parked for quota counts as having nothing left, in both modes.
+- **Inside a project nothing changes.** Priority labels, blocked-by links and the rule that overlapping scopes never run together work as in `factory queue`. Scopes are only compared within a project.
+- **The machine guard.** A further issue starts only while `factory capacity` would say the machine has room. The first one always starts. `--no-guard` turns this off.
+- **`--watch`** never ends. With nothing to do it looks again every 30 seconds, so labelling an issue `today` is all it takes to start it. This is the long-running form. Nothing installs it as a service yet.
+- **An issue someone else is running** is left alone and not counted as blocked.
+
+Projects are kept in `~/.factory/config.yaml`, in the order they were added. `factory serve` with no `--repo-dir` serves the registered projects. In the output an issue is named with its repository, as in `todo-trial#37`.
+
 ### What a machine can run at once
 
 `factory capacity` answers that from the machine itself. On its own it changes nothing and starts nothing.
@@ -503,7 +535,7 @@ cargo install --path .
 | `src/repo.rs` | `repo init` and the preflight |
 | `src/engine/mod.rs` | The steps and the fixed gates |
 | `src/engine/rounds.rs` | The loop: what runs next, and when the rounds run out |
-| `src/engine/queue.rs` | Which issues are ready, in what order, and how many at once |
+| `src/engine/queue.rs` | The scheduler: which issues are ready, in what order, how many at once, and which project gets the next place |
 | `src/engine/judgment.rs` | What a judgment's answer is allowed to do, and a split as a plan file |
 | `src/engine/handoff.rs` | The handoff document and the promote pull request |
 | `src/engine/api.rs` | The local API |

@@ -5,7 +5,7 @@ mod plan;
 mod repo;
 mod yaml;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use plan::model::PlanSet;
 use std::collections::BTreeSet;
@@ -68,6 +68,32 @@ enum Top {
         /// Leave every merge to a person
         #[arg(long)]
         no_merge: bool,
+    },
+    /// Run the ready issues of every project registered on this machine,
+    /// sharing one set of places between them
+    Schedule {
+        /// How many issues may run at once, over all projects. Two, or the
+        /// size of this machine's simulator pool when that is larger
+        #[arg(long)]
+        parallel: Option<usize>,
+        /// Finish one project's work before starting the next one's.
+        /// Otherwise the projects run side by side
+        #[arg(long)]
+        in_order: bool,
+        /// Never end: keep looking for issues that became ready
+        #[arg(long)]
+        watch: bool,
+        /// Leave every merge to a person
+        #[arg(long)]
+        no_merge: bool,
+        /// Start further issues even while the machine is busy
+        #[arg(long)]
+        no_guard: bool,
+    },
+    /// The projects `factory schedule` works on
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
     },
     /// Start a stuck issue over: close the pull request and delete the
     /// branch its last attempt left, then run it from nothing
@@ -184,6 +210,27 @@ enum ProvidersCommand {
         /// Only this tier. Every tier when not given
         #[arg(long)]
         tier: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// Register a checkout, or change how it is registered
+    Add {
+        /// A checkout of the project repository
+        dir: PathBuf,
+        /// Only issues with this label are run
+        #[arg(long)]
+        label: Option<String>,
+        /// At most this many of its issues at once
+        #[arg(long)]
+        max_parallel: Option<usize>,
+    },
+    /// Show the registered projects, in the order they are worked on
+    List,
+    /// Take a checkout off the list. Nothing is deleted
+    Remove {
+        dir: PathBuf,
     },
 }
 
@@ -400,7 +447,62 @@ fn run() -> Result<bool> {
         Top::Queue { repo_dir, label, parallel, no_merge } => {
             let pool = engine::config::Config::load(&engine::util::home()?)?.pool("simulator") as usize;
             let parallel = parallel.unwrap_or(pool.max(2));
-            engine::queue::run(&engine::queue::QueueOptions { repo_dir, label, parallel, no_merge })
+            let projects = vec![engine::queue::Project { repo_dir, label, max_parallel: None }];
+            engine::queue::run(&engine::queue::Options { projects, parallel, in_order: false, watch: false, no_merge, guard: false, single: true })
+        }
+
+        Top::Schedule { parallel, in_order, watch, no_merge, no_guard } => {
+            let config = engine::config::Config::load(&engine::util::home()?)?;
+            let parallel = parallel.unwrap_or((config.pool("simulator") as usize).max(2));
+            let projects = config.projects.iter().map(|entry| engine::queue::Project { repo_dir: entry.path(), label: entry.label().to_string(), max_parallel: entry.max_parallel }).collect();
+            engine::queue::run(&engine::queue::Options { projects, parallel, in_order, watch, no_merge, guard: !no_guard, single: false })
+        }
+
+        Top::Project { command } => {
+            let home = engine::util::home()?;
+            let mut config = engine::config::Config::load(&home)?;
+            match command {
+                ProjectCommand::Add { dir, label, max_parallel } => {
+                    let dir = dir.canonicalize().with_context(|| format!("{} does not exist", dir.display()))?;
+                    // It has to be a checkout of a GitHub repository to be of any use.
+                    let repo = engine::repo_name(&dir)?;
+                    if max_parallel == Some(0) {
+                        bail!("--max-parallel must be at least 1");
+                    }
+                    let new = config.add_project(engine::config::ProjectEntry { dir: dir.display().to_string(), label, max_parallel });
+                    config.save(&home)?;
+                    println!("{} {repo}, at {}", if new { "added" } else { "updated" }, dir.display());
+                    Ok(true)
+                }
+                ProjectCommand::Remove { dir } => {
+                    let dir = dir.canonicalize().unwrap_or(dir);
+                    if !config.remove_project(&dir) {
+                        bail!("{} is not a registered project", dir.display());
+                    }
+                    config.save(&home)?;
+                    println!("removed {}. Nothing was deleted", dir.display());
+                    Ok(true)
+                }
+                ProjectCommand::List => {
+                    quiet_on_closed_pipe();
+                    if config.projects.is_empty() {
+                        println!("no project is registered. Add one with `factory project add <checkout>`");
+                    }
+                    let mut all_there = true;
+                    for (at, entry) in config.projects.iter().enumerate() {
+                        let name = match engine::repo_name(&entry.path()) {
+                            Ok(repo) => repo,
+                            Err(_) => {
+                                all_there = false;
+                                "NOT A CHECKOUT OF A GITHUB REPOSITORY".to_string()
+                            }
+                        };
+                        let max = entry.max_parallel.map(|max| format!(", at most {max} at once")).unwrap_or_default();
+                        println!("{}. {name}  {}  issues labelled '{}'{max}", at + 1, entry.dir, entry.label());
+                    }
+                    Ok(all_there)
+                }
+            }
         }
 
         Top::Retry { issue, repo_dir, no_merge } => engine::run(&engine::RunOptions {
@@ -536,7 +638,11 @@ fn run() -> Result<bool> {
             Ok(report.problems.is_empty())
         }
 
-        Top::Serve { bind, token, repo_dirs } => {
+        Top::Serve { bind, token, mut repo_dirs } => {
+            // With none named, the projects this machine has registered.
+            if repo_dirs.is_empty() {
+                repo_dirs = engine::config::Config::load(&engine::util::home()?)?.projects.iter().map(|entry| entry.path()).collect();
+            }
             engine::api::serve(&engine::api::ServeOptions { bind, token, repo_dirs })?;
             Ok(true)
         }

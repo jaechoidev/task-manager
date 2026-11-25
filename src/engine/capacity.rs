@@ -363,6 +363,13 @@ fn calm_again(before: Option<u32>, now: Option<u32>) -> bool {
     now.is_some_and(|idle| idle >= wanted)
 }
 
+/// How many more simulator steps could start this minute. Quick: it reads
+/// only the CPU and memory, not the tools.
+pub fn room() -> Room {
+    let machine = machine();
+    room_now(&machine, &propose(&machine))
+}
+
 /// Reads the machine. Takes a few seconds: several tools are asked for their version.
 pub fn read() -> Report {
     let machine = machine();

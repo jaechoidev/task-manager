@@ -238,6 +238,10 @@ impl std::fmt::Display for Parked {
 
 impl std::error::Error for Parked {}
 
+/// How `factory run` refuses an issue another process holds. The scheduler
+/// looks for these words, so that such an issue is not counted as blocked.
+pub const ALREADY_RUNNING: &str = "is already being run by another process";
+
 /// What `factory run` exits with when the issue is parked. Not a failure:
 /// the conventional code for "try again later".
 pub const PARKED_EXIT_CODE: u8 = 75;
@@ -1850,7 +1854,7 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     let name = util::repo_dir_name(&repo);
     // One process per issue. The system drops the lock if this process dies.
     let Some(_issue_lock) = lock::try_acquire(&home, &format!("issue-{name}-{}", issue.number))? else {
-        bail!("issue #{} is already being run by another process", issue.number);
+        bail!("issue #{} {ALREADY_RUNNING}", issue.number);
     };
     // Other runs share this checkout's refs and worktree list.
     let git_lock = lock::acquire(&home, &format!("git-{name}"), &|| {})?;

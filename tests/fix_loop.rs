@@ -15,6 +15,8 @@ const GH: &str = r#"#!/usr/bin/env python3
 # Stands in for gh and for GitHub: one repository, o/r. With issue.json it
 # has one open issue, #7. With issues.json it has several. The pull request
 # for issue N is number N + 2. STUB_GITHUB says how checks and reviews answer.
+# A second repository, o/r2, exists when a test made the checkout `repo2`:
+# its state is in the folder r2 and its remote is origin2.git.
 import glob, json, os, re, subprocess, sys
 
 stub = os.environ["STUB_DIR"]
@@ -23,12 +25,17 @@ origin = f"{stub}/../origin.git"
 body = sys.stdin.read()
 args = sys.argv[1:]
 if args[:1] == ["repo"]:
-    print("o/r")
+    print("o/r2" if os.path.basename(os.getcwd()) == "repo2" else "o/r")
     sys.exit(0)
 if args[:1] != ["api"]:
     sys.exit(1)
 method = args[2]
 path = args[5] if args[3] == "-H" else args[3]
+if path.startswith("repos/o/r2"):
+    # The second repository answers like the first, from its own state.
+    origin = f"{stub}/../origin2.git"
+    stub = f"{stub}/r2"
+    path = path.replace("repos/o/r2", "repos/o/r", 1)
 with open(f"{stub}/gh.calls", "a") as calls:
     calls.write(f"{method} {path}\n")
 
@@ -163,8 +170,11 @@ else:
 
 const CODEX: &str = r#"#!/bin/bash
 # Stands in for the developer. What it writes depends on STUB_DEV.
+# Two calls may start in the same instant, so the count is taken under a lock.
+until mkdir "$STUB_DIR/codex.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$STUB_DIR/codex.count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$STUB_DIR/codex.count"
+rmdir "$STUB_DIR/codex.lock"
 echo "$*" > "$STUB_DIR/codex.args.$n"
 cat > "$STUB_DIR/codex.prompt.$n"
 out=""; model=""; prev=""
@@ -188,7 +198,7 @@ mkdir -p Sources
 if [ "$STUB_DEV" = "by-issue" ]; then
   # Each issue gets its own folder. The pause makes overlap in time visible.
   issue=$(sed -n 's/^# Issue #\([0-9]*\):.*/\1/p' "$STUB_DIR/codex.prompt.$n" | head -1)
-  if [ "$STUB_CODEX_LIMIT_ISSUE" = "$issue" ] && [ ! -f "$STUB_DIR/codex.limited" ]; then
+  if [ -n "$issue" ] && [ "$STUB_CODEX_LIMIT_ISSUE" = "$issue" ] && [ ! -f "$STUB_DIR/codex.limited" ]; then
     # The usage limit is reached once, on this issue's first call, and only
     # once another issue's developer is at work: that call must go through.
     for _ in $(seq 1 100); do grep -q "^dev-start" "$STUB_DIR/events" 2>/dev/null && break; sleep 0.1; done
@@ -243,8 +253,10 @@ echo "{\"summary\":\"attempt $n\",\"commit_subject\":\"feat(a): attempt $n\",\"f
 const CLAUDE: &str = r#"#!/bin/bash
 # Stands in for Claude in whichever role the prompt gives it: the acceptance
 # writer, the same writer ruling on a flow change request, or the reviewer.
+until mkdir "$STUB_DIR/claude.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$STUB_DIR/claude.count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$STUB_DIR/claude.count"
+rmdir "$STUB_DIR/claude.lock"
 echo "$*" > "$STUB_DIR/claude.args.$n"
 cat > "$STUB_DIR/claude.prompt.$n"
 reply() { echo "{\"type\":\"result\",\"is_error\":false,\"session_id\":\"stub-claude-$n\",\"structured_output\":$1}"; }
@@ -371,6 +383,17 @@ const ISSUE_BODY: &str = "<!-- factory:issue {\"v\":1,\"plan\":\"trial\",\"key\"
 /// One issue of a multi-issue trial: number, key, scope, labels, blocked by.
 type IssueSpec<'a> = (u64, &'a str, &'a str, &'a [&'a str], &'a [u64]);
 
+/// What the stand-in GitHub keeps for a repository's issues.
+fn issues_json(list: &[IssueSpec]) -> String {
+    let mut issues = serde_json::Map::new();
+    for (number, key, scope, labels, blocked_by) in list {
+        let marker = serde_json::json!({"v": 1, "plan": "trial", "key": key, "scope": [scope], "accept": ["It carries the marker"]});
+        let body = format!("<!-- factory:issue {marker} -->\n\nDo the work for {key}.\n");
+        issues.insert(number.to_string(), serde_json::json!({"title": format!("Issue {key}"), "body": body, "labels": labels, "blocked_by": blocked_by}));
+    }
+    serde_json::Value::Object(issues).to_string()
+}
+
 struct Trial {
     dir: PathBuf,
 }
@@ -399,20 +422,73 @@ impl Trial {
         let issue = serde_json::json!({ "number": 7, "state": "open", "title": "Add the file", "body": issue_body });
         fs::write(trial.dir.join("stub/issue.json"), issue.to_string()).unwrap();
 
-        let repo = trial.dir.join("repo");
+        trial.checkout("repo", "origin.git", workflow);
+        trial
+    }
+
+    /// A checkout with a workflow and a verify script, and its remote.
+    fn checkout(&self, name: &str, remote: &str, workflow: &str) {
+        let repo = self.dir.join(name);
+        fs::create_dir_all(&repo).unwrap();
         fs::write(repo.join("factory.yaml"), workflow).unwrap();
         executable(&repo.join("verify.sh"), VERIFY);
-        let origin = trial.dir.join("origin.git");
-        trial.git(&trial.dir, &["init", "--quiet", "--bare", "-b", "dev", origin.to_str().unwrap()]);
-        trial.git(&repo, &["init", "--quiet", "-b", "dev"]);
-        trial.git(&repo, &["add", "-A"]);
-        trial.git(&repo, &["commit", "--quiet", "-m", "start"]);
-        trial.git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
-        trial.git(&repo, &["push", "--quiet", "-u", "origin", "dev"]);
+        let origin = self.dir.join(remote);
+        self.git(&self.dir, &["init", "--quiet", "--bare", "-b", "dev", origin.to_str().unwrap()]);
+        self.git(&repo, &["init", "--quiet", "-b", "dev"]);
+        self.git(&repo, &["add", "-A"]);
+        self.git(&repo, &["commit", "--quiet", "-m", "start"]);
+        self.git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        self.git(&repo, &["push", "--quiet", "-u", "origin", "dev"]);
         // Plans are proposed into main.
-        trial.git(&repo, &["push", "--quiet", "origin", "dev:main"]);
-        trial.git(&repo, &["remote", "set-head", "origin", "dev"]);
-        trial
+        self.git(&repo, &["push", "--quiet", "origin", "dev:main"]);
+        self.git(&repo, &["remote", "set-head", "origin", "dev"]);
+    }
+
+    /// Adds a second project, o/r2, with its own issues, and registers both
+    /// on this machine in that order. `second` is extra config for the
+    /// second one, such as `max_parallel: 1`.
+    fn with_second_project(self, workflow: &str, list: &[IssueSpec], second: &str) -> Trial {
+        self.checkout("repo2", "origin2.git", workflow);
+        fs::create_dir_all(self.dir.join("stub/r2")).unwrap();
+        fs::write(self.dir.join("stub/r2/issues.json"), issues_json(list)).unwrap();
+        let entry = |name: &str, more: &str| format!("  - dir: {}\n{more}", self.dir.join(name).display());
+        let more = if second.is_empty() { String::new() } else { format!("    {second}\n") };
+        fs::write(self.dir.join("home/config.yaml"), format!("projects:\n{}{}", entry("repo", ""), entry("repo2", &more))).unwrap();
+        self
+    }
+
+    /// Starts `factory schedule` on the registered projects, without waiting for it.
+    fn schedule_command(&self, flags: &[&str], env: &[(&str, &str)]) -> Command {
+        let mut command = self.command(env!("CARGO_BIN_EXE_factory"));
+        command
+            .arg("schedule")
+            .arg("--no-guard")
+            .args(flags)
+            .envs([("STUB_DEV", "by-issue"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "green"), ("STUB_REAL_MERGE", "1")])
+            .envs(env.iter().copied())
+            .env("FACTORY_POLL_SECONDS", "0")
+            .env("FACTORY_SETTLE_SECONDS", "0");
+        command
+    }
+
+    /// Runs `factory schedule` to its end.
+    fn schedule(&self, flags: &[&str]) -> (Output, String) {
+        let output = self.schedule_command(flags, &[]).output().unwrap();
+        let mut text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        if !output.status.success() {
+            // What each issue's own process said, for the failure message.
+            for project in ["o__r", "o__r2"] {
+                for entry in fs::read_dir(self.dir.join("home/queue").join(project)).into_iter().flatten().flatten() {
+                    text.push_str(&format!("\n== {}\n{}", entry.path().display(), fs::read_to_string(entry.path()).unwrap_or_default()));
+                }
+            }
+        }
+        (output, text)
+    }
+
+    /// The files on `dev` of a remote.
+    fn files_on(&self, remote: &str) -> String {
+        self.git(&self.dir.join(remote), &["ls-tree", "-r", "--name-only", "dev"])
     }
 
     fn command(&self, program: &str) -> Command {
@@ -455,13 +531,7 @@ impl Trial {
     /// Replaces the single issue with several. Each entry is
     /// `(number, key, scope, labels, blocked by)`.
     fn with_issues(self, list: &[IssueSpec]) -> Trial {
-        let mut issues = serde_json::Map::new();
-        for (number, key, scope, labels, blocked_by) in list {
-            let marker = serde_json::json!({"v": 1, "plan": "trial", "key": key, "scope": [scope], "accept": ["It carries the marker"]});
-            let body = format!("<!-- factory:issue {marker} -->\n\nDo the work for {key}.\n");
-            issues.insert(number.to_string(), serde_json::json!({"title": format!("Issue {key}"), "body": body, "labels": labels, "blocked_by": blocked_by}));
-        }
-        fs::write(self.dir.join("stub/issues.json"), serde_json::Value::Object(issues).to_string()).unwrap();
+        fs::write(self.dir.join("stub/issues.json"), issues_json(list)).unwrap();
         self
     }
 
@@ -1566,4 +1636,116 @@ fn the_queue_picks_up_an_issue_that_becomes_ready_while_a_place_is_free() {
     // It was started without waiting for issue 7 to end.
     assert!(text.find("#8 b started").unwrap() < text.find("#7 a ended").unwrap(), "{text}");
     assert!(text.contains("Merged:") && text.contains("#7") && text.contains("#8") && text.contains("Blocked: none"), "{text}");
+}
+
+/// Two projects on one machine: o/r with issues 7 and 8, o/r2 with 17 and 18.
+fn two_projects(name: &str, second: &str) -> Trial {
+    Trial::build(name, &github_workflow(2), ISSUE_BODY)
+        .with_issues(&[(7, "a", "Sources/I7/", &["today"], &[]), (8, "b", "Sources/I8/", &["today"], &[])])
+        .with_second_project(&github_workflow(2), &[(17, "c", "Sources/I17/", &["today"], &[]), (18, "d", "Sources/I18/", &["today"], &[])], second)
+}
+
+#[test]
+fn two_projects_share_the_machine_side_by_side() {
+    let trial = two_projects("s-side", "");
+    let (output, text) = trial.schedule(&["--parallel", "2"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("schedule: 2 project(s), up to 2 issue(s) at once, projects side by side"), "{text}");
+    // The two places went to one issue of each project, not to two of the first.
+    let first_end = text.find(" ended after ").unwrap();
+    assert!(text.find("r#7 a started").unwrap() < first_end && text.find("r2#17 c started").unwrap() < first_end, "{text}");
+    assert!(text.find("r#8 b started").unwrap() > first_end, "{text}");
+    // Everything of both was done, each in its own repository.
+    for line in ["schedule done for o/r. Merged: ", "schedule done for o/r2. Merged: "] {
+        let done = text.lines().find(|l| l.starts_with(line)).unwrap_or_else(|| panic!("no line '{line}' in {text}"));
+        assert!(done.ends_with("Pull request open: none. Blocked: none"), "{done}");
+    }
+    let (first, second) = (trial.files_on("origin.git"), trial.files_on("origin2.git"));
+    assert!(first.contains("Sources/I7/File.swift") && first.contains("Sources/I8/File.swift") && !first.contains("I17"), "{first}");
+    assert!(second.contains("Sources/I17/File.swift") && second.contains("Sources/I18/File.swift") && !second.contains("I7/"), "{second}");
+    // The simulator belongs to the machine, not to a project: with one
+    // slot, verifies of different projects still took turns.
+    assert_eq!(trial.verify_overlap().0, 1, "{:?}", trial.events());
+}
+
+#[test]
+fn in_order_one_project_is_finished_before_the_next_starts() {
+    let trial = two_projects("s-order", "");
+    let (output, text) = trial.schedule(&["--parallel", "2", "--in-order"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("one project after the other"), "{text}");
+    // Both places went to the first project. The second waited for it.
+    let second_starts = text.find("r2#17 c started").unwrap().min(text.find("r2#18 d started").unwrap());
+    assert!(text.find("r#7 a ended").unwrap() < second_starts && text.find("r#8 b ended").unwrap() < second_starts, "{text}");
+    assert!(text.contains("schedule done for o/r. Merged: ") && text.contains("schedule done for o/r2. Merged: "), "{text}");
+    assert!(!text.contains("Blocked: #"), "{text}");
+}
+
+#[test]
+fn a_project_never_gets_more_places_than_its_own_limit() {
+    // Three places, but the second project may use one.
+    let trial = two_projects("s-max", "max_parallel: 1");
+    let (output, text) = trial.schedule(&["--parallel", "3"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("o/r2: issues labelled 'today', at most 1 at once"), "{text}");
+    // 18 started only after 17 had ended, though a place was free.
+    assert!(text.find("r2#17 c ended").unwrap() < text.find("r2#18 d started").unwrap(), "{text}");
+    let first_end = text.find(" ended after ").unwrap();
+    assert!(text.find("r#7 a started").unwrap() < first_end && text.find("r#8 b started").unwrap() < first_end, "{text}");
+}
+
+#[test]
+fn watching_the_scheduler_picks_up_work_that_arrives_later_and_does_not_end() {
+    // Nothing is labelled when it starts.
+    let trial = Trial::build("s-watch", &github_workflow(2), ISSUE_BODY)
+        .with_issues(&[(7, "a", "Sources/I7/", &[], &[])])
+        .with_second_project(&github_workflow(2), &[(17, "c", "Sources/I17/", &[], &[])], "");
+    let log = trial.dir.join("schedule.log");
+    let out = fs::File::create(&log).unwrap();
+    let mut child = trial
+        .schedule_command(&["--watch"], &[("FACTORY_QUEUE_LOOK_SECONDS", "1")])
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(child.try_wait().unwrap().is_none(), "it ended with nothing to do: {}", fs::read_to_string(&log).unwrap());
+    // A person labels an issue of the second project.
+    fs::write(trial.dir.join("stub/r2/issues.json"), issues_json(&[(17, "c", "Sources/I17/", &["today"], &[])])).unwrap();
+    let merged = trial.dir.join("stub/r2/closed-17");
+    for _ in 0..300 {
+        if merged.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let still_running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(merged.exists(), "{text}");
+    assert!(text.contains("r2#17 c started") && text.contains("r2#17 c ended"), "{text}");
+    assert!(text.contains("keeps looking for new work until stopped"), "{text}");
+    // Done with that, it went on watching.
+    assert!(still_running, "{text}");
+    assert!(trial.files_on("origin2.git").contains("Sources/I17/File.swift"));
+}
+
+#[test]
+fn an_issue_another_process_is_running_is_left_alone_not_counted_as_blocked() {
+    let trial = Trial::build("q-held", &github_workflow(2), ISSUE_BODY)
+        .with_issues(&[(7, "a", "Sources/I7/", &["today"], &[]), (8, "b", "Sources/I8/", &["today"], &[])]);
+    // Somebody is running issue 7 by hand: they hold its lock.
+    let locks = trial.dir.join("home/locks");
+    fs::create_dir_all(&locks).unwrap();
+    let held = fs::OpenOptions::new().create(true).truncate(false).write(true).open(locks.join("issue-o__r-7.lock")).unwrap();
+    held.lock().unwrap();
+    let (output, text) = trial.queue(&["--parallel", "2"]);
+    drop(held);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("#7 a left alone: another process is running it"), "{text}");
+    assert!(text.contains("queue done. Merged: #8. Pull request open: none. Blocked: none"), "{text}");
+    let (_, blocked) = trial.cli(&["blocked"], &[]);
+    assert!(blocked.contains("no issue is waiting for a person"), "{blocked}");
 }
