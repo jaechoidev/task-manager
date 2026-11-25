@@ -100,7 +100,7 @@ enum Render {
                             if let workflow { WorkflowPane(workflow: workflow, repo: repo, edit: {}) } else { Text("No workflow.") }
                         }
                     case .usage:
-                        padded { UsagePane(usage: usage) }
+                        padded { UsagePane(usage: usage, schedule: schedule) }
                     case .issue:
                         padded {
                             if let selected {

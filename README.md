@@ -478,9 +478,9 @@ A call that fails with signs of a usage or rate limit is not a failed attempt. T
 
 Codex documents no stable format for a failed call, so there the engine looks for the phrases a limit is worded with ("usage limit", "rate limit", "429", "too many requests") in the error and in error lines of the output. It does the same for Claude when Claude's own event does not say.
 
-`factory providers` prints each provider's latest reading and when it was read. `GET /v1/schedule` and the app's Schedule screen show the same.
+`factory providers` prints each provider's latest reading and when it was read. `GET /v1/schedule` carries the same, and the app shows it on its Usage screen.
 
-`factory providers refresh` reads every plan now, or one provider's when it is named. Z.ai is asked directly, which costs nothing. Claude and Codex only say it in a reply, so each gets one small call on its cheapest checked tier, in an empty folder. The refresh button beside Quota in the app does the same.
+`factory providers refresh` reads every plan now, or one provider's when it is named. Z.ai is asked directly, which costs nothing. Claude and Codex only say it in a reply, so each gets one small call on its cheapest checked tier, in an empty folder. The refresh button beside Quota on the app's Usage screen does the same.
 
 ## Modules
 

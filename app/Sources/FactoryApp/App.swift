@@ -109,16 +109,11 @@ struct RootView: View {
         case .schedule:
             page {
                 if let schedule = model.schedule {
-                    SchedulePane(
-                        schedule: schedule, project: model.project,
-                        open: { id in
-                            model.selected = id
-                            screen = .issue
-                            Task { await model.refresh() }
-                        },
-                        refreshQuota: { Task { await model.refreshQuota() } },
-                        refreshing: model.quotaRefreshing
-                    )
+                    SchedulePane(schedule: schedule, project: model.project) { id in
+                        model.selected = id
+                        screen = .issue
+                        Task { await model.refresh() }
+                    }
                 } else {
                     missing("This engine does not report its schedule. Build a newer `factory`.")
                 }
@@ -132,7 +127,9 @@ struct RootView: View {
                 }
             }
         case .usage:
-            page { UsagePane(usage: model.usage) }
+            page {
+                UsagePane(usage: model.usage, schedule: model.schedule, refreshQuota: { Task { await model.refreshQuota() } }, refreshing: model.quotaRefreshing)
+            }
         case .issue:
             page {
                 if let issue = model.selectedIssue {

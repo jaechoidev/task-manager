@@ -155,17 +155,49 @@ struct WorkflowPane: View {
     }
 }
 
-/// Calls and tokens per vendor, with a bar for the tokens. An engine that
-/// does not count tokens gets the calls and the limits only.
+/// What each plan has left and what was spent: a card per provider's plan
+/// with a button that reads them again, then calls and tokens per vendor.
+/// An engine that does not count tokens gets the calls and the limits only.
 struct UsagePane: View {
     var usage: [UsageRow]
+    /// Where the plans' readings come from. Nil when the engine has none.
+    var schedule: Schedule?
+    /// Asks every provider for its plan again. Nil leaves the button out.
+    var refreshQuota: (() -> Void)?
+    /// Set while the providers are being asked.
+    var refreshing = false
 
     var body: some View {
         let most = usage.compactMap(\.tokens).max() ?? 0
         let counted = most > 0
         let missing = usage.map { $0.calls - ($0.tokenCalls ?? $0.calls) }.reduce(0, +)
-        VStack(alignment: .leading, spacing: 20) {
-            ScreenTitle(over: "every issue this machine has run", title: "Usage")
+        VStack(alignment: .leading, spacing: 28) {
+            ScreenTitle(over: "each provider's plan, and what every issue on this machine used", title: "Usage")
+            if let schedule {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 10) {
+                        SectionTitle(title: "Quota", note: refreshing ? "asking each provider..." : nil)
+                        if let refreshQuota, !refreshing {
+                            Button(action: refreshQuota) {
+                                Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.tertiary)
+                                    .frame(width: 26, height: 24)
+                                    .background(Color.white, in: RoundedRectangle(cornerRadius: 6))
+                                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.control, lineWidth: 1))
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("Reads every plan again. Z.ai is asked directly. Claude and ChatGPT each get one small call, because they only say it in a reply.")
+                            .accessibilityLabel("Refresh quota")
+                        }
+                    }
+                    if schedule.out.isEmpty && schedule.quota.isEmpty {
+                        Text("No plan has been read yet.").font(.system(size: 13)).foregroundStyle(Theme.secondary)
+                    } else {
+                        QuotaCards(out: schedule.out, readings: schedule.quota)
+                    }
+                }
+                .frame(maxWidth: 1080, alignment: .leading)
+            }
             VStack(alignment: .leading, spacing: 10) {
                 SectionTitle(title: "Usage by vendor")
                 if usage.isEmpty {
@@ -217,5 +249,72 @@ struct UsagePane: View {
         .foregroundStyle(header ? Theme.secondary : Theme.text)
         .padding(.horizontal, 14).padding(.vertical, 8)
         .background(header ? Theme.band : Color.clear)
+    }
+}
+
+/// A card per provider: who is set aside after a usage limit, and how much
+/// of each plan is used, with a bar per window.
+struct QuotaCards: View {
+    var out: [OutOfQuota]
+    var readings: [QuotaReading]
+
+    var body: some View {
+        Columns(minimum: 300, spacing: 12) {
+            ForEach(out) { entry in
+                setAside(entry)
+            }
+            ForEach(readings) { reading in
+                readingCard(reading)
+            }
+        }
+    }
+
+    private func setAside(_ entry: OutOfQuota) -> some View {
+        Boxed(fill: Theme.amberCard, line: Theme.amberCardLine) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Image(systemName: "clock").font(.system(size: 13)).foregroundStyle(Theme.amber)
+                    Text("\(entry.who) is set aside").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
+                }
+                Text("until \(clockTime(entry.until))" + (entry.hits > 1 ? ", after \(entry.hits) limits in a row" : ""))
+                    .font(.system(size: 13)).foregroundStyle(Theme.amberDark)
+                Text("\"\(entry.reason)\"").font(.system(size: 12)).foregroundStyle(Theme.secondary).lineLimit(2)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 14)
+        }
+    }
+
+    private func readingCard(_ reading: QuotaReading) -> some View {
+        let out = reading.outUntil
+        return Boxed(fill: out == nil ? .white : Theme.amberCard, line: out == nil ? Theme.border : Theme.amberCardLine) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(reading.provider).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
+                    Spacer()
+                    Text("read at \(clockTime(reading.at))").font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                }
+                if let out {
+                    Text("used up, set aside until \(clockTime(out))").font(.system(size: 13)).foregroundStyle(Theme.amberDark)
+                }
+                ForEach(Array(reading.windows.enumerated()), id: \.offset) { _, window in
+                    let line = quotaLine(window)
+                    if let share = line.share {
+                        HStack {
+                            Text(line.name)
+                            Spacer()
+                            Text(line.used).monospacedDigit()
+                        }
+                        .font(.system(size: 13)).foregroundStyle(Theme.tertiary)
+                        MeterBar(share: share, color: share >= 1 ? Theme.red : (share >= 0.8 ? Theme.amberLine : Theme.green))
+                        if !line.detail.isEmpty {
+                            Text(line.detail).font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                        }
+                    } else {
+                        Text(window).font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                    }
+                }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 14)
+        }
     }
 }

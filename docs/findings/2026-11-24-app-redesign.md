@@ -47,7 +47,7 @@ The app has 15 tests. In the real window the Issue, Schedule and Usage screens w
 ## Open items
 
 - **Most of the real window is still untried by hand.** Filter, picker, ticking an item, opening the editor and the two buttons of a stuck issue.
-- **Usage no longer follows the canvas.** At the owner's word it shows calls as a number and tokens with a bar, and no time. The canvas still draws time.
+- **Usage no longer follows the canvas.** At the owner's word it shows calls as a number and tokens with a bar, and no time. The plan cards and their refresh button moved there from Schedule too: what a plan has left and what was spent are one subject, and Schedule is about what runs now. Schedule keeps a "Set aside" section, shown only while someone is set aside, because that explains a wait. The canvas still draws time in Usage and Quota on Schedule.
 - **The canvas was still changing** while this was built: the Schedule artboard arrived during the day. This follows the version read at 05:30 UTC on 2026-11-25.
 - **The editor's gutter while typing.**
 - **Dark mode.**
