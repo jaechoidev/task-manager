@@ -1,6 +1,6 @@
 # Findings: one scheduler for several projects (2026-11-24)
 
-A machine can now work on several repositories with one set of places. It is built and tested with stand-ins. It has not run two real projects, because there is only one trial repository.
+A machine can now work on several repositories with one set of places. It is built and tested with stand-ins. When this was written it had not run two real projects, because there was only one trial repository. It has since: see [two real projects](2026-11-24-two-projects.md).
 
 ## Result
 
@@ -28,7 +28,7 @@ A machine can now work on several repositories with one set of places. It is bui
 
 ## Open items
 
-- **A real run with two projects.** It needs a second repository with its own plan.
+- **A real run with two projects.** Done later the same day, side by side only: see [two real projects](2026-11-24-two-projects.md).
 - **Fair share counts issues, not cost.** A project whose issues take ten times longer gets the same number of places.
 - **No service.** `--watch` is the daemon in the sense of the design doc, started by hand. A launchd entry is not written.
 - **Priority between projects** is only the order they were added in. There is no weight.
