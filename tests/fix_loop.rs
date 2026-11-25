@@ -83,6 +83,10 @@ def match(pattern):
     return re.fullmatch(pattern, path)
 
 if method == "GET" and path.startswith("repos/o/r/issues?"):
+    # GitHub does not answer while this file is there.
+    if os.path.exists(f"{stub}/gh.down"):
+        sys.stderr.write("error connecting to api.github.com\n")
+        sys.exit(1)
     label = re.search(r"labels=([^&]*)", path).group(1)
     listed = [issue(n) for n in issues()]
     out([i for i in listed if i["state"] == "open" and any(l["name"] == label for l in i["labels"])])
@@ -1822,6 +1826,12 @@ fn watching_the_scheduler_picks_up_work_that_arrives_later_and_does_not_end() {
     let idle = board();
     assert!(idle.contains(&format!("\"pid\":{},", child.id())) && idle.contains("\"watch\":true"), "{idle}");
     assert!(idle.contains("\"repo\":\"o/r\"") && idle.contains("\"repo\":\"o/r2\"") && !idle.contains("\"merged\":[17]"), "{idle}");
+    // GitHub stops answering for a while. A scheduler that watches says so
+    // once and keeps going: ending would cut off every issue at work.
+    fs::write(trial.dir.join("stub/gh.down"), "").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(child.try_wait().unwrap().is_none(), "it ended when GitHub did not answer: {}", fs::read_to_string(&log).unwrap());
+    fs::remove_file(trial.dir.join("stub/gh.down")).unwrap();
     // A person labels an issue of the second project.
     fs::write(trial.dir.join("stub/r2/issues.json"), issues_json(&[(17, "c", "Sources/I17/", &["today"], &[])])).unwrap();
     let merged = trial.dir.join("stub/r2/closed-17");
@@ -1840,6 +1850,8 @@ fn watching_the_scheduler_picks_up_work_that_arrives_later_and_does_not_end() {
     assert!(merged.exists(), "{text}");
     assert!(text.contains("r2#17 c started") && text.contains("r2#17 c ended"), "{text}");
     assert!(text.contains("keeps looking for new work until stopped"), "{text}");
+    assert_eq!(text.matches("could not list the issues of o/r:").count(), 1, "{text}");
+    assert!(text.contains("o/r answers again"), "{text}");
     // Done with that, it went on watching, and its board says what it did.
     assert!(still_running, "{text}");
     assert!(done.contains("\"merged\":[17]") && done.contains("\"running\":[]"), "{done}");

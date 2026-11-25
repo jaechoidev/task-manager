@@ -24,6 +24,7 @@ pub mod providers;
 pub mod qualify;
 pub mod queue;
 pub mod rounds;
+pub mod service;
 pub mod state;
 pub mod util;
 pub mod workflow;

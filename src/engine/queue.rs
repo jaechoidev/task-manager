@@ -337,11 +337,31 @@ pub fn run(opts: &Options) -> Result<bool> {
     };
 
     let mut running: Vec<Running> = Vec::new();
+    // Repositories GitHub did not answer for at the last look, and issues
+    // already said to be in another process's hands.
+    let mut unreachable: BTreeSet<String> = BTreeSet::new();
+    let mut left_alone: BTreeSet<String> = BTreeSet::new();
     let mut held_back: Option<String> = None;
     let mut ended_since_handoff = false;
     loop {
         for state in states.iter_mut() {
-            state.all = candidates(&state.repo, &state.label)?;
+            match candidates(&state.repo, &state.label) {
+                Ok(found) => {
+                    state.all = found;
+                    if unreachable.remove(&state.repo) {
+                        println!("  {} answers again", state.repo);
+                    }
+                }
+                // A scheduler that watches outlives a network that doesn't.
+                // Ending here would also cut off every issue at work. What
+                // was listed last stands until GitHub answers again.
+                Err(e) if opts.watch => {
+                    if unreachable.insert(state.repo.clone()) {
+                        eprintln!("warning: could not list the issues of {}: {e:#}. Looking again later", state.repo);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
         // A parked issue whose time has come goes first: it is half done.
         let now = util::now_secs();
@@ -477,7 +497,14 @@ pub fn run(opts: &Options) -> Result<bool> {
         if !status.success() && result.contains(super::ALREADY_RUNNING) {
             // Someone started it by hand, or another scheduler has it. That
             // is not a failure of the issue, and nobody needs to look.
-            println!("  {name} {} left alone: another process is running it", done.candidate.key);
+            if left_alone.insert(name.clone()) {
+                println!("  {name} {} left alone: another process is running it", done.candidate.key);
+            }
+            // A scheduler that watches looks at it again later: the other
+            // process may have ended without finishing it.
+            if opts.watch {
+                state.tried.remove(&number);
+            }
             continue;
         }
         println!("  {name} {} ended after {:.0} s: {result}", done.candidate.key, done.started.elapsed().as_secs_f64());
@@ -496,7 +523,12 @@ pub fn run(opts: &Options) -> Result<bool> {
             // blocks only become ready once it is closed.
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline {
-                let issue = gh::api("GET", &format!("repos/{}/issues/{number}", state.repo), None)?;
+                let issue = match gh::api("GET", &format!("repos/{}/issues/{number}", state.repo), None) {
+                    Ok(issue) => issue,
+                    // Not worth ending a watching scheduler over.
+                    Err(_) if opts.watch => break,
+                    Err(e) => return Err(e.into()),
+                };
                 if issue.get("state").and_then(Value::as_str) == Some("closed") {
                     break;
                 }

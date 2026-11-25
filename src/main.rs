@@ -95,6 +95,12 @@ enum Top {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Keep the scheduler and the API running on this Mac: started at login,
+    /// and started again when they stop
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Start a stuck issue over: close the pull request and delete the
     /// branch its last attempt left, then run it from nothing
     Retry {
@@ -217,6 +223,34 @@ enum ProvidersCommand {
         /// Only this provider
         name: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install both and start them now. Run it again to change how they run
+    Install {
+        /// How many issues may run at once, over all projects. Left out, the
+        /// scheduler decides as `factory schedule` does
+        #[arg(long)]
+        parallel: Option<usize>,
+        /// Finish one project's work before starting the next one's
+        #[arg(long)]
+        in_order: bool,
+        /// Leave every merge to a person
+        #[arg(long)]
+        no_merge: bool,
+        /// Start further issues even while the machine is busy
+        #[arg(long)]
+        no_guard: bool,
+        /// The address the API listens on
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        bind: String,
+    },
+    /// Stop both and remove them. Issues at work pick up where they were
+    /// the next time they are run
+    Uninstall,
+    /// Whether each is installed and running, and where its output goes
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -462,6 +496,22 @@ fn run() -> Result<bool> {
             let parallel = parallel.unwrap_or((config.pool("simulator") as usize).max(2));
             let projects = config.projects.iter().map(|entry| engine::queue::Project { repo_dir: entry.path(), label: entry.label().to_string(), max_parallel: entry.max_parallel }).collect();
             engine::queue::run(&engine::queue::Options { projects, parallel, in_order, watch, no_merge, guard: !no_guard, single: false })
+        }
+
+        Top::Service { command } => {
+            match command {
+                ServiceCommand::Install { parallel, in_order, no_merge, no_guard, bind } => {
+                    if parallel == Some(0) {
+                        bail!("--parallel must be at least 1");
+                    }
+                    let states = engine::service::install(&engine::service::Options { parallel, in_order, no_merge, no_guard, bind })?;
+                    engine::service::print(&states);
+                    println!("Both start at login and are started again when they stop. Label an issue and the scheduler picks it up.");
+                }
+                ServiceCommand::Uninstall => engine::service::uninstall()?.iter().for_each(|line| println!("{line}")),
+                ServiceCommand::Status => engine::service::print(&engine::service::status()?),
+            }
+            Ok(true)
         }
 
         Top::Project { command } => {
