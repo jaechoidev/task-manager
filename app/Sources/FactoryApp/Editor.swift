@@ -281,14 +281,15 @@ struct EditorInspector: View {
             }
             Spacer(minLength: 0)
             if !used, let insert {
-                Text("Add").font(.system(size: 12)).foregroundStyle(Theme.text)
-                    .padding(.horizontal, 8).frame(height: 24)
-                    .background(Color.white, in: RoundedRectangle(cornerRadius: 6))
-                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.control, lineWidth: 1))
-                    .contentShape(Rectangle())
-                    .onTapGesture { insert(module) }
-                    .accessibilityLabel("Add \(module.module) as a step")
-                    .accessibilityAddTraits(.isButton)
+                Button { insert(module) } label: {
+                    Text("Add").font(.system(size: 12)).foregroundStyle(Theme.text)
+                        .padding(.horizontal, 8).frame(height: 24)
+                        .background(Color.white, in: RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.control, lineWidth: 1))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Add \(module.module) as a step")
             }
         }
         .padding(.horizontal, 10).padding(.vertical, 8)
@@ -388,10 +389,12 @@ struct EditorBar: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "chevron.left").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.tertiary)
-                .frame(width: 32, height: 28).contentShape(Rectangle())
-                .onTapGesture(perform: back)
-                .accessibilityLabel("Back to workflow").accessibilityAddTraits(.isButton)
+            Button(action: back) {
+                Image(systemName: "chevron.left").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.tertiary)
+                    .frame(width: 32, height: 28).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Back to workflow")
             HStack(spacing: 6) {
                 Text(repo).foregroundStyle(Theme.secondary)
                 Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold)).foregroundStyle(Theme.idle)
@@ -409,17 +412,19 @@ struct EditorBar: View {
             }
             if busy { ProgressView().controlSize(.small) }
             OutlineButton(title: "Revert", enabled: changed, action: revert)
-            HStack(spacing: 8) {
-                Text("Open a pull request")
-                Text("⌘S").opacity(0.7)
+            Button(action: propose) {
+                HStack(spacing: 8) {
+                    Text("Open a pull request")
+                    Text("⌘S").opacity(0.7)
+                }
+                .font(.system(size: 13, weight: .medium)).foregroundStyle(canPropose ? Color.white : Theme.idle)
+                .padding(.horizontal, 12).frame(height: 28)
+                .background(canPropose ? Theme.accent : Theme.hairline, in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
             }
-            .font(.system(size: 13, weight: .medium)).foregroundStyle(canPropose ? Color.white : Theme.idle)
-            .padding(.horizontal, 12).frame(height: 28)
-            .background(canPropose ? Theme.accent : Theme.hairline, in: RoundedRectangle(cornerRadius: 6))
-            .contentShape(Rectangle())
-            .onTapGesture { if canPropose { propose() } }
+            .buttonStyle(.plain)
+            .disabled(!canPropose)
             .help(canPropose ? "Opens a pull request with this draft" : (changed ? "Fix the problems first" : "Nothing has changed"))
-            .accessibilityAddTraits(.isButton)
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
         .background(Theme.band)

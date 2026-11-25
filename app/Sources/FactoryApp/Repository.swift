@@ -155,12 +155,15 @@ struct WorkflowPane: View {
     }
 }
 
-/// Calls and time per vendor, with a bar for the time.
+/// Calls and tokens per vendor, with a bar for the tokens. An engine that
+/// does not count tokens gets the calls and the limits only.
 struct UsagePane: View {
     var usage: [UsageRow]
 
     var body: some View {
-        let longest = usage.map(\.seconds).max() ?? 0
+        let most = usage.compactMap(\.tokens).max() ?? 0
+        let counted = most > 0
+        let missing = usage.map { $0.calls - ($0.tokenCalls ?? $0.calls) }.reduce(0, +)
         VStack(alignment: .leading, spacing: 20) {
             ScreenTitle(over: "every issue this machine has run", title: "Usage")
             VStack(alignment: .leading, spacing: 10) {
@@ -170,30 +173,44 @@ struct UsagePane: View {
                 } else {
                     Boxed {
                         VStack(spacing: 0) {
-                            row("Vendor", "Calls", nil, "Time", "Usage limits hit", header: true)
+                            row("Vendor", "Calls", nil, counted ? "Tokens" : "", "", "Usage limits hit", header: true, counted: counted)
                             ForEach(usage) { entry in
                                 Rectangle().fill(Theme.hairline).frame(height: 1)
-                                row(entry.vendor, "\(entry.calls)", (longest > 0 ? entry.seconds / longest : 0, Theme.vendor(entry.vendor).bar), duration(entry.seconds), "\(entry.rateLimited)", header: false, warn: entry.rateLimited > 0)
+                                row(
+                                    entry.vendor, "\(entry.calls)",
+                                    entry.tokens.map { (Double($0) / Double(most), Theme.vendor(entry.vendor).bar) },
+                                    entry.tokens.map(tokenCount) ?? "", tokenDetail(entry), "\(entry.rateLimited)",
+                                    header: false, counted: counted, warn: entry.rateLimited > 0
+                                )
                             }
                         }
                     }
+                    if counted {
+                        Text("Tokens are what each program counted for its own calls: everything sent to the model, cached or not, and everything it wrote." + (missing > 0 ? " \(missing) call\(missing == 1 ? " has" : "s have") no count." : ""))
+                            .font(.system(size: 12)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
-            .frame(maxWidth: 760, alignment: .leading)
+            .frame(maxWidth: 860, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func row(_ vendor: String, _ calls: String, _ bar: (Double, Color)?, _ time: String, _ limits: String, header: Bool, warn: Bool = false) -> some View {
+    private func row(_ vendor: String, _ calls: String, _ bar: (Double, Color)?, _ tokens: String, _ detail: String, _ limits: String, header: Bool, counted: Bool, warn: Bool = false) -> some View {
         HStack(spacing: 14) {
             Text(vendor).fontWeight(header ? .semibold : .medium).frame(width: 110, alignment: .leading)
             Text(calls).frame(width: 60, alignment: .trailing)
-            if let bar {
-                MeterBar(share: bar.0, color: bar.1, height: 8)
+            if counted {
+                Text(tokens).frame(width: 64, alignment: .trailing)
+                if let bar {
+                    MeterBar(share: bar.0, color: bar.1, height: 8).frame(minWidth: 80)
+                } else {
+                    Spacer(minLength: 0)
+                }
+                Text(detail).font(.system(size: 12).monospacedDigit()).foregroundStyle(Theme.secondary).lineLimit(1).frame(width: 240, alignment: .leading)
             } else {
                 Spacer(minLength: 0)
             }
-            Text(time).frame(width: 96, alignment: .leading)
             Text(limits).foregroundStyle(warn ? Theme.amber : (header ? Theme.secondary : Theme.text)).frame(width: 120, alignment: .trailing)
         }
         .font(.system(size: header ? 12 : 13, weight: header ? .semibold : .regular).monospacedDigit())

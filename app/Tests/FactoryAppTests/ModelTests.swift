@@ -232,6 +232,17 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(engineLine(address: "http://127.0.0.1:7878", reached: false, updated: nil, now: Date()), "No answer from the engine at 127.0.0.1:7878")
     }
 
+    func testUsageShowsTokensWhenTheEngineCountsThem() throws {
+        let json = #"[{"vendor":"claude","calls":48,"seconds":824.0,"rate_limited":0,"tokens_in":2134567,"tokens_cached":1900000,"tokens_out":34012,"token_calls":47},{"vendor":"codex","calls":9,"seconds":301.0,"rate_limited":1}]"#
+        let usage = try JSONDecoder.api.decode([UsageRow].self, from: Data(json.utf8))
+        XCTAssertEqual(usage[0].tokens, 2_168_579)
+        XCTAssertEqual(tokenDetail(usage[0]), "2.1M in (1.9M cached) · 34.0k out")
+        // An older engine sends no counts, and a row without them has no total.
+        XCTAssertNil(usage[1].tokens)
+        XCTAssertEqual(tokenDetail(usage[1]), "")
+        XCTAssertEqual([812, 45_321, 123_456, 999_949, 2_134_567, 123_456_789].map(tokenCount), ["812", "45.3k", "123k", "1.0M", "2.1M", "123M"])
+    }
+
     func testAnArrowToAStepThatIsNotThereIsLeftOut() throws {
         var workflow = try workflow()
         workflow.onFail = ["verify": "develop", "review": "nowhere", "acceptance": "develop"]

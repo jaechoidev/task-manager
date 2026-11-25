@@ -143,12 +143,19 @@ fn log_json(home: &Path, row: &IssueRow, file: Option<&str>) -> Value {
     }
 }
 
-/// Calls and time per vendor, and how often a usage limit was hit.
+/// Calls and tokens per vendor, and how often a usage limit was hit. The
+/// tokens are what each program counted for its own calls. `token_calls`
+/// is how many of the calls have a count: a call that failed early has none.
 fn usage_json(store: &Store) -> Result<Value> {
     let mut by_vendor: BTreeMap<String, (u64, f64, u64)> = BTreeMap::new();
+    let mut tokens: BTreeMap<String, (u64, u64, u64, u64)> = BTreeMap::new();
     for row in store.issues()? {
         for ran in store.steps(&row.repo, row.number, &row.run_id)? {
             let Some(vendor) = ran.vendor else { continue };
+            if let Some((input, cached, output)) = ran.tokens {
+                let sum = tokens.entry(vendor.clone()).or_default();
+                *sum = (sum.0 + input, sum.1 + cached, sum.2 + output, sum.3 + 1);
+            }
             let entry = by_vendor.entry(vendor).or_default();
             entry.0 += 1;
             entry.1 += ran.duration_ms as f64 / 1000.0;
@@ -157,7 +164,13 @@ fn usage_json(store: &Store) -> Result<Value> {
             }
         }
     }
-    let list: Vec<Value> = by_vendor.into_iter().map(|(vendor, (calls, seconds, limited))| json!({ "vendor": vendor, "calls": calls, "seconds": seconds, "rate_limited": limited })).collect();
+    let list: Vec<Value> = by_vendor
+        .into_iter()
+        .map(|(vendor, (calls, seconds, limited))| {
+            let (input, cached, output, counted) = tokens.get(&vendor).copied().unwrap_or_default();
+            json!({ "vendor": vendor, "calls": calls, "seconds": seconds, "rate_limited": limited, "tokens_in": input, "tokens_cached": cached, "tokens_out": output, "token_calls": counted })
+        })
+        .collect();
     Ok(json!(list))
 }
 
@@ -252,6 +265,15 @@ pub fn route(context: &Context_, request: &Request) -> (u16, Value) {
             }
             ("GET", ["v1", "usage"]) => (200, usage_json(&store)?),
             ("GET", ["v1", "schedule"]) => (200, schedule_json(&context.home, &store)?),
+            // Reading the plans takes a call to each provider, so it runs on
+            // its own. The readings show up in the schedule when it is done.
+            ("POST", ["v1", "quota", "refresh"]) => {
+                let log = context.home.join("checks").join("refresh.log");
+                std::fs::create_dir_all(context.home.join("checks"))?;
+                let out = std::fs::File::create(&log)?;
+                Command::new(&context.program).args(["providers", "refresh"]).stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out).spawn().context("starting factory providers refresh")?;
+                (202, json!({ "ok": true, "started": true, "log": log.display().to_string() }))
+            }
             ("GET", ["v1", "capacity"]) => (200, serde_json::to_value(super::capacity::read())?),
             ("GET", ["v1", "workflow"]) | ("GET", ["v1", "modules"]) | ("POST", ["v1", "workflow", "validate"]) | ("POST", ["v1", "workflow", "propose"]) | ("POST", ["v1", "modules"]) => {
                 let repo = request.query.get("repo").cloned().or_else(|| context.repos.keys().next().cloned()).unwrap_or_default();
@@ -442,6 +464,9 @@ mod tests {
                 stdout: None,
                 stderr: None,
                 session_id: None,
+                tokens_in: vendor.map(|_| 1_000),
+                tokens_cached: vendor.map(|_| 600),
+                tokens_out: vendor.map(|_| 50),
             })
             .unwrap();
     }
@@ -494,7 +519,7 @@ mod tests {
         assert_eq!(get(&context, "/v1/issues/o/r/7/log?file=..%2F..%2Fstate.db").1["file"], Value::Null);
 
         let (_, usage) = get(&context, "/v1/usage");
-        assert_eq!(usage[0], json!({ "vendor": "codex", "calls": 2, "seconds": 60.0, "rate_limited": 1 }));
+        assert_eq!(usage[0], json!({ "vendor": "codex", "calls": 2, "seconds": 60.0, "rate_limited": 1, "tokens_in": 2_000, "tokens_cached": 1_200, "tokens_out": 100, "token_calls": 2 }));
 
         assert_eq!(get(&context, "/v1/issues/o/r/99").0, 404);
         assert_eq!(get(&context, "/v2/issues").0, 404);

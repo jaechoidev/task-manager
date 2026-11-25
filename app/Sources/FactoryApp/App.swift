@@ -109,11 +109,16 @@ struct RootView: View {
         case .schedule:
             page {
                 if let schedule = model.schedule {
-                    SchedulePane(schedule: schedule, project: model.project) { id in
-                        model.selected = id
-                        screen = .issue
-                        Task { await model.refresh() }
-                    }
+                    SchedulePane(
+                        schedule: schedule, project: model.project,
+                        open: { id in
+                            model.selected = id
+                            screen = .issue
+                            Task { await model.refresh() }
+                        },
+                        refreshQuota: { Task { await model.refreshQuota() } },
+                        refreshing: model.quotaRefreshing
+                    )
                 } else {
                     missing("This engine does not report its schedule. Build a newer `factory`.")
                 }

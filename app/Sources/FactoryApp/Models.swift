@@ -291,7 +291,36 @@ struct UsageRow: Codable, Equatable, Identifiable {
     var calls: Int
     var seconds: Double
     var rateLimited: Int
+    /// Tokens as each program counted them for its own calls: all input,
+    /// the part of it read from a cache, and the output. Missing from an
+    /// engine that does not keep them.
+    var tokensIn: Int?
+    var tokensCached: Int?
+    var tokensOut: Int?
+    /// How many of the calls have a count. A call that failed early has none.
+    var tokenCalls: Int?
     var id: String { vendor }
+
+    /// Input and output together, when the engine counted any.
+    var tokens: Int? {
+        guard let tokensIn, let tokensOut, (tokenCalls ?? 0) > 0 else { return nil }
+        return tokensIn + tokensOut
+    }
+}
+
+/// A token count in a few characters: `812`, `45.3k`, `2.1M`.
+func tokenCount(_ count: Int) -> String {
+    let value = Double(count)
+    if count < 1_000 { return "\(count)" }
+    if count < 999_500 { return String(format: value < 99_950 ? "%.1fk" : "%.0fk", value / 1_000) }
+    return String(format: value < 99_950_000 ? "%.1fM" : "%.0fM", value / 1_000_000)
+}
+
+/// What a vendor's tokens were made of: `2.1M in (1.9M cached) · 34.0k out`.
+func tokenDetail(_ row: UsageRow) -> String {
+    guard let input = row.tokensIn, let output = row.tokensOut else { return "" }
+    let cached = (row.tokensCached ?? 0) > 0 ? " (\(tokenCount(row.tokensCached ?? 0)) cached)" : ""
+    return "\(tokenCount(input)) in\(cached) · \(tokenCount(output)) out"
 }
 
 struct Health: Codable {

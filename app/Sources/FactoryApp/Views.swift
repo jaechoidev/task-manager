@@ -100,19 +100,21 @@ struct SidebarPane: View {
 
     private func place(_ target: Screen, _ title: String, icon: String, badge: String?) -> some View {
         let on = screen == target
-        return HStack(spacing: 8) {
-            Image(systemName: icon).font(.system(size: 13)).foregroundStyle(on ? Color.white : Theme.accent).frame(width: 16)
-            Text(title).font(.system(size: 13)).foregroundStyle(on ? Color.white : Theme.text)
-            Spacer(minLength: 0)
-            if let badge {
-                Text(badge).font(.system(size: 12).monospacedDigit()).foregroundStyle(on ? Color.white : Theme.secondary)
+        return Button { go(target) } label: {
+            HStack(spacing: 8) {
+                Image(systemName: icon).font(.system(size: 13)).foregroundStyle(on ? Color.white : Theme.accent).frame(width: 16)
+                Text(title).font(.system(size: 13)).foregroundStyle(on ? Color.white : Theme.text)
+                Spacer(minLength: 0)
+                if let badge {
+                    Text(badge).font(.system(size: 12).monospacedDigit()).foregroundStyle(on ? Color.white : Theme.secondary)
+                }
             }
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(on ? Theme.accent : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, 8).padding(.vertical, 5)
-        .background(on ? Theme.accent : Color.clear, in: RoundedRectangle(cornerRadius: 6))
-        .contentShape(Rectangle())
-        .onTapGesture { go(target) }
-        .accessibilityAddTraits(.isButton)
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
     }
 
     @ViewBuilder
@@ -129,8 +131,10 @@ struct SidebarPane: View {
                 .padding(.horizontal, 8).padding(.bottom, 6)
         }
         ForEach(members) { issue in
-            IssueRowView(issue: issue, selected: screen == .issue && issue.id == selected, showRepo: several, parked: parked.contains(issue.id))
-                .onTapGesture { select(issue.id) }
+            Button { select(issue.id) } label: {
+                IssueRowView(issue: issue, selected: screen == .issue && issue.id == selected, showRepo: several, parked: parked.contains(issue.id))
+            }
+            .buttonStyle(.plain)
         }
     }
 }
@@ -319,6 +323,8 @@ struct IssueDetailPane: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture { toggleLooked(key) }
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityLabel((done ? "Looked at: " : "To look at: ") + item)
                 }
             }
             .padding(.horizontal, 18).padding(.vertical, 16)

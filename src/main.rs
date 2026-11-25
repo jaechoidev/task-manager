@@ -211,6 +211,12 @@ enum ProvidersCommand {
         #[arg(long)]
         tier: Option<String>,
     },
+    /// Read every provider's plan now. Z.ai is asked directly. Claude and
+    /// Codex each get one small call, because they only say it in a reply
+    Refresh {
+        /// Only this provider
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -626,6 +632,13 @@ fn run() -> Result<bool> {
         Top::Providers { command: Some(ProvidersCommand::Check { name, tier }), .. } => {
             let results = engine::qualify::run(&engine::util::home()?, &name, tier.as_deref())?;
             Ok(results.iter().all(|checked| checked.qualified))
+        }
+
+        Top::Providers { command: Some(ProvidersCommand::Refresh { name }), .. } => {
+            for line in engine::qualify::refresh(&engine::util::home()?, name.as_deref())? {
+                println!("{line}");
+            }
+            Ok(true)
         }
 
         Top::Providers { format, command: None } => {

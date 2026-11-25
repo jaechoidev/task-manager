@@ -224,6 +224,38 @@ pub fn launch(call: &Call, schema: &Path, output: &Path) -> Result<Launch> {
     }
 }
 
+/// How many tokens a call used, as the program itself counted them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tokens {
+    /// Everything sent to the model, cached or not.
+    pub input: u64,
+    /// The part of the input that was read from a cache.
+    pub cached: u64,
+    pub output: u64,
+}
+
+/// The token counts in what a call printed. Claude gives them in its
+/// result, with cached input counted apart from the rest. Codex gives them
+/// once per turn, with cached input as a part of the input. Told apart by
+/// shape, so a log can be read without knowing which program wrote it.
+pub fn tokens(stdout: &str) -> Option<Tokens> {
+    let number = |usage: &Value, key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let lines: Vec<Value> = stdout.lines().filter(|line| line.contains("\"usage\"")).filter_map(|line| serde_json::from_str(line).ok()).collect();
+    if let Some(usage) = lines.iter().rev().find(|line| line.get("type").and_then(Value::as_str) == Some("result")).and_then(|result| result.get("usage")).filter(|usage| usage.is_object()) {
+        let (fresh, written, read) = (number(usage, "input_tokens"), number(usage, "cache_creation_input_tokens"), number(usage, "cache_read_input_tokens"));
+        return Some(Tokens { input: fresh + written + read, cached: read, output: number(usage, "output_tokens") });
+    }
+    let turns: Vec<&Value> = lines.iter().filter(|line| line.get("type").and_then(Value::as_str) == Some("turn.completed")).filter_map(|turn| turn.get("usage")).collect();
+    if turns.is_empty() {
+        return None;
+    }
+    Some(turns.iter().fold(Tokens::default(), |sum, usage| Tokens {
+        input: sum.input + number(usage, "input_tokens"),
+        cached: sum.cached + number(usage, "cached_input_tokens"),
+        output: sum.output + number(usage, "output_tokens"),
+    }))
+}
+
 /// Signs that a call failed because a usage or rate limit was reached. Each
 /// CLI words this differently and neither documents a stable format, so this
 /// looks for the phrases both use.
@@ -476,6 +508,19 @@ mod tests {
         assert_eq!(read_claude(&cut).2.as_deref(), Some("claude did not print a JSON result"));
         // No event, no reading. Text that only mentions one is not an event.
         assert_eq!(claude_limits("{\"type\":\"assistant\",\"message\":\"a rate_limit_event is printed\"}"), None);
+    }
+
+    #[test]
+    fn token_counts_are_read_from_what_either_program_prints() {
+        // Claude: cached input is counted apart, so the input is the sum.
+        let claude = "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":999}}}\n{\"type\":\"result\",\"usage\":{\"input_tokens\":4,\"cache_creation_input_tokens\":7104,\"cache_read_input_tokens\":82402,\"output_tokens\":653}}\n";
+        assert_eq!(tokens(claude), Some(Tokens { input: 89_510, cached: 82_402, output: 653 }));
+        // Codex: one record per turn, cached input a part of the input.
+        let codex = "{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":224123,\"cached_input_tokens\":185856,\"output_tokens\":809}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1000,\"cached_input_tokens\":0,\"output_tokens\":10}}\n";
+        assert_eq!(tokens(codex), Some(Tokens { input: 225_123, cached: 185_856, output: 819 }));
+        // A call that failed before it counted anything has no count.
+        assert_eq!(tokens("{\"type\":\"error\",\"message\":\"usage limit\"}"), None);
+        assert_eq!(tokens(""), None);
     }
 
     #[test]

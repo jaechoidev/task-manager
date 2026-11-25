@@ -277,9 +277,98 @@ pub fn run(home: &Path, name: &str, tier: Option<&str>) -> Result<Vec<Checked>> 
     Ok(results)
 }
 
+/// The tier a plan is read through: `fast` when the provider has one, else
+/// the first by name. The plan is the same whichever model answers, so the
+/// cheapest is the one to ask. Only a tier that passed its check is used.
+pub fn tier_to_ask<'a>(tiers: impl Iterator<Item = &'a String>, qualified: impl Fn(&str) -> bool) -> Option<String> {
+    let mut passed: Vec<&String> = tiers.filter(|tier| qualified(tier)).collect();
+    passed.sort_by_key(|tier| (tier.as_str() != "fast", tier.as_str()));
+    passed.first().map(|tier| tier.to_string())
+}
+
+/// Reads every provider's plan now, or one provider's.
+///
+/// Z.ai is asked directly, which costs nothing. Claude and Codex only say
+/// how much of the plan is used as part of a reply, so each gets one small
+/// call, on its cheapest checked tier, in an empty folder with nothing to
+/// read. Returns a line per provider.
+pub fn refresh(home: &Path, only: Option<&str>) -> Result<Vec<String>> {
+    let set = providers::Providers::load(home)?.ok_or_else(|| anyhow!("no providers file at {}", providers::Providers::file(home).display()))?;
+    if let Some(name) = only {
+        if !set.providers.contains_key(name) {
+            return Err(anyhow!("no provider {name} in {}", providers::Providers::file(home).display()));
+        }
+    }
+    let store = load(home);
+    let config = super::config::Config::load(home).unwrap_or_default();
+    let mut lines = Vec::new();
+    for (name, provider) in set.providers.iter().filter(|(name, _)| only.is_none_or(|only| only == name.as_str())) {
+        let said = |reading: &super::ledger::Reading| reading.windows.join(". ");
+        if let (Some(providers::Quota::Zai), Some(env_file)) = (provider.quota, &provider.env_file) {
+            lines.push(match super::ledger::read_zai_now(home, name, &providers::expand(env_file))? {
+                Some(reading) => format!("{name}: {}", said(&reading)),
+                None => format!("{name}: its quota report could not be read"),
+            });
+            continue;
+        }
+        if provider.cli == providers::Cli::Agy {
+            lines.push(format!("{name}: nothing to read. Its program does not say how much of the plan is used"));
+            continue;
+        }
+        let asked = tier_to_ask(provider.tiers.keys(), |tier| provider.tiers.get(tier).is_some_and(|entry| current(&store, name, tier, entry.model()).is_some_and(|checked| checked.qualified)));
+        let Some((tier, runner)) = asked.and_then(|tier| provider.runner(&tier).map(|runner| (tier, runner))) else {
+            lines.push(format!("{name}: not asked. No tier of it has passed `factory providers check`"));
+            continue;
+        };
+        let at = now();
+        let dir = home.join("checks").join(format!("refresh-{name}-{at}"));
+        let inside = dir.join("inside");
+        std::fs::create_dir_all(&inside).with_context(|| format!("creating {}", inside.display()))?;
+        // Codex refuses to work outside a git repository.
+        let _ = std::process::Command::new("git").args(["init", "-q"]).current_dir(&inside).status();
+        // A call like any other: it takes one of the provider's places.
+        let _slot = match config.vendor_pool(name) {
+            Some(size) => Some(super::lock::acquire_slot(home, name, size, None, &|| {})?),
+            None => None,
+        };
+        let reply = agent::call(&Call {
+            runner: &runner,
+            access: Access::ReadOnly,
+            cwd: &inside,
+            prompt: "Reply with `ok` set to true. Do nothing else.",
+            schema: r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#,
+            dir: &dir,
+            stem: "refresh",
+            timeout: Duration::from_secs(180),
+            resume: None,
+            web: false,
+        })?;
+        lines.push(match reply.quota {
+            Some(reading) => {
+                let line = format!("{name}: {} (asked through {tier})", said(&reading));
+                super::ledger::note(home, name, reading)?;
+                line
+            }
+            None => format!("{name}: the call through {tier} said nothing about the plan{}", reply.error.map(|error| format!(": {error}")).unwrap_or_default()),
+        });
+    }
+    Ok(lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_is_read_through_the_cheapest_checked_tier() {
+        let tiers: Vec<String> = ["high", "fast", "standard"].iter().map(|tier| tier.to_string()).collect();
+        assert_eq!(tier_to_ask(tiers.iter(), |_| true).as_deref(), Some("fast"));
+        // `fast` did not pass its check: the first that did, by name.
+        assert_eq!(tier_to_ask(tiers.iter(), |tier| tier != "fast").as_deref(), Some("high"));
+        assert_eq!(tier_to_ask(tiers.iter(), |_| false), None);
+        let named: Vec<String> = ["sol", "astra", "configured"].iter().map(|tier| tier.to_string()).collect();
+        assert_eq!(tier_to_ask(named.iter(), |_| true).as_deref(), Some("astra"));
+    }
 
     #[test]
     fn the_home_probe_removes_itself() {

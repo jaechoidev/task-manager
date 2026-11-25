@@ -264,7 +264,8 @@ It is generated from the state database and the run files, with no LLM call, and
 | `POST /v1/workflow/validate?repo=...` | Checks the workflow file in the request body. Answers the problems, or the graph |
 | `POST /v1/workflow/propose?repo=...` | Checks it, then opens a pull request for it |
 | `POST /v1/modules?repo=...` | Scaffolds `{"module": "<kind>/<name>", "role": ...}` into a pull request |
-| `GET /v1/usage` | Calls, time and usage limits hit, per vendor |
+| `GET /v1/usage` | Calls, tokens and usage limits hit, per vendor. Tokens are what each program counted for its own calls: all input, the cached part of it, and output |
+| `POST /v1/quota/refresh` | Starts `factory providers refresh`, which reads every provider's plan again |
 | `GET /v1/schedule` | What runs where: each running scheduler's places with what holds them, what waits and what for, what is parked until when, who holds each slot of each pool, and who is out of quota |
 | `GET /v1/capacity` | What `factory capacity` reports, as data |
 | `POST /v1/issues/<owner>/<repo>/<n>/retry` | Starts `factory retry` for the issue |
@@ -477,7 +478,9 @@ A call that fails with signs of a usage or rate limit is not a failed attempt. T
 
 Codex documents no stable format for a failed call, so there the engine looks for the phrases a limit is worded with ("usage limit", "rate limit", "429", "too many requests") in the error and in error lines of the output. It does the same for Claude when Claude's own event does not say.
 
-`factory providers` prints each provider's latest reading and when it was read. `GET /v1/schedule` and the app's Schedule pane show the same.
+`factory providers` prints each provider's latest reading and when it was read. `GET /v1/schedule` and the app's Schedule screen show the same.
+
+`factory providers refresh` reads every plan now, or one provider's when it is named. Z.ai is asked directly, which costs nothing. Claude and Codex only say it in a reply, so each gets one small call on its cheapest checked tier, in an empty folder. The refresh button beside Quota in the app does the same.
 
 ## Modules
 

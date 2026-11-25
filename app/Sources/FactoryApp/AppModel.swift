@@ -34,6 +34,30 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.set(Array(looked).sorted(), forKey: "looked")
     }
 
+    /// Until when the Quota heading says the providers are being asked.
+    @Published var quotaAskedUntil: Date?
+    /// The newest reading there was when the providers were asked.
+    private var quotaSeenAt = 0
+
+    var quotaRefreshing: Bool {
+        guard let until = quotaAskedUntil, until > Date() else { return false }
+        // Done as soon as every reading is newer than when it was asked.
+        let oldest = schedule?.quota.map(\.at).min() ?? 0
+        return oldest <= quotaSeenAt
+    }
+
+    /// Asks the engine to read every provider's plan again.
+    func refreshQuota() async {
+        quotaSeenAt = schedule?.quota.map(\.at).max() ?? 0
+        do {
+            try await client.post("quota/refresh")
+            quotaAskedUntil = Date().addingTimeInterval(90)
+        } catch {
+            notice = "Could not ask the providers: \(error.localizedDescription)"
+        }
+        await refresh()
+    }
+
     private var loop: Task<Void, Never>?
     private var knownStuck: Set<String> = []
 

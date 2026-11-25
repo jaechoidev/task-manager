@@ -8,6 +8,10 @@ struct SchedulePane: View {
     var project: String?
     /// Opens an issue, by its id.
     var open: (String) -> Void = { _ in }
+    /// Asks every provider for its plan again. Nil leaves the button out.
+    var refreshQuota: (() -> Void)?
+    /// Set while the providers are being asked.
+    var refreshing = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
@@ -65,9 +69,25 @@ struct SchedulePane: View {
                 }
             }
 
-            if !schedule.out.isEmpty || !schedule.quota.isEmpty {
-                VStack(alignment: .leading, spacing: 12) {
-                    SectionTitle(title: "Quota")
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    SectionTitle(title: "Quota", note: refreshing ? "asking each provider..." : nil)
+                    if let refreshQuota, !refreshing {
+                        Button(action: refreshQuota) {
+                            Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.tertiary)
+                                .frame(width: 26, height: 24)
+                                .background(Color.white, in: RoundedRectangle(cornerRadius: 6))
+                                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.control, lineWidth: 1))
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Reads every plan again. Z.ai is asked directly. Claude and ChatGPT each get one small call, because they only say it in a reply.")
+                        .accessibilityLabel("Refresh quota")
+                    }
+                }
+                if schedule.out.isEmpty && schedule.quota.isEmpty {
+                    Text("No plan has been read yet.").font(.system(size: 13)).foregroundStyle(Theme.secondary)
+                } else {
                     Columns(minimum: 300, spacing: 12) {
                         ForEach(schedule.out) { entry in
                             setAside(entry)

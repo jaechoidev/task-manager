@@ -187,21 +187,24 @@ struct SectionTitle: View {
     }
 }
 
-/// A button drawn as the design's outlined control. Plain shapes and a tap,
-/// so it also draws to an image.
+/// A button drawn as the design's outlined control. A real button, so a
+/// click, the keyboard and an assistive press all reach it, with a plain
+/// style so that it looks as drawn here and also draws to an image.
 struct OutlineButton: View {
     var title: String
     var enabled = true
     var action: () -> Void
 
     var body: some View {
-        Text(title).font(.system(size: 13)).foregroundStyle(enabled ? Theme.text : Theme.idle)
-            .padding(.horizontal, 12).frame(height: 28)
-            .background(Color.white, in: RoundedRectangle(cornerRadius: 6))
-            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.control, lineWidth: 1))
-            .contentShape(Rectangle())
-            .onTapGesture { if enabled { action() } }
-            .accessibilityAddTraits(.isButton)
+        Button(action: action) {
+            Text(title).font(.system(size: 13)).foregroundStyle(enabled ? Theme.text : Theme.idle)
+                .padding(.horizontal, 12).frame(height: 28)
+                .background(Color.white, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.control, lineWidth: 1))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
     }
 }
 

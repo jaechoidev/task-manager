@@ -11,7 +11,7 @@ The app had grown pane by pane: a list, a detail view and a row of tabs. A desig
 | Workflow and usage | The graph with dashed red return lines, the four limit cards, the usage table with bars | Drawn from a real workflow |
 | Edit workflow | The bar with the problem count, the graph with refused steps, numbered lines with the engine's word under a bad line, the inspector | Drawn from a real workflow file with a wrong module name |
 
-The app has 14 tests. The real window was looked at once, on the Usage screen: the toolbar, the sidebar and the screen are there. No other screen was clicked through in the real window.
+The app has 15 tests. In the real window the Issue, Schedule and Usage screens were looked at, the sidebar was used to move between them, and the refresh button beside Quota was pressed: all three plans were read again within twelve seconds. The Workflow screen, the editor, the filter, the project picker and the two buttons of a stuck issue were not tried in the real window.
 
 ![The issue screen, from a real run](img/2026-11-24-redesign-issue.png)
 
@@ -41,11 +41,13 @@ The app has 14 tests. The real window was looked at once, on the Usage screen: t
 1. **A module was "in use" that was not.** A draft that names `check/verifyy` also contains the text `check/verify`. The check now asks for the exact name.
 2. **Long items were cut to one line** when drawn to an image. Text in a row now takes the height it needs.
 3. **Lazy grids and scroll views draw nothing to an image.** The cards use a small layout of their own, and the graph scrolls sideways only in a window.
-4. **Screen capture is not allowed from this shell,** so the real window could not be captured by a command. It was looked at through the desktop control the app's owner approved.
+4. **A drawn button did not answer a press.** The first controls were shapes with a tap handler, so that they would draw to an image. Pressed through the system's accessibility, the refresh button did nothing. Every control that acts is now a real button with a plain style, which draws the same and answers a click, the keyboard and an assistive press.
+5. **Screen capture is not allowed from this shell,** so the real window could not be captured by a command. It was looked at through the desktop control the app's owner approved.
 
 ## Open items
 
-- **Nobody has clicked through the real window.** Filter, picker, ticking an item, opening the editor and the two buttons of a stuck issue are untested by hand.
+- **Most of the real window is still untried by hand.** Filter, picker, ticking an item, opening the editor and the two buttons of a stuck issue.
+- **Usage no longer follows the canvas.** At the owner's word it shows calls as a number and tokens with a bar, and no time. The canvas still draws time.
 - **The canvas was still changing** while this was built: the Schedule artboard arrived during the day. This follows the version read at 05:30 UTC on 2026-11-25.
 - **The editor's gutter while typing.**
 - **Dark mode.**

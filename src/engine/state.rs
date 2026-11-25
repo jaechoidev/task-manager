@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS steps (
     module       TEXT NOT NULL,
     vendor       TEXT,
     model        TEXT,
+    tokens_in    INTEGER,
+    tokens_cached INTEGER,
+    tokens_out   INTEGER,
     round        INTEGER NOT NULL DEFAULT 0,
     attempt      INTEGER NOT NULL,
     sha          TEXT,
@@ -83,6 +86,11 @@ pub struct StepRecord {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub session_id: Option<String>,
+    /// What an agent call used, as its program counted it: all input, the
+    /// part of it read from a cache, and the output.
+    pub tokens_in: Option<u64>,
+    pub tokens_cached: Option<u64>,
+    pub tokens_out: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +125,25 @@ pub struct Ran {
     pub duration_ms: u64,
     /// 0 for the first pass.
     pub round: u32,
+    /// Tokens the call used: all input, the cached part of it, and output.
+    /// Empty for a step that is not an agent call, or that counted nothing.
+    pub tokens: Option<(u64, u64, u64)>,
+}
+
+/// Reads the token counts of agent calls made before the database kept
+/// them, from each call's own output file next to its reply.
+fn backfill_tokens(db: &Connection) -> Result<()> {
+    let calls: Vec<(i64, String)> = {
+        let mut statement = db.prepare("SELECT id, output_path FROM steps WHERE vendor IS NOT NULL AND output_path IS NOT NULL")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, output) in calls {
+        let Some(stem) = output.strip_suffix(".out.json") else { continue };
+        let Some(found) = std::fs::read_to_string(format!("{stem}.stdout.log")).ok().and_then(|text| super::agent::tokens(&text)) else { continue };
+        db.execute("UPDATE steps SET tokens_in = ?2, tokens_cached = ?3, tokens_out = ?4 WHERE id = ?1", params![id, found.input, found.cached, found.output])?;
+    }
+    Ok(())
 }
 
 pub struct Store {
@@ -140,6 +167,14 @@ impl Store {
         let has_model = db.prepare("SELECT 1 FROM pragma_table_info('steps') WHERE name = 'model'")?.exists([])?;
         if !has_model {
             db.execute_batch("ALTER TABLE steps ADD COLUMN model TEXT")?;
+        }
+        // Databases from before tokens were kept have no token columns. The
+        // calls made until then still have their output on disk, so their
+        // counts are read from there once.
+        let has_tokens = db.prepare("SELECT 1 FROM pragma_table_info('steps') WHERE name = 'tokens_in'")?.exists([])?;
+        if !has_tokens {
+            db.execute_batch("ALTER TABLE steps ADD COLUMN tokens_in INTEGER; ALTER TABLE steps ADD COLUMN tokens_cached INTEGER; ALTER TABLE steps ADD COLUMN tokens_out INTEGER")?;
+            backfill_tokens(&db)?;
         }
         // Databases from before parking have no `wake_at` column.
         let has_wake = db.prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name = 'wake_at'")?.exists([])?;
@@ -213,8 +248,9 @@ impl Store {
     pub fn record(&self, step: &StepRecord) -> Result<()> {
         self.db.execute(
             "INSERT INTO steps (repo, number, run_id, step, kind, module, vendor, attempt, sha, exit_code, timed_out,
-                                verdict, duration_ms, input_path, output_path, session_id, finished_at, round, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                                verdict, duration_ms, input_path, output_path, session_id, finished_at, round, model,
+                                tokens_in, tokens_cached, tokens_out)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 step.repo,
                 step.issue,
@@ -234,7 +270,10 @@ impl Store {
                 step.session_id,
                 step.ts,
                 step.round,
-                step.model
+                step.model,
+                step.tokens_in,
+                step.tokens_cached,
+                step.tokens_out
             ],
         )?;
         let mut file = OpenOptions::new().create(true).append(true).open(&self.log)?;
@@ -274,7 +313,7 @@ impl Store {
     /// Steps of one run, oldest first.
     pub fn steps(&self, repo: &str, number: u64, run_id: &str) -> Result<Vec<Ran>> {
         let mut statement = self.db.prepare(
-            "SELECT step, vendor, model, attempt, verdict, exit_code, duration_ms, round FROM steps
+            "SELECT step, vendor, model, attempt, verdict, exit_code, duration_ms, round, tokens_in, tokens_cached, tokens_out FROM steps
              WHERE repo = ?1 AND number = ?2 AND run_id = ?3 ORDER BY id",
         )?;
         let rows = statement.query_map(params![repo, number, run_id], |row| {
@@ -287,6 +326,10 @@ impl Store {
                 exit_code: row.get(5)?,
                 duration_ms: row.get(6)?,
                 round: row.get(7)?,
+                tokens: match (row.get::<_, Option<u64>>(8)?, row.get::<_, Option<u64>>(9)?, row.get::<_, Option<u64>>(10)?) {
+                    (Some(input), cached, Some(output)) => Some((input, cached.unwrap_or(0), output)),
+                    _ => None,
+                },
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -329,6 +372,9 @@ mod tests {
                     stdout: None,
                     stderr: None,
                     session_id: None,
+                    tokens_in: None,
+                    tokens_cached: None,
+                    tokens_out: None,
                 })
                 .unwrap();
         }
@@ -351,7 +397,17 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         {
             let db = Connection::open(home.join("state.db")).unwrap();
-            db.execute_batch(&SCHEMA.replace("    round        INTEGER NOT NULL DEFAULT 0,\n", "").replace("    model        TEXT,\n", "")).unwrap();
+            let older = SCHEMA.replace("    round        INTEGER NOT NULL DEFAULT 0,\n", "").replace("    model        TEXT,\n", "").replace("    tokens_in    INTEGER,\n    tokens_cached INTEGER,\n    tokens_out   INTEGER,\n", "");
+        assert!(!older.contains("tokens_in"));
+        db.execute_batch(&older).unwrap();
+        // An agent call from then, whose output is still on disk.
+        std::fs::write(home.join("03-develop-1.stdout.log"), "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":500,\"cached_input_tokens\":300,\"output_tokens\":20}}\n").unwrap();
+        db.execute(
+            "INSERT INTO steps (repo, number, run_id, step, kind, module, vendor, attempt, timed_out, verdict, duration_ms, output_path, finished_at)
+             VALUES ('o/r', 4, 'run0', 'review', 'agent', 'agent/review', 'codex', 1, 0, 'approve', 5, ?1, 't')",
+            params![home.join("03-develop-1.out.json").display().to_string()],
+        )
+        .unwrap();
             db.execute_batch(
                 "INSERT INTO steps (repo, number, run_id, step, kind, module, attempt, timed_out, verdict, duration_ms, finished_at)
                  VALUES ('o/r', 4, 'run0', 'develop', 'agent', 'agent/dev', 1, 0, 'replied', 5, 't')",
@@ -360,7 +416,12 @@ mod tests {
         }
         let store = Store::open(&home).unwrap();
         let steps = store.steps("o/r", 4, "run0").unwrap();
-        assert_eq!((steps[0].step.as_str(), steps[0].round, steps[0].model.as_deref()), ("develop", 0, None));
+        let develop = steps.iter().find(|ran| ran.step == "develop").unwrap();
+        assert_eq!((develop.round, develop.model.as_deref()), (0, None));
+        // The earlier call's tokens were read from its output file. A step
+        // with no such file has none.
+        let review = steps.iter().find(|ran| ran.step == "review").unwrap();
+        assert_eq!((develop.tokens, review.tokens), (None, Some((500, 300, 20))));
         // Opening again must not try to add the column twice.
         drop(store);
         Store::open(&home).unwrap();

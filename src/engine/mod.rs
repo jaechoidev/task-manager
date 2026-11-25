@@ -436,6 +436,8 @@ impl Run<'_> {
     fn record(&self, step: &Step, name: &str, attempt: u32, verdict: &str, evidence: Evidence) -> Result<()> {
         let Evidence { outcome, files, session, by } = evidence;
         let path = |p: Option<&Path>| p.map(|p| p.display().to_string());
+        // What an agent call used, as its own program counted it.
+        let used = by.and(files[2]).and_then(|stdout| std::fs::read_to_string(stdout).ok()).and_then(|text| agent::tokens(&text));
         self.store.record(&StepRecord {
             ts: util::now(),
             repo: self.repo.clone(),
@@ -461,6 +463,9 @@ impl Run<'_> {
             stdout: path(files[2]),
             stderr: path(files[3]),
             session_id: session,
+            tokens_in: used.map(|tokens| tokens.input),
+            tokens_cached: used.map(|tokens| tokens.cached),
+            tokens_out: used.map(|tokens| tokens.output),
         })
     }
 
@@ -490,6 +495,9 @@ impl Run<'_> {
             stdout: None,
             stderr: None,
             session_id: None,
+            tokens_in: None,
+            tokens_cached: None,
+            tokens_out: None,
         })?;
         Ok(match failure {
             Some(reason) => Outcome::Stop(format!("{name} gate: {reason}")),
@@ -530,6 +538,9 @@ impl Run<'_> {
             stdout: None,
             stderr: None,
             session_id: None,
+            tokens_in: None,
+            tokens_cached: None,
+            tokens_out: None,
         })
     }
 

@@ -275,13 +275,17 @@ pub fn refresh_zai(home: &Path, provider: &str, env_file: &Path) -> Result<()> {
     if load(home).quota.get(provider).is_some_and(|reading| now.saturating_sub(reading.at) < QUOTA_FRESH_SECONDS) {
         return Ok(());
     }
-    let Some(reading) = ask_zai(env_file).and_then(|body| read_zai(&body, now)) else {
-        return Ok(());
+    read_zai_now(home, provider, env_file).map(|_| ())
+}
+
+/// Asks Z.ai now, however fresh the last reading is. Returns the reading,
+/// or None when Z.ai gave nothing that can be read.
+pub fn read_zai_now(home: &Path, provider: &str, env_file: &Path) -> Result<Option<Reading>> {
+    let Some(reading) = ask_zai(env_file).and_then(|body| read_zai(&body, util::now_secs())) else {
+        return Ok(None);
     };
-    change(home, |ledger| {
-        ledger.quota.insert(provider.to_string(), reading);
-    })?;
-    Ok(())
+    note(home, provider, reading.clone())?;
+    Ok(Some(reading))
 }
 
 #[cfg(test)]

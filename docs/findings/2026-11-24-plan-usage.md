@@ -41,6 +41,13 @@ Tests: 122 unit tests and 55 scenarios. Two scenarios are new: a run leaves a re
 3. **A stand-in did not know a fix round's prompt.** With the developer set aside, the fix round went to another provider, and the stand-in for it took the prompt for a review. The engine's prompt was fine: a fix round's prompt carries the whole issue. The stand-in now knows both openings.
 4. **The check's own format changed.** Every Claude and GLM call now uses the stream. One tier of each was checked again for real and passes.
 
+## Added the same evening: tokens, and reading a plan on request
+
+- **Usage counts tokens, not time.** Each program counts the tokens of its own calls: Claude in its result, Codex once per turn. The engine now keeps them with each step, and `GET /v1/usage` sums them per vendor. Calls made before this were filled in once from their output files, which were still on disk: 79 of 82 calls have a count.
+- **What a count is.** All input, cached or not, plus output. Most input is cached: 5.3 of Claude's 6.0 million input tokens were read from a cache. The Usage screen shows the total, and the parts beside it.
+- **A plan can be read on request.** `factory providers refresh`, and a button beside Quota in the app. Z.ai is asked directly. Claude and Codex get one small call each, because a reply is the only place they say it. Run for real through the API: Claude and GLM answered within six seconds, and ChatGPT once the problem below was fixed.
+- **One thing it found.** Codex refuses to run in a folder that is not a git repository. The first refresh of ChatGPT failed on that. The folder is now made one, as the provider check already did.
+
 ## Open items
 
 - **Which login the Claude reading is for.** Every engine run so far was started from a shell inside a Claude Code session, where Claude takes that session's login. From an ordinary terminal it is the machine's own login. The reading is kept by provider name either way.
