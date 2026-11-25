@@ -277,7 +277,7 @@ pub fn route(context: &Context_, request: &Request) -> (u16, Value) {
         let parts: Vec<&str> = request.path.trim_matches('/').split('/').collect();
         let not_found = || Ok((404, json!({ "error": format!("no such route: {} {}", request.method, request.path) })));
         Ok(match (request.method, parts.as_slice()) {
-            ("GET", ["v1", "health"]) => (200, json!({ "ok": true, "version": env!("CARGO_PKG_VERSION"), "repos": context.repos.keys().collect::<Vec<_>>() })),
+            ("GET", ["v1", "health"]) => (200, json!({ "ok": true, "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(), "repos": context.repos.keys().collect::<Vec<_>>() })),
             ("GET", ["v1", "issues"]) => {
                 let rows = store.issues()?;
                 (200, json!(rows.iter().map(|row| issue_json(&store, row)).collect::<Result<Vec<_>>>()?))

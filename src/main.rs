@@ -510,7 +510,7 @@ fn run() -> Result<bool> {
                         for why in &installed.refused {
                             eprintln!("error: {why}");
                         }
-                        eprintln!("Not every agent is loaded. `factory service install` again stops and starts both.");
+                        eprintln!("Not every agent is running as it should. `factory service install` again stops and starts both.");
                         return Ok(false);
                     }
                     println!("Both start at login and are started again when they stop. Label an issue and the scheduler picks it up.");

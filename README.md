@@ -254,7 +254,7 @@ It is generated from the state database and the run files, with no LLM call, and
 
 | Route | Answers |
 | --- | --- |
-| `GET /v1/health` | The version and the repositories the server may act on |
+| `GET /v1/health` | The version, the server's process id, and the repositories it may act on |
 | `GET /v1/issues` | Every issue run so far: its state, its stage, what it waits on, which pass it is on |
 | `GET /v1/issues/<owner>/<repo>/<n>` | One issue: every step with who answered and on which model, the summary, what failed, the judgment, the run's files |
 | `GET /v1/issues/<owner>/<repo>/<n>/log` | The end of the newest output of that run |
@@ -360,10 +360,10 @@ factory service uninstall
 
 - **What goes into an agent's environment** is only the `PATH` of the shell that installed it, each folder once, and `FACTORY_HOME` when that was set. So install it from a shell that finds `git`, `gh`, `claude`, `codex` and the Xcode tools. No login of that shell is carried over: the agents' calls use this machine's own logins.
 - **It needs a registered project.** `install` refuses when `factory project list` is empty.
-- **To change how it runs,** run `install` again with other flags. It stops what is loaded and starts the new settings. It waits up to 10 seconds for launchd to finish removing each old agent, offers the new file up to five times, and tries both agents even when one is refused. When one is still not loaded it says which and exits 1.
+- **To change how it runs,** run `install` again with other flags. It stops what is loaded and starts the new settings. It waits up to 10 seconds for launchd to finish removing each old agent, offers the new file up to five times, and tries both agents even when one is refused. It says the API runs only once `/v1/health` answers with the agent's own process id, which it waits up to 10 seconds for. When an agent is not loaded, or another process answers on the API's address, it says which and exits 1.
 - **The agents run the program where it was when `install` ran.** Building again replaces that file, and an agent picks the new build up the next time it starts.
 - **`uninstall` cuts off issues at work.** They pick up at the step they were on the next time they are run.
-- **Don't also start `factory serve` by hand** on the same address. The second one can't listen.
+- **Don't also start `factory serve` by hand** on the same address. The second one can't listen. `install` and `status` name the process that holds it.
 
 ### What a machine can run at once
 

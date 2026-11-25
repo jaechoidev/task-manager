@@ -49,6 +49,33 @@ pub struct State {
     /// The process, while it runs.
     pub pid: Option<u32>,
     pub log: PathBuf,
+    /// For the API: where it listens, and whether it answered there.
+    pub api: Option<Api>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Api {
+    pub address: String,
+    pub answer: Answer,
+}
+
+/// Who answers on the API's address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// This agent's own process.
+    Ours,
+    /// Another server, with its process when it said which.
+    Someone(Option<u32>),
+    Nobody,
+}
+
+/// Who a health reply came from, given the agent's process.
+fn answer(reply: Option<Option<u32>>, agent: Option<u32>) -> Answer {
+    match reply {
+        None => Answer::Nobody,
+        Some(Some(pid)) if Some(pid) == agent => Answer::Ours,
+        Some(pid) => Answer::Someone(pid),
+    }
 }
 
 /// `dev.factory`, with a suffix when a test asks for agents of its own.
@@ -203,7 +230,59 @@ pub fn pid_of(print: &str) -> Option<u32> {
 
 fn state_of(job: &Job, file: &Path) -> Result<State> {
     let print = launchctl(&["print", &format!("{}/{}", domain()?, job.label)])?;
-    Ok(State { label: job.label.clone(), installed: file.is_file(), loaded: print.ok, pid: if print.ok { pid_of(&print.text) } else { None }, log: job.log.clone() })
+    Ok(State { label: job.label.clone(), installed: file.is_file(), loaded: print.ok, pid: if print.ok { pid_of(&print.text) } else { None }, log: job.log.clone(), api: None })
+}
+
+/// The address an agent's API listens on, from its arguments or its file.
+fn bind_of(args: &[String]) -> Option<String> {
+    args.iter().position(|arg| arg == "--bind").and_then(|at| args.get(at + 1)).filter(|address| !address.is_empty()).cloned()
+}
+
+fn bind_in(plist: &str) -> Option<String> {
+    let args: Vec<String> = plist.split("<string>").skip(1).filter_map(|piece| piece.split_once("</string>")).map(|(text, _)| text.to_string()).collect();
+    bind_of(&args)
+}
+
+/// How long a newly started API has to answer.
+const ANSWERS_WITHIN: Duration = Duration::from_secs(10);
+
+/// Asks `address` for `/v1/health`. `None` when nothing answers over HTTP.
+/// Otherwise the process the reply names: an API says its own, and a
+/// server that wants a token, or isn't factory's, names none.
+pub fn health(address: &str, within: Duration) -> Option<Option<u32>> {
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+    let socket = address.to_socket_addrs().ok()?.next()?;
+    let mut stream = std::net::TcpStream::connect_timeout(&socket, within).ok()?;
+    let _ = stream.set_read_timeout(Some(within));
+    let _ = stream.set_write_timeout(Some(within));
+    stream.write_all(format!("GET /v1/health HTTP/1.0\r\nHost: {address}\r\n\r\n").as_bytes()).ok()?;
+    let mut reply = Vec::new();
+    // HTTP/1.0: the server closes when it is done. What came before a
+    // timeout still counts.
+    let _ = stream.take(64 * 1024).read_to_end(&mut reply);
+    let reply = String::from_utf8_lossy(&reply);
+    if !reply.starts_with("HTTP/1.") {
+        return None;
+    }
+    let body = reply.split_once("\r\n\r\n").map(|(_, body)| body).unwrap_or_default();
+    let pid = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|value| value.get("pid")?.as_u64()).and_then(|pid| u32::try_from(pid).ok());
+    Some(pid)
+}
+
+/// Looks until `check` is true, for at most `limit`.
+fn within(limit: Duration, check: &mut dyn FnMut() -> bool, wait: &mut dyn FnMut(Duration)) -> bool {
+    let mut waited = Duration::ZERO;
+    loop {
+        if check() {
+            return true;
+        }
+        if waited >= limit {
+            return false;
+        }
+        wait(LOOK_EVERY);
+        waited += LOOK_EVERY;
+    }
 }
 
 /// What `install` left: each agent's state, and why any was not taken.
@@ -240,10 +319,35 @@ pub fn install(opts: &Options) -> Result<Installed> {
         let file = dir.join(format!("{}.plist", job.label));
         // Loaded with other settings: stop it, so the new file is what runs.
         let target = format!("{domain}/{}", job.label);
-        if let Err(why) = restart(&target, &domain, &file, &mut launchctl, &mut std::thread::sleep)? {
+        let taken = restart(&target, &domain, &file, &mut launchctl, &mut std::thread::sleep)?;
+        if let Err(why) = &taken {
             refused.push(format!("{}: {why}", job.label));
         }
-        states.push(state_of(job, &file)?);
+        // launchd has a process before the API listens, and another server
+        // on the same address answers at once. So it counts only when the
+        // answer names this agent's own process.
+        let mut state = state_of(job, &file)?;
+        if let Some(address) = bind_of(&job.args).filter(|_| taken.is_ok()) {
+            let mut seen = Answer::Nobody;
+            let mut look = || {
+                let Ok(now) = state_of(job, &file) else { return false };
+                seen = answer(health(&address, Duration::from_secs(1)), now.pid);
+                state = now;
+                seen == Answer::Ours
+            };
+            within(ANSWERS_WITHIN, &mut look, &mut std::thread::sleep);
+            let after = ANSWERS_WITHIN.as_secs();
+            match seen {
+                Answer::Ours => {}
+                Answer::Nobody => refused.push(format!("{}: loaded, but nothing answers on http://{address}/v1/health after {after} s. Its output is in {}", job.label, job.log.display())),
+                Answer::Someone(other) => {
+                    let who = other.map(|pid| format!("process {pid}")).unwrap_or_else(|| "another server".to_string());
+                    refused.push(format!("{}: {who} answers on http://{address}, not this agent, after {after} s. Stop it, for example a `factory serve` started by hand, and install again. This agent's output is in {}", job.label, job.log.display()));
+                }
+            }
+            state.api = Some(Api { address, answer: seen });
+        }
+        states.push(state);
     }
     Ok(Installed { states, refused })
 }
@@ -273,15 +377,33 @@ pub fn status() -> Result<Vec<State>> {
     let dir = agents_dir()?;
     jobs(&home, &Options { parallel: None, in_order: false, no_merge: false, no_guard: false, bind: String::new() })
         .iter()
-        .map(|job| state_of(job, &dir.join(format!("{}.plist", job.label))))
+        .map(|job| {
+            let file = dir.join(format!("{}.plist", job.label));
+            let mut state = state_of(job, &file)?;
+            // The address is the one the installed file names.
+            if let Some(address) = std::fs::read_to_string(&file).ok().and_then(|text| bind_in(&text)) {
+                state.api = Some(Api { answer: answer(health(&address, Duration::from_secs(1)), state.pid), address });
+            }
+            Ok(state)
+        })
         .collect()
 }
 
 pub fn print(states: &[State]) {
     for state in states {
         let how = match (state.installed, state.loaded, state.pid) {
-            (_, true, Some(pid)) => format!("running, process {pid}"),
-            (_, true, None) => "loaded, not running right now. launchd starts it again".to_string(),
+            (_, true, Some(pid)) => match &state.api {
+                Some(Api { address, answer: Answer::Ours }) => format!("running, process {pid}, answering on http://{address}"),
+                Some(Api { address, answer: Answer::Nobody }) => format!("running, process {pid}, NOT answering on http://{address}"),
+                Some(Api { address, answer: Answer::Someone(Some(other)) }) => format!("running, process {pid}, but process {other} answers on http://{address}"),
+                Some(Api { address, answer: Answer::Someone(None) }) => format!("running, process {pid}, but another server answers on http://{address}"),
+                None => format!("running, process {pid}"),
+            },
+            (_, true, None) => match &state.api {
+                Some(Api { address, answer: Answer::Someone(Some(other)) }) => format!("loaded, not running right now. Process {other} answers on http://{address}, so this agent can't listen there"),
+                Some(Api { address, answer: Answer::Someone(None) }) => format!("loaded, not running right now. Another server answers on http://{address}, so this agent can't listen there"),
+                _ => "loaded, not running right now. launchd starts it again".to_string(),
+            },
             (true, false, _) => "installed, not loaded. It starts at the next login, or with `factory service install`".to_string(),
             (false, false, _) => "not installed".to_string(),
         };
@@ -377,6 +499,67 @@ mod tests {
         let mut waited = Duration::ZERO;
         assert_eq!(restart("t", "d", Path::new("/f"), &mut run, &mut |d| waited += d).unwrap(), Ok(()));
         assert_eq!(waited, GONE_WITHIN);
+    }
+
+    #[test]
+    fn the_api_address_is_read_from_the_arguments_or_the_installed_file() {
+        let opts = Options { parallel: None, in_order: false, no_merge: false, no_guard: false, bind: "127.0.0.1:7878".into() };
+        let jobs = jobs(Path::new("/h"), &opts);
+        assert_eq!((bind_of(&jobs[0].args), bind_of(&jobs[1].args)), (None, Some("127.0.0.1:7878".to_string())));
+        let file = plist(&jobs[1], Path::new("/bin/factory"), "/bin", None);
+        assert_eq!(bind_in(&file), Some("127.0.0.1:7878".to_string()));
+        assert_eq!(bind_in(&plist(&jobs[0], Path::new("/bin/factory"), "/bin", None)), None);
+    }
+
+    /// A server that answers one request with `reply`, and the request it got.
+    fn one_reply(reply: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 64];
+            let _ = stream.read(&mut request);
+            stream.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (address, server)
+    }
+
+    #[test]
+    fn a_health_reply_names_the_process_that_answered() {
+        let (address, server) = one_reply("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"pid\":4242}");
+        assert_eq!(health(&address, Duration::from_secs(2)), Some(Some(4242)));
+        assert!(server.join().unwrap().starts_with("GET /v1/health HTTP/1.0\r\n"));
+        // One that wants a token is up, and doesn't say who it is.
+        let (address, server) = one_reply("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(health(&address, Duration::from_secs(2)), Some(None));
+        server.join().unwrap();
+        // Nobody listens there now.
+        assert_eq!(health(&address, Duration::from_millis(500)), None);
+        assert_eq!(health("not an address", Duration::from_millis(100)), None);
+    }
+
+    #[test]
+    fn only_an_answer_from_the_agents_own_process_counts() {
+        assert_eq!(answer(Some(Some(7)), Some(7)), Answer::Ours);
+        // A server started by hand on the same address, while the agent's
+        // own process is still starting or already gone.
+        assert_eq!(answer(Some(Some(9)), Some(7)), Answer::Someone(Some(9)));
+        assert_eq!(answer(Some(Some(9)), None), Answer::Someone(Some(9)));
+        assert_eq!(answer(Some(None), Some(7)), Answer::Someone(None));
+        assert_eq!(answer(None, Some(7)), Answer::Nobody);
+    }
+
+    #[test]
+    fn a_new_api_is_given_a_while_to_answer() {
+        let mut asked = 0;
+        let mut waited = Duration::ZERO;
+        assert!(within(ANSWERS_WITHIN, &mut || { asked += 1; asked == 3 }, &mut |d| waited += d));
+        assert_eq!((asked, waited), (3, LOOK_EVERY * 2));
+        let mut waited = Duration::ZERO;
+        assert!(!within(ANSWERS_WITHIN, &mut || false, &mut |d| waited += d));
+        assert_eq!(waited, ANSWERS_WITHIN);
     }
 
     #[test]
