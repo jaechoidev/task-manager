@@ -189,6 +189,8 @@ final class ModelTests: XCTestCase {
         // The last run of a step is what counts, and a step still to come waits.
         let failed = stageChips(steps: Array(steps.prefix(4)), order: ["acceptance", "verify", "review"], current: nil)
         XCTAssertEqual(failed.map(\.state), ["ok", "fail", "pending"])
+        // The step an issue stopped at, waiting for a person, reads as failed.
+        XCTAssertEqual(stageChips(steps: steps, order: ["develop", "verify", "review"], current: "verify", stuck: true).map(\.state), ["ok", "fail", "pending"])
         // Without a workflow, the steps are listed as they ran.
         XCTAssertEqual(stageChips(steps: steps, order: nil, current: nil).map(\.name), ["research", "acceptance", "scope", "verify", "develop"])
     }

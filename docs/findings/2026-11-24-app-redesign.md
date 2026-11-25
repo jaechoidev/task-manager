@@ -11,13 +11,41 @@ The app had grown pane by pane: a list, a detail view and a row of tabs. A desig
 | Workflow and usage | The graph with dashed red return lines, the four limit cards, the usage table with bars | Drawn from a real workflow |
 | Edit workflow | The bar with the problem count, the graph with refused steps, numbered lines with the engine's word under a bad line, the inspector | Drawn from a real workflow file with a wrong module name |
 
-The app has 15 tests. In the real window the Issue, Schedule and Usage screens were looked at, the sidebar was used to move between them, and the refresh button beside Quota was pressed: all three plans were read again within twelve seconds. The Workflow screen, the editor, the filter, the project picker and the two buttons of a stuck issue were not tried in the real window.
+The app has 15 tests. The real window was then gone through control by control: see "The real window, by hand" below. The project picker is the one control that could not be tried.
 
 ![The issue screen, from a real run](img/2026-11-24-redesign-issue.png)
 
 ![The schedule screen, from a made-up busy state](img/2026-11-24-redesign-schedule.png)
 
 ![The editor, with a module name spelled wrong](img/2026-11-24-redesign-editor.png)
+
+## The real window, by hand
+
+Every control was pressed in the running app through the system's accessibility, with the app in the background. The stuck issue's two buttons were pressed against a scratch engine with a made-up stuck issue and no checkout, so that they could reach the API without touching GitHub.
+
+| Control | What happened |
+| --- | --- |
+| Filter | "counter" left the five counter-trial issues, "#46" left one |
+| An issue in the sidebar | Opened its screen |
+| A "to look at" item | Ticked, and stayed ticked. Not on the first try: see the problems |
+| Latest output | Unfolded |
+| Workflow, then "Edit workflow…" | The editor opened with the file, its graph, no problems and eight modules |
+| Typing a draft with a wrong module name | Two problems with their line numbers, the two steps marked on the graph, "Open a pull request" off |
+| "Add" on a module | A step line was added to the draft, and the module showed as in use |
+| Revert, then back | The file was as on the default branch again, then the Workflow screen |
+| Refresh beside Quota | All three plans were read again within twelve seconds |
+| "Start over" and "Take off the queue" | Each reached the API, which refused for lack of a checkout, and the app said so |
+| Stopping the engine | A red banner and a red dot in the toolbar within seconds |
+| Project picker | Not tried. A menu can't be opened in a background window, and the test did not take the screen |
+
+"Open a pull request" and "Scaffold as a pull request" were not pressed on purpose: each opens a real pull request.
+
+What this turned up, all fixed:
+
+1. **Ticking did nothing.** The "to look at" rows, the output's fold, the schedule's rows and the module kind were still shapes with a tap handler. They are real buttons now, like the rest.
+2. **A draft was judged on another draft's word.** For half a second after an edit the editor still showed the last text's verdict. A broken draft read "No problems" with "Open a pull request" on, and a reverted one still listed the old problems. The verdict is now put away the moment the text changes, an answer about a text that has since changed is dropped, and the file as it is on the default branch needs no asking.
+3. **A stuck step looked like it was running.** The strip marked the step a stopped issue is at with the mark for "at work". It is marked as failed now.
+4. **The banner named a flag that is no longer needed.** It said to start the engine with `--repo-dir`. The engine serves the registered projects by itself.
 
 ## Where the app differs from the canvas
 
@@ -46,7 +74,10 @@ The app has 15 tests. In the real window the Issue, Schedule and Usage screens w
 
 ## Open items
 
-- **Most of the real window is still untried by hand.** Filter, picker, ticking an item, opening the editor and the two buttons of a stuck issue.
+- **The project picker is untried by hand.** Its logic is tested. The menu itself was never opened.
+- **"Add" can name a step twice.** Adding `check/verify` to a draft that already has a step called `verify` adds another `verify`. The engine then reports it. The app could pick a free name.
+- **"Take off the queue" asks nothing first.** It closes the pull request and deletes the branch at one press.
+- **A notice stays until the next one.** "Could not retry" was still on screen after the following press.
 - **Usage no longer follows the canvas.** At the owner's word it shows calls as a number and tokens with a bar, and no time. The plan cards and their refresh button moved there from Schedule too: what a plan has left and what was spent are one subject, and Schedule is about what runs now. Schedule keeps a "Set aside" section, shown only while someone is set aside, because that explains a wait. The canvas still draws time in Usage and Quota on Schedule.
 - **The canvas was still changing** while this was built: the Schedule artboard arrived during the day. This follows the version read at 05:30 UTC on 2026-11-25.
 - **The editor's gutter while typing.**

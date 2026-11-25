@@ -116,7 +116,7 @@ final class AppModel: ObservableObject {
                 self.workflow = nil
             }
         } catch {
-            self.problem = "Can't reach the engine at \(address). Start it with `factory serve --repo-dir <checkout>`. (\(error.localizedDescription))"
+            self.problem = "Can't reach the engine at \(address). Start it with `factory serve`. (\(error.localizedDescription))"
         }
     }
 

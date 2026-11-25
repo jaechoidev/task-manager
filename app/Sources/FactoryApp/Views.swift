@@ -193,7 +193,7 @@ struct IssueDetailPane: View {
                 let active = issue.state == "running" || issue.state == "waiting" || issue.state == "needs-a-person"
                 Boxed {
                     Flow {
-                        let chips = stageChips(steps: steps, order: order, current: active ? issue.stage : nil)
+                        let chips = stageChips(steps: steps, order: order, current: active ? issue.stage : nil, stuck: issue.state == "needs-a-person")
                         ForEach(Array(chips.enumerated()), id: \.offset) { index, chip in
                             HStack(spacing: 4) {
                                 chipView(chip)
@@ -310,6 +310,7 @@ struct IssueDetailPane: View {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
                     let key = "\(issue.id)|\(item)"
                     let done = looked.contains(key)
+                    Button { toggleLooked(key) } label: {
                     HStack(alignment: .top, spacing: 10) {
                         ZStack {
                             RoundedRectangle(cornerRadius: 3).fill(done ? Theme.accent : Color.white)
@@ -322,8 +323,8 @@ struct IssueDetailPane: View {
                         Spacer(minLength: 0)
                     }
                     .contentShape(Rectangle())
-                    .onTapGesture { toggleLooked(key) }
-                    .accessibilityAddTraits(.isButton)
+                    }
+                    .buttonStyle(.plain)
                     .accessibilityLabel((done ? "Looked at: " : "To look at: ") + item)
                 }
             }
@@ -376,6 +377,7 @@ struct IssueDetailPane: View {
         let open = outputOpen ?? (issue.state == "running" || issue.state == "waiting" || issue.state == "needs-a-person")
         return Boxed {
             VStack(alignment: .leading, spacing: 10) {
+                Button { outputOpen = !open } label: {
                 HStack(spacing: 8) {
                     Image(systemName: open ? "chevron.down" : "chevron.right").font(.system(size: 9, weight: .bold)).foregroundStyle(Theme.secondary)
                     Text("Latest output").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
@@ -385,7 +387,9 @@ struct IssueDetailPane: View {
                     Spacer(minLength: 0)
                 }
                 .contentShape(Rectangle())
-                .onTapGesture { outputOpen = !open }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(open ? "Hide the latest output" : "Show the latest output")
                 if open {
                     Text(logExcerpt(log.text))
                         .font(.system(size: 12, design: .monospaced)).foregroundStyle(Color(hex: 0xE8E8EA))

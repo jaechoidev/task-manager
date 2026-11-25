@@ -131,6 +131,7 @@ struct SchedulePane: View {
                 .padding(.horizontal, 14).padding(.top, 10).padding(.bottom, 4)
             ForEach(entries) { entry in
                 let (kind, stage, detail, time) = row(entry)
+                Button { open("\(project.repo)#\(entry.number)") } label: {
                 HStack(alignment: .top, spacing: 10) {
                     MarkView(mark: kind).padding(.top, 1)
                     VStack(alignment: .leading, spacing: 3) {
@@ -152,7 +153,8 @@ struct SchedulePane: View {
                 }
                 .padding(.horizontal, 14).padding(.top, 6).padding(.bottom, 8)
                 .contentShape(Rectangle())
-                .onTapGesture { open("\(project.repo)#\(entry.number)") }
+                }
+                .buttonStyle(.plain)
             }
         }
     }

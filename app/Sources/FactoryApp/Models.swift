@@ -442,8 +442,9 @@ let failingVerdicts: Set<String> = ["fail", "invalid", "failed", "changes", "tim
 
 /// The workflow's steps in order, each with how it went for this issue.
 /// `order` is the workflow's own list when it is known. Without it the steps
-/// are taken as they ran. `current` is the step an unfinished issue is at.
-func stageChips(steps: [StepRow], order: [String]?, current: String?) -> [StageChip] {
+/// are taken as they ran. `current` is the step an unfinished issue is at,
+/// and `stuck` says the issue stopped there and waits for a person.
+func stageChips(steps: [StepRow], order: [String]?, current: String?, stuck: Bool = false) -> [StageChip] {
     var seen: [String] = []
     for step in steps where !seen.contains(step.step) { seen.append(step.step) }
     let names = order ?? seen
@@ -451,7 +452,7 @@ func stageChips(steps: [StepRow], order: [String]?, current: String?) -> [StageC
         let runs = steps.filter { $0.step == name }
         let state: String
         if name == current {
-            state = "current"
+            state = stuck ? "fail" : "current"
         } else if let last = runs.last {
             state = last.verdict == "skipped" ? "skip" : (failingVerdicts.contains(last.verdict) ? "fail" : "ok")
         } else {

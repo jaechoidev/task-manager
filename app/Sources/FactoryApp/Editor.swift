@@ -20,6 +20,8 @@ final class EditorModel: ObservableObject {
     /// has no graph of its own, so this one is shown with the refused steps
     /// marked.
     @Published var lastValid: Workflow?
+    /// The graph of the file on the default branch, which the engine accepted.
+    private var originalWorkflow: Workflow?
 
     private var pending: Task<Void, Never>?
 
@@ -41,6 +43,7 @@ final class EditorModel: ObservableObject {
             draft = original
             validation = Validation(ok: true, errors: [], workflow: workflow)
             lastValid = workflow
+            originalWorkflow = workflow
             modules = (try? await client.get(query("modules"))) ?? []
             message = nil
         } catch {
@@ -48,9 +51,18 @@ final class EditorModel: ObservableObject {
         }
     }
 
-    /// Checks the draft a moment after the last keystroke.
+    /// Checks the draft a moment after the last keystroke. Until the engine
+    /// has looked at this text, what it said about the last one is put away:
+    /// a draft is never shown as valid, or as broken, on another draft's word.
     func draftChanged(client: APIClient) {
         pending?.cancel()
+        if draft == original, let accepted = originalWorkflow {
+            // The file as it is on the default branch needs no asking.
+            validation = Validation(ok: true, errors: [], workflow: accepted)
+            lastValid = accepted
+            return
+        }
+        validation = nil
         pending = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled, let self else { return }
@@ -59,12 +71,17 @@ final class EditorModel: ObservableObject {
     }
 
     func validate(client: APIClient) async {
+        let asked = draft
+        var answer: Validation
         do {
-            validation = try await client.send(query("workflow/validate"), body: Data(draft.utf8))
-            if let workflow = validation?.workflow { lastValid = workflow }
+            answer = try await client.send(query("workflow/validate"), body: Data(asked.utf8))
         } catch {
-            validation = Validation(ok: false, errors: ["The engine could not check this: \(error.localizedDescription)"], workflow: nil)
+            answer = Validation(ok: false, errors: ["The engine could not check this: \(error.localizedDescription)"], workflow: nil)
         }
+        // An answer about a text that has changed since is no answer.
+        guard asked == draft else { return }
+        validation = answer
+        if let workflow = answer.workflow { lastValid = workflow }
     }
 
     func propose(client: APIClient) async {
@@ -303,12 +320,15 @@ struct EditorInspector: View {
             Text("New module").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
             HStack(spacing: 0) {
                 ForEach(["check", "agent", "judgment"], id: \.self) { option in
-                    Text(option).font(.system(size: 13)).foregroundStyle(option == kind ? Theme.text : Theme.tertiary)
-                        .frame(maxWidth: .infinity).frame(height: 24)
-                        .background(option == kind ? Color.white : Color.clear, in: RoundedRectangle(cornerRadius: 5))
-                        .shadow(color: option == kind ? .black.opacity(0.12) : .clear, radius: 1, y: 1)
-                        .contentShape(Rectangle())
-                        .onTapGesture { editor?.newKind = option }
+                    Button { editor?.newKind = option } label: {
+                        Text(option).font(.system(size: 13)).foregroundStyle(option == kind ? Theme.text : Theme.tertiary)
+                            .frame(maxWidth: .infinity).frame(height: 24)
+                            .background(option == kind ? Color.white : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+                            .shadow(color: option == kind ? .black.opacity(0.12) : .clear, radius: 1, y: 1)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("New module kind: \(option)")
                 }
             }
             .padding(2)
