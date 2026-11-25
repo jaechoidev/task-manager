@@ -418,7 +418,6 @@ pub struct RoleRow {
 }
 
 pub fn report(home: &Path) -> Result<Report> {
-    let file = Providers::file(home);
     let loaded = Providers::load(home)?;
     // Where quota can be read, read it now. It costs nothing.
     for (name, provider) in loaded.iter().flat_map(|set| set.providers.iter()) {
@@ -426,6 +425,14 @@ pub fn report(home: &Path) -> Result<Report> {
             ledger::refresh_zai(home, name, &expand(env_file))?;
         }
     }
+    report_as_known(home)
+}
+
+/// The same report from what is already on disk, asking nobody. For a
+/// caller that is asked often and must answer at once.
+pub fn report_as_known(home: &Path) -> Result<Report> {
+    let file = Providers::file(home);
+    let loaded = Providers::load(home)?;
     Ok(build(&file, loaded.as_ref(), &qualify::load(home), &ledger::load(home), super::util::now_secs(), &|program| on_path(program), &|path| path.exists()))
 }
 

@@ -21,6 +21,7 @@ pub mod ledger;
 pub mod lock;
 pub mod proc;
 pub mod providers;
+pub mod providers_edit;
 pub mod qualify;
 pub mod queue;
 pub mod rounds;

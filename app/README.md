@@ -14,6 +14,7 @@ A window and a menu bar item onto the engine. It is a client of `factory serve` 
 | Workflow | The repository's steps as a graph, with a dashed red line from each step to where its failure goes, and the limits it runs under. Read only |
 | Edit workflow | Reached from Workflow. The workflow file's text, checked by the engine as you type. The graph of the draft, with the steps the engine refuses marked. The problems with their line numbers, the modules a step may name, and a form that scaffolds a new module. "Open a pull request" is how a change is saved |
 | Usage | Quota first: each provider's plan with a bar per window, and a button that reads every plan again (one small call each for Claude and ChatGPT). Then calls, tokens and usage limits hit per vendor, with a bar for the tokens |
+| Providers | Each job's list of who is tried, in order, with buttons to move, remove and add. Each provider's tiers with the model each names (editable), what its check found, and a button to check it again. A new tier can be added. "Save and check" writes this machine's `providers.yaml` through the engine and checks every tier whose model changed |
 | Menu bar | How many issues need a person, what is running, and how many places are in use |
 
 The look follows the redesign canvas. It is drawn for a light window, so the app is light whatever the system is set to.

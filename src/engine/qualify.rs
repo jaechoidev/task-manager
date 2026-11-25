@@ -267,7 +267,13 @@ pub fn run(home: &Path, name: &str, tier: Option<&str>) -> Result<Vec<Checked>> 
     let mut results = Vec::new();
     for tier in &tiers {
         println!("trying {name} {tier}");
-        let checked = check(home, name, provider, tier)?;
+        // Says, for anyone looking on, that this tier is being tried now.
+        let mark = running_mark(home, name, tier);
+        let _ = std::fs::create_dir_all(home.join("checks"));
+        let _ = std::fs::write(&mark, std::process::id().to_string());
+        let checked = check(home, name, provider, tier);
+        let _ = std::fs::remove_file(&mark);
+        let checked = checked?;
         println!("  {}", checked.summary());
         let mut store = load(home);
         store.insert(format!("{name}/{tier}"), checked.clone());
@@ -275,6 +281,25 @@ pub fn run(home: &Path, name: &str, tier: Option<&str>) -> Result<Vec<Checked>> 
         results.push(checked);
     }
     Ok(results)
+}
+
+fn running_mark(home: &Path, name: &str, tier: &str) -> PathBuf {
+    home.join("checks").join(format!("running-{name}-{tier}"))
+}
+
+/// The tiers being checked right now, as `provider/tier`. A mark whose
+/// process is gone counts for nothing.
+pub fn being_checked(home: &Path, set: &providers::Providers) -> Vec<String> {
+    let mut found = Vec::new();
+    for (name, provider) in &set.providers {
+        for tier in provider.tiers.keys() {
+            let alive = std::fs::read_to_string(running_mark(home, name, tier)).ok().and_then(|pid| pid.trim().parse::<u32>().ok()).is_some_and(super::util::alive);
+            if alive {
+                found.push(format!("{name}/{tier}"));
+            }
+        }
+    }
+    found
 }
 
 /// The tier a plan is read through: `fast` when the provider has one, else

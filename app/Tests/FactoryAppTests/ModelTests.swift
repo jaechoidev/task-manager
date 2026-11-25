@@ -245,6 +245,34 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual([812, 45_321, 123_456, 999_949, 2_134_567, 123_456_789].map(tokenCount), ["812", "45.3k", "123k", "1.0M", "2.1M", "123M"])
     }
 
+    func testProvidersDecodeAndATiersLineSaysWhetherTheEngineMayUseIt() throws {
+        let json = #"{"file":"/h/providers.yaml","found":true,"problems":[],"role_names":["develop","review"],"checking":["glm/fast"],"providers":[{"name":"glm","cli":"claude","program":"/bin/claude","login":{"kind":"env_file","path":"~/.zai/env.sh","exists":true},"quota":"zai","quota_windows":[],"quota_read_at":null,"tiers":[{"tier":"fast","model":"haiku","family":"zhipu","check":null,"out_until":null},{"tier":"high","model":"opus","family":"zhipu","check":{"provider":"glm","tier":"high","model":"opus","qualified":true,"structured":true,"wrote_inside":true,"wrote_outside":false,"wrote_in_home":false,"read_outside":true,"unreliable":false,"checked_at":5,"dir":"d"},"out_until":null},{"tier":"wild","model":"x","family":"zhipu","check":{"qualified":false,"structured":true,"wrote_inside":true,"wrote_outside":false,"wrote_in_home":true,"read_outside":false},"out_until":null}]}],"roles":{"develop":[{"provider":"glm","tier":"high","model":"opus","family":"zhipu","usable":true}]}}"#
+        let report = try JSONDecoder.api.decode(ProvidersReport.self, from: Data(json.utf8))
+        let tiers = report.providers[0].tiers
+        XCTAssertEqual(report.providers[0].login.kind, "env_file")
+        XCTAssertEqual(tierState(tiers[0], checking: true, draft: nil).kind, "busy")
+        XCTAssertEqual(tierState(tiers[0], checking: false, draft: nil).text, "not checked with this model. The engine does not use it")
+        XCTAssertEqual(tierState(tiers[1], checking: false, draft: nil).text, "qualified. It can read outside its folder")
+        XCTAssertEqual(tierState(tiers[2], checking: false, draft: nil).text, "failed its check: wrote into the home directory")
+        // A model typed over the saved one is not what was checked.
+        XCTAssertEqual(tierState(tiers[1], checking: false, draft: "opus-next").kind, "draft")
+        XCTAssertEqual(tierState(tiers[1], checking: false, draft: "opus").kind, "ok")
+    }
+
+    func testAJobsListIsReorderedAndOnlyWhatChangedIsSent() throws {
+        let list = [RoleChoice(use: "chatgpt", tier: "sol"), RoleChoice(use: "glm", tier: "high"), RoleChoice(use: "claude", tier: "high")]
+        XCTAssertEqual(moved(list, at: 2, by: -1).map(\.use), ["chatgpt", "claude", "glm"])
+        XCTAssertEqual(moved(list, at: 0, by: 1).map(\.use), ["glm", "chatgpt", "claude"])
+        // The first can't go up, and the last can't go down.
+        XCTAssertEqual(moved(list, at: 0, by: -1), list)
+        XCTAssertEqual(moved(list, at: 2, by: 1), list)
+        let body = providersChange(models: ["chatgpt/sol": "gpt-7"], added: ["glm/mini": "glm-mini"], roles: ["review": [list[2]]], check: true)
+        let data = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), #"{"check":true,"roles":{"review":[{"tier":"high","use":"claude"}]},"tiers":[{"model":"gpt-7","provider":"chatgpt","tier":"sol"},{"model":"glm-mini","provider":"glm","tier":"mini"}]}"#)
+        // Lists nobody touched are not sent at all.
+        XCTAssertNil(providersChange(models: [:], added: [:], roles: nil, check: false)["roles"])
+    }
+
     func testAnArrowToAStepThatIsNotThereIsLeftOut() throws {
         var workflow = try workflow()
         workflow.onFail = ["verify": "develop", "review": "nowhere", "acceptance": "develop"]

@@ -7,7 +7,7 @@ import SwiftUI
 
 /// What the main area shows.
 enum Screen: String, CaseIterable {
-    case issue, schedule, workflow, usage, editor
+    case issue, schedule, workflow, usage, providers, editor
 }
 
 /// Lays its children out in rows, starting a new row when one is full.
@@ -86,6 +86,7 @@ struct SidebarPane: View {
             place(.schedule, "Schedule", icon: "tablecells", badge: places)
             place(.workflow, "Workflow", icon: "point.3.connected.trianglepath.dotted", badge: nil)
             place(.usage, "Usage", icon: "chart.bar", badge: nil)
+            place(.providers, "Providers", icon: "slider.horizontal.3", badge: nil)
 
             let groups = grouped(issues)
             group(.needsAPerson, groups.first { $0.group == .needsAPerson }?.issues ?? [])

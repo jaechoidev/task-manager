@@ -62,6 +62,7 @@ enum Render {
         let usage: [UsageRow] = fetch(address, "usage") ?? []
         let schedule: Schedule? = fetch(address, "schedule")
         let modules: [ModuleInfo] = screen == .editor ? (fetch(address, "modules" + query) ?? []) : []
+        let providers: ProvidersReport? = screen == .providers ? fetch(address, "providers") : nil
         let original = workflow?.text ?? ""
         let draft = draftFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) } ?? original
         let validation = screen == .editor ? validate(address, draft: draft, repo: repo) : nil
@@ -101,6 +102,10 @@ enum Render {
                         }
                     case .usage:
                         padded { UsagePane(usage: usage, schedule: schedule) }
+                    case .providers:
+                        padded {
+                            if let providers { ProvidersPane(report: providers) } else { Text("This engine does not report its providers.") }
+                        }
                     case .issue:
                         padded {
                             if let selected {

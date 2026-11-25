@@ -9,7 +9,7 @@
 //! must carry that token.
 
 use super::state::{IssueRow, Store};
-use super::{board, config::Config, editing, first_line, git, ledger, lock, util};
+use super::{board, config::Config, editing, first_line, git, ledger, lock, providers, providers_edit, qualify, util};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -242,6 +242,29 @@ fn schedule_json(home: &Path, store: &Store) -> Result<Value> {
     Ok(json!({ "now": now, "schedulers": schedulers, "pools": pools, "out": out, "quota": quota }))
 }
 
+/// The providers file as `factory providers` shows it, with the jobs a
+/// list can be given for and the tiers being checked right now.
+fn providers_json(home: &Path) -> Result<Value> {
+    let mut value = serde_json::to_value(providers::report_as_known(home)?)?;
+    let checking = providers::Providers::load(home).ok().flatten().map(|set| qualify::being_checked(home, &set)).unwrap_or_default();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("role_names".into(), json!(providers_edit::ROLES));
+        object.insert("checking".into(), json!(checking));
+    }
+    Ok(value)
+}
+
+/// Starts `factory providers check` for one tier, on its own: three short
+/// real calls. The result shows up in the providers report when it is done.
+fn start_check(context: &Context_, provider: &str, tier: &str) -> Result<String> {
+    let logs = context.home.join("checks");
+    std::fs::create_dir_all(&logs)?;
+    let log = logs.join(format!("check-{provider}-{tier}.log"));
+    let out = std::fs::File::create(&log)?;
+    Command::new(&context.program).args(["providers", "check", provider, "--tier", tier]).stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out).spawn().context("starting factory providers check")?;
+    Ok(log.display().to_string())
+}
+
 fn find(store: &Store, owner: &str, name: &str, number: &str) -> Result<Option<IssueRow>> {
     let Ok(number) = number.parse::<u64>() else { return Ok(None) };
     store.issue(&format!("{owner}/{name}"), number)
@@ -265,6 +288,47 @@ pub fn route(context: &Context_, request: &Request) -> (u16, Value) {
             }
             ("GET", ["v1", "usage"]) => (200, usage_json(&store)?),
             ("GET", ["v1", "schedule"]) => (200, schedule_json(&context.home, &store)?),
+            ("GET", ["v1", "providers"]) => (200, providers_json(&context.home)?),
+            // Changes which model a tier names and who is tried for each job.
+            // With `"check": true` every tier whose model changed is checked
+            // at once, because the engine uses a tier only after its check.
+            ("POST", ["v1", "providers"]) => {
+                let mut body: Value = match serde_json::from_str(request.body) {
+                    Ok(body) => body,
+                    Err(e) => return Ok((422, json!({ "ok": false, "problems": [format!("the request is not JSON: {e}")] }))),
+                };
+                let check = body.as_object_mut().and_then(|object| object.remove("check")).and_then(|flag| flag.as_bool()).unwrap_or(false);
+                let change: providers_edit::Change = match serde_json::from_value(body) {
+                    Ok(change) => change,
+                    Err(e) => return Ok((422, json!({ "ok": false, "problems": [format!("the request is not a change: {e}")] }))),
+                };
+                match providers_edit::save(&context.home, &change)? {
+                    Err(problems) => (422, json!({ "ok": false, "problems": problems })),
+                    Ok(changed) => {
+                        let mut started = Vec::new();
+                        if check {
+                            for (provider, tier) in &changed {
+                                start_check(context, provider, tier)?;
+                                started.push(format!("{provider}/{tier}"));
+                            }
+                        }
+                        let unchecked: Vec<String> = changed.iter().map(|(provider, tier)| format!("{provider}/{tier}")).collect();
+                        (200, json!({ "ok": true, "problems": [], "changed_tiers": unchecked, "checking": started, "providers": providers_json(&context.home)? }))
+                    }
+                }
+            }
+            ("POST", ["v1", "providers", "check"]) => {
+                let wanted: Value = serde_json::from_str(request.body).unwrap_or(Value::Null);
+                let (Some(provider), Some(tier)) = (wanted.get("provider").and_then(Value::as_str), wanted.get("tier").and_then(Value::as_str)) else {
+                    return Ok((422, json!({ "ok": false, "problems": ["send {\"provider\": ..., \"tier\": ...}"] })));
+                };
+                // Only a tier the file has. The names go on a command line.
+                let known = providers::Providers::load(&context.home)?.is_some_and(|set| set.providers.get(provider).is_some_and(|entry| entry.tiers.contains_key(tier)));
+                if !known {
+                    return Ok((404, json!({ "ok": false, "problems": [format!("there is no tier {tier} of a provider {provider}")] })));
+                }
+                (202, json!({ "ok": true, "started": true, "log": start_check(context, provider, tier)? }))
+            }
             // Reading the plans takes a call to each provider, so it runs on
             // its own. The readings show up in the schedule when it is done.
             ("POST", ["v1", "quota", "refresh"]) => {
@@ -588,6 +652,47 @@ mod tests {
         assert_eq!(busy["pools"][1]["slots"][0]["holder"]["what"], "review, opus");
         assert_eq!((busy["out"][0]["who"].as_str(), busy["out"][0]["reason"].as_str(), busy["out"][0]["hits"].as_u64()), (Some("chatgpt/gpt-x"), Some("You have hit your usage limit"), Some(1)));
         assert!(busy["out"][0]["until"].as_u64() > busy["now"].as_u64());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn providers_are_read_and_changed_through_the_api() {
+        let home = home("providers");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("providers.yaml"), "# mine\nproviders:\n  chatgpt:\n    cli: codex\n    family: openai\n    tiers:\n      sol: gpt-6.2-sol   # the big one\n  claude:\n    cli: claude\n    family: anthropic\n    tiers:\n      high: opus\nroles:\n  develop:\n    - { use: chatgpt, tier: sol }\n").unwrap();
+        // The check can't be started from here: `program` is not a program.
+        let context = Context_ { home: home.clone(), repos: BTreeMap::new(), program: PathBuf::from("/nonexistent/factory") };
+        let post = |path: &str, body: &str| route(&context, &Request { method: "POST", path, query: BTreeMap::new(), body });
+
+        let (status, read) = get(&context, "/v1/providers");
+        assert_eq!(status, 200);
+        assert_eq!(read["role_names"], json!(["research", "acceptance", "develop", "review", "summary", "judgment"]));
+        assert_eq!(read["checking"], json!([]));
+        assert_eq!(read["providers"][0]["tiers"][0]["model"], "gpt-6.2-sol");
+        assert_eq!(read["roles"]["develop"][0]["usable"], false);
+
+        // A model and the lists change in one request. Nothing was asked to
+        // be checked, so nothing is started, and the answer says which tier
+        // has no check for its model now.
+        let (status, saved) = post("/v1/providers", r#"{"tiers":[{"provider":"chatgpt","tier":"sol","model":"gpt-7"}],"roles":{"develop":[{"use":"chatgpt","tier":"sol"}],"review":[{"use":"claude","tier":"high"}]}}"#);
+        assert_eq!(status, 200, "{saved}");
+        assert_eq!((saved["ok"].as_bool(), &saved["changed_tiers"], &saved["checking"]), (Some(true), &json!(["chatgpt/sol"]), &json!([])));
+        assert_eq!(saved["providers"]["roles"]["review"][0]["provider"], "claude");
+        let text = std::fs::read_to_string(home.join("providers.yaml")).unwrap();
+        assert!(text.starts_with("# mine\n") && text.contains("      sol: gpt-7   # the big one\n") && text.contains("  review:\n    - { use: claude, tier: high }\n"), "{text}");
+        assert!(home.join("providers.yaml.bak").is_file());
+
+        // What makes no sense is refused, with why, and the file stays.
+        let (status, refused) = post("/v1/providers", r#"{"roles":{"review":[{"use":"nobody","tier":"x"}]}}"#);
+        assert_eq!(status, 422);
+        assert!(refused["problems"][0].as_str().unwrap().contains("unknown provider nobody"), "{refused}");
+        assert_eq!(post("/v1/providers", "not json").0, 422);
+        assert_eq!(post("/v1/providers", r#"{"surprise":1}"#).0, 422);
+        assert_eq!(std::fs::read_to_string(home.join("providers.yaml")).unwrap(), text);
+        // A check is only started for a tier the file has.
+        assert_eq!(post("/v1/providers/check", r#"{"provider":"chatgpt","tier":"nope"}"#).0, 404);
+        assert_eq!(post("/v1/providers/check", r#"{"provider":"chatgpt; rm -rf /","tier":"sol"}"#).0, 404);
+        assert_eq!(post("/v1/providers/check", "{}").0, 422);
         let _ = std::fs::remove_dir_all(&home);
     }
 

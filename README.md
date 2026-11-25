@@ -266,6 +266,9 @@ It is generated from the state database and the run files, with no LLM call, and
 | `POST /v1/modules?repo=...` | Scaffolds `{"module": "<kind>/<name>", "role": ...}` into a pull request |
 | `GET /v1/usage` | Calls, tokens and usage limits hit, per vendor. Tokens are what each program counted for its own calls: all input, the cached part of it, and output |
 | `POST /v1/quota/refresh` | Starts `factory providers refresh`, which reads every provider's plan again |
+| `GET /v1/providers` | What `factory providers` shows, as data: every provider and tier with what its check found, each job's list, the jobs a list can be given for, and the tiers being checked right now |
+| `POST /v1/providers` | Changes `providers.yaml`: `{"tiers": [{"provider", "tier", "model"}], "roles": {"<job>": [{"use", "tier"}]}, "check": true}`. Refused with every reason when the result would not be consistent. With `check`, each tier whose model changed is checked at once |
+| `POST /v1/providers/check` | Starts `factory providers check` for `{"provider", "tier"}` |
 | `GET /v1/schedule` | What runs where: each running scheduler's places with what holds them, what waits and what for, what is parked until when, who holds each slot of each pool, and who is out of quota |
 | `GET /v1/capacity` | What `factory capacity` reports, as data |
 | `POST /v1/issues/<owner>/<repo>/<n>/retry` | Starts `factory retry` for the issue |
@@ -501,6 +504,15 @@ A call that fails with signs of a usage or rate limit is not a failed attempt. T
 Codex documents no stable format for a failed call, so there the engine looks for the phrases a limit is worded with ("usage limit", "rate limit", "429", "too many requests") in the error and in error lines of the output. It does the same for Claude when Claude's own event does not say.
 
 `factory providers` prints each provider's latest reading and when it was read. `GET /v1/schedule` carries the same, and the app shows it on its Usage screen.
+
+#### Changing the file from the app
+
+The app's Providers screen changes which model a tier names, adds a tier, and reorders who is tried for each job. It goes through `POST /v1/providers`, and the rules are the engine's:
+
+- **The file stays yours.** A tier's line and the `roles:` block are rewritten in place. Comments and everything else stay as they are. The result is read back and compared with what was asked for, and a file laid out in a way the engine can't follow is left alone, with a message to edit it by hand. The file as it was is kept as `providers.yaml.bak`.
+- **A change is refused whole** when it would leave a job naming a tier that does not exist, a model name with spaces in it, or anything else `factory providers` would report.
+- **A changed model is not usable until it passes its check.** The check that was on record was for the old model. Saving from the app starts the check at once (three short calls), and until it passes the engine skips that tier wherever it is listed.
+- **What is not a setting stays out.** The reviewer and the acceptance writer never come from the developer's family, whatever the lists say.
 
 `factory providers refresh` reads every plan now, or one provider's when it is named. Z.ai is asked directly, which costs nothing. Claude and Codex only say it in a reply, so each gets one small call on its cheapest checked tier, in an empty folder. The refresh button beside Quota on the app's Usage screen does the same.
 

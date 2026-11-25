@@ -18,6 +18,7 @@ struct SidewaysScroll<Content: View>: View {
 struct RootView: View {
     @ObservedObject var model: AppModel
     @StateObject private var editor = EditorModel()
+    @StateObject private var providers = ProvidersModel()
     @State private var screen: Screen = .issue
     @State private var filter = ""
     @State private var sidebarShown = true
@@ -124,6 +125,26 @@ struct RootView: View {
                     WorkflowPane(workflow: workflow, repo: model.workflowRepo) { screen = .editor }
                 } else {
                     missing("Start the engine with a checkout of the repository to see its workflow.")
+                }
+            }
+        case .providers:
+            page {
+                if let report = providers.report {
+                    ProvidersPane(
+                        report: report, model: providers,
+                        save: { Task { await providers.save(client: model.client) } },
+                        check: { provider, tier in Task { await providers.check(provider, tier, client: model.client) } }
+                    )
+                } else {
+                    missing("This engine does not report its providers. Build a newer `factory`.")
+                }
+            }
+            // Asked again every two seconds while the screen is open, so a
+            // check that ends shows by itself. What was typed is kept apart.
+            .task {
+                while !Task.isCancelled {
+                    await providers.load(client: model.client)
+                    try? await Task.sleep(for: .seconds(2))
                 }
             }
         case .usage:

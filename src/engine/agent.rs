@@ -387,11 +387,20 @@ fn read_codex(stdout: &str, output: &Path) -> (Option<Value>, Option<String>, Op
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find_map(|event| event.get("thread_id").and_then(Value::as_str).map(str::to_string));
+    // What Codex itself said went wrong, when it said: a failed turn, or
+    // an error event. That says more than the state of its output file.
+    let said = || {
+        stdout.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find_map(|event| match event.get("type").and_then(Value::as_str) {
+            Some("turn.failed") => event.get("error").and_then(|error| error.get("message")).and_then(Value::as_str).map(str::to_string),
+            Some("error") => event.get("message").and_then(Value::as_str).map(str::to_string),
+            _ => None,
+        })
+    };
     match std::fs::read_to_string(output) {
-        Err(_) => (None, session, Some("codex wrote no final message".into())),
+        Err(_) => (None, session, Some(said().map_or("codex wrote no final message".to_string(), |why| format!("codex reported an error: {why}")))),
         Ok(raw) => match serde_json::from_str::<Value>(raw.trim()) {
             Ok(value) => (Some(value), session, None),
-            Err(e) => (None, session, Some(format!("codex's final message is not JSON: {e}"))),
+            Err(e) => (None, session, Some(said().map_or(format!("codex's final message is not JSON: {e}"), |why| format!("codex reported an error: {why}")))),
         },
     }
 }
@@ -508,6 +517,26 @@ mod tests {
         assert_eq!(read_claude(&cut).2.as_deref(), Some("claude did not print a JSON result"));
         // No event, no reading. Text that only mentions one is not an event.
         assert_eq!(claude_limits("{\"type\":\"assistant\",\"message\":\"a rate_limit_event is printed\"}"), None);
+    }
+
+    #[test]
+    fn codex_s_own_word_on_a_failure_is_what_is_reported() {
+        let dir = std::env::temp_dir().join(format!("factory-codex-said-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.json");
+        // A model the account can't use: Codex says so, and leaves an empty file.
+        std::fs::write(&out, "").unwrap();
+        let stdout = "{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"a warning\"}}\n{\"type\":\"error\",\"message\":\"The 'gpt-0' model is not supported\"}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"The 'gpt-0' model is not supported when using Codex with a ChatGPT account.\"}}\n";
+        let (output, session, error) = read_codex(stdout, &out);
+        assert_eq!((output, session.as_deref()), (None, Some("t1")));
+        assert_eq!(error.as_deref(), Some("codex reported an error: The 'gpt-0' model is not supported when using Codex with a ChatGPT account."));
+        // With nothing said, the state of the file is all there is to report.
+        assert!(read_codex("{\"type\":\"thread.started\",\"thread_id\":\"t1\"}\n", &out).2.unwrap().starts_with("codex's final message is not JSON"));
+        assert_eq!(read_codex("", &dir.join("missing.json")).2.as_deref(), Some("codex wrote no final message"));
+        // A reply that is there is a reply, whatever was said along the way.
+        std::fs::write(&out, "{\"ok\":true}").unwrap();
+        assert_eq!(read_codex(stdout, &out).2, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
