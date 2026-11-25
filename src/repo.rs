@@ -118,6 +118,29 @@ fn rulesets(owner: &str) -> Result<Vec<Value>> {
     ])
 }
 
+/// Why this account can't check or converge the repo, when it isn't an admin
+/// of it. The bypass list, invitations, Actions settings and secrets are
+/// shown only to an admin, so an account with less would see half of them
+/// and fail on the rest.
+fn not_admin(repo: &str, info: &Value) -> Option<String> {
+    let can = |what: &str| info.pointer(&format!("/permissions/{what}")).and_then(Value::as_bool) == Some(true);
+    if can("admin") {
+        return None;
+    }
+    let access = if can("maintain") {
+        "maintain"
+    } else if can("push") {
+        "write"
+    } else if can("triage") {
+        "triage"
+    } else {
+        "read"
+    };
+    Some(format!(
+        "{repo}: the account gh is using has {access} access, not admin. Some settings checked here (the rulesets' bypass list, invitations, Actions settings, secrets) are shown only to an admin. Run this as the repository's owner"
+    ))
+}
+
 fn exists(result: Result<Value, ApiError>) -> Result<Option<Value>> {
     match result {
         Ok(value) => Ok(Some(value)),
@@ -132,7 +155,10 @@ pub fn init(opts: &Options) -> Result<Vec<Check>> {
     println!("repo init {repo}");
 
     // 1. The repository itself.
-    if exists(gh::api("GET", &format!("repos/{repo}"), None))?.is_some() {
+    if let Some(info) = exists(gh::api("GET", &format!("repos/{repo}"), None))? {
+        if let Some(why) = not_admin(repo, &info) {
+            bail!(why);
+        }
         step("repository already exists, settings will be converged");
     } else {
         let template = opts
@@ -241,6 +267,9 @@ pub fn preflight(opts: &Options) -> Result<Vec<Check>> {
     let Some(info) = exists(gh::api("GET", &format!("repos/{repo}"), None))? else {
         bail!("{repo} does not exist or is not visible to this account");
     };
+    if let Some(why) = not_admin(repo, &info) {
+        bail!(why);
+    }
     let private = info.get("private").and_then(Value::as_bool) == Some(true);
     add(private, "repository is private", format!("visibility: {}", info["visibility"].as_str().unwrap_or("?")));
     let default = info.get("default_branch").and_then(Value::as_str).unwrap_or("?");
@@ -414,4 +443,23 @@ pub fn report(repo: &str, checks: &[Check]) -> String {
         count(Status::Fail)
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_admin_may_check_or_converge_a_repo() {
+        let owner = json!({ "permissions": { "admin": true, "maintain": true, "push": true, "triage": true, "pull": true } });
+        assert_eq!(not_admin("o/r", &owner), None);
+        let agent = json!({ "permissions": { "admin": false, "maintain": false, "push": true, "triage": true, "pull": true } });
+        let why = not_admin("o/r", &agent).unwrap();
+        assert!(why.contains("write access, not admin"), "{why}");
+        assert!(why.contains("owner"), "{why}");
+        let reader = json!({ "permissions": { "admin": false, "pull": true } });
+        assert!(not_admin("o/r", &reader).unwrap().contains("read access"));
+        // A reply without permissions, as GitHub gives to no login at all.
+        assert!(not_admin("o/r", &json!({})).is_some());
+    }
 }
