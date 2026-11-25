@@ -51,8 +51,12 @@ providers:
       high: { model: gemini-4-hydrogen-high, family: google }
       fast: { model: gemini-3.8-flash-medium, family: google }
 
-# For each role, who to try, in order.
+# For each role, who to try, in order. A role with no list uses the
+# workflow's vendor with that program's default model on this machine.
 roles:
+  acceptance:
+    - { use: claude, tier: high }
+    - { use: glm, tier: high }
   develop:
     - { use: chatgpt, tier: standard }
     - { use: glm, tier: high }
@@ -548,6 +552,11 @@ pub fn print(report: &Report) {
             );
         }
     }
+    let unlisted = unlisted_roles(report);
+    if !unlisted.is_empty() {
+        println!("\nno list, so not pinned to a model: {}", unlisted.join(", "));
+        println!("  the workflow's vendor answers, with that program's default model on this machine");
+    }
     if report.problems.is_empty() {
         println!("\nthe file is consistent. `factory providers check <name>` tries a provider for real.");
     } else {
@@ -556,6 +565,12 @@ pub fn print(report: &Report) {
             println!("  {problem}");
         }
     }
+}
+
+/// The jobs the file gives no list. Each falls back to the workflow's vendor
+/// and to whatever model that program picks by default on this machine.
+pub fn unlisted_roles(report: &Report) -> Vec<&'static str> {
+    super::providers_edit::ROLES.iter().copied().filter(|role| !report.roles.contains_key(*role)).collect()
 }
 
 /// `~` and `~/` are the home directory. Nothing else is expanded.
@@ -692,6 +707,8 @@ mod tests {
         assert_eq!((develop[1].model.as_deref(), develop[1].family.as_deref()), (Some("opus"), Some("zhipu")));
         // Nothing has been checked, so nothing may be used yet.
         assert!(!develop[0].usable && !develop[1].usable);
+        // Jobs with no list answer with whatever model the program defaults to.
+        assert_eq!(unlisted_roles(&report), ["research", "judgment"]);
 
         // No file is not a problem: the engine carries on as before.
         let none = build(&file, None, &qualify::Store::new(), &Ledger::default(), 100, &|_| None, &|_| false);

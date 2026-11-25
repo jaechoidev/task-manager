@@ -307,7 +307,7 @@ struct ProvidersPane: View {
             Text(role).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text).frame(width: 96, alignment: .leading).padding(.top, 4)
             VStack(alignment: .leading, spacing: 6) {
                 if list.isEmpty {
-                    Text("No list. The workflow's own vendor does this job.").font(.system(size: 13)).foregroundStyle(Theme.secondary).padding(.top, 4)
+                    Text("No list. The workflow's own vendor does this job, with its default model on this machine.").font(.system(size: 13)).foregroundStyle(Theme.secondary).padding(.top, 4)
                 }
                 ForEach(Array(list.enumerated()), id: \.offset) { index, choice in
                     let info = tierInfo(choice)
