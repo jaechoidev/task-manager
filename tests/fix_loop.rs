@@ -1543,3 +1543,27 @@ fn the_queue_goes_on_with_other_work_while_an_issue_is_parked() {
     let logs: String = fs::read_dir(trial.dir.join("home/queue/o__r")).unwrap().map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap()).collect();
     assert!(logs.contains("PARKED: parked until") && logs.contains("resuming run"), "{logs}");
 }
+
+#[test]
+fn the_queue_picks_up_an_issue_that_becomes_ready_while_a_place_is_free() {
+    // Issue 8 has no label when the queue starts.
+    let trial = Trial::build("q-late", &github_workflow(2), ISSUE_BODY)
+        .with_issues(&[(7, "a", "Sources/I7/", &["today"], &[]), (8, "b", "Sources/I8/", &[], &[])]);
+    let issues = trial.dir.join("stub/issues.json");
+    // A person labels it a second later, while issue 7 is still at work.
+    let label_later = std::thread::spawn({
+        let issues = issues.clone();
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let mut all: serde_json::Value = serde_json::from_str(&fs::read_to_string(&issues).unwrap()).unwrap();
+            all["8"]["labels"] = serde_json::json!(["today"]);
+            fs::write(&issues, all.to_string()).unwrap();
+        }
+    });
+    let (output, text) = trial.queue_with(&["--parallel", "2"], &[("FACTORY_QUEUE_LOOK_SECONDS", "1")]);
+    label_later.join().unwrap();
+    assert!(output.status.success(), "{text}");
+    // It was started without waiting for issue 7 to end.
+    assert!(text.find("#8 b started").unwrap() < text.find("#7 a ended").unwrap(), "{text}");
+    assert!(text.contains("Merged:") && text.contains("#7") && text.contains("#8") && text.contains("Blocked: none"), "{text}");
+}

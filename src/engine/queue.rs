@@ -130,6 +130,11 @@ fn last_line(log: &Path) -> String {
         .to_string()
 }
 
+/// How often the queue looks for newly ready issues while a place is free.
+fn look_again() -> Duration {
+    Duration::from_secs(std::env::var("FACTORY_QUEUE_LOOK_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(30))
+}
+
 fn pause() -> Duration {
     match std::env::var("FACTORY_POLL_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
         Some(0) => Duration::from_millis(100),
@@ -213,7 +218,11 @@ pub fn run(opts: &QueueOptions) -> Result<bool> {
             break;
         }
 
-        // Wait for one run to end.
+        // Wait for one run to end. With a place free, also look again now
+        // and then: an issue may have become ready without a run ending,
+        // because a person labelled it, or because GitHub's list was a few
+        // seconds behind when the queue started.
+        let looked = Instant::now();
         let index = loop {
             let mut ended = None;
             for (index, run) in running.iter_mut().enumerate() {
@@ -223,10 +232,12 @@ pub fn run(opts: &QueueOptions) -> Result<bool> {
                 }
             }
             match ended {
-                Some(index) => break index,
+                Some(index) => break Some(index),
+                None if running.len() < opts.parallel && looked.elapsed() >= look_again() => break None,
                 None => std::thread::sleep(Duration::from_millis(200)),
             }
         };
+        let Some(index) = index else { continue };
         let mut done = running.remove(index);
         let status = done.child.wait()?;
         let result = last_line(&done.log);

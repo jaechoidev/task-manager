@@ -282,6 +282,7 @@ The engine returns data and no layout. Clients poll: there is no event stream ye
 | Ready | The issue was made by `plan create`, is open, carries the label, and everything it is blocked by is closed. GitHub's blocked-by links are the graph |
 | Order | `priority:high`, then unlabelled or `priority:normal`, then `priority:low`. Lower issue numbers first within one priority |
 | At once | Up to `--parallel` issues. By default 2, or the size of this machine's simulator pool when that is larger. Two issues whose scopes overlap never run together, whatever the plan said |
+| Looking again | When a run ends, and every 30 seconds while a place is free. An issue labelled while the queue runs is picked up |
 | Held back | An issue with the `blocked` label waits for a person. An issue the queue already ran is not started twice in one session |
 
 Each issue runs as its own `factory run` process, with its output in `~/.factory/queue/<repo>/`. One that dies takes nothing else with it.
