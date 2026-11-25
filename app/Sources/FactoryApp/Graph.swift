@@ -20,8 +20,8 @@ struct GraphLayout: Equatable {
     var backEdges: [BackEdge]
     var size: CGSize
 
-    static let nodeSize = CGSize(width: 104, height: 46)
-    static let gap: CGFloat = 26
+    static let nodeSize = CGSize(width: 104, height: 56)
+    static let gap: CGFloat = 32
 
     static func make(_ workflow: Workflow) -> GraphLayout {
         let names = workflow.steps.map(\.name)

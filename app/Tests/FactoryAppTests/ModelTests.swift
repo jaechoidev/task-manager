@@ -176,6 +176,62 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(stepWho(step(nil, nil)), "engine")
     }
 
+    func testTheStripAboveAnIssueSaysHowEachStepWent() {
+        let step = { (name: String, verdict: String, pass: Int) in StepRow(step: name, vendor: nil, model: nil, attempt: 1, verdict: verdict, exitCode: 0, seconds: 1, pass: pass) }
+        let steps = [step("research", "skipped", 1), step("acceptance", "replied", 1), step("scope", "pass", 1), step("verify", "fail", 1), step("develop", "replied", 2), step("verify", "pass", 2)]
+        // With the workflow's own order, a gate that is not a step is left out
+        // and a step that has not run yet is still listed.
+        let chips = stageChips(steps: steps, order: ["research", "acceptance", "develop", "verify", "review"], current: "review")
+        XCTAssertEqual(chips.map(\.name), ["research", "acceptance", "develop", "verify", "review"])
+        XCTAssertEqual(chips.map(\.state), ["skip", "ok", "ok", "ok", "current"])
+        XCTAssertEqual(chips.map(\.extra), [" skipped", "", "", " ×2", ""])
+        XCTAssertEqual(chips.map(\.mark), ["–", "✓", "✓", "✓", "▶"])
+        // The last run of a step is what counts, and a step still to come waits.
+        let failed = stageChips(steps: Array(steps.prefix(4)), order: ["acceptance", "verify", "review"], current: nil)
+        XCTAssertEqual(failed.map(\.state), ["ok", "fail", "pending"])
+        // Without a workflow, the steps are listed as they ran.
+        XCTAssertEqual(stageChips(steps: steps, order: nil, current: nil).map(\.name), ["research", "acceptance", "scope", "verify", "develop"])
+    }
+
+    func testStepsAreGroupedByPassWithWhyEachPassBegan() {
+        let step = { (name: String, verdict: String, pass: Int) in StepRow(step: name, vendor: nil, model: nil, attempt: 1, verdict: verdict, exitCode: 0, seconds: 1, pass: pass) }
+        let groups = passGroups([step("develop", "replied", 1), step("sync", "merged-base", 1), step("verify", "fail", 2), step("develop", "replied", 3)])
+        XCTAssertEqual(groups.map(\.pass), [1, 2, 3])
+        XCTAssertEqual(groups.map(\.note), ["2 steps", "after the base branch was merged in", "after a step sent it back"])
+        XCTAssertEqual(groups.map { $0.steps.count }, [2, 1, 1])
+        XCTAssertEqual(passGroups([step("develop", "replied", 1)]).map(\.note), ["1 step"])
+    }
+
+    func testAQuotaLineIsTakenApartForItsBar() {
+        XCTAssertEqual(quotaLine("5-hour window: 43% used, resets 2026-11-25 07:00 UTC"), QuotaLine(name: "5-hour window", share: 0.43, used: "43% used", detail: "resets 2026-11-25 07:00 UTC"))
+        XCTAssertEqual(quotaLine("weekly window: 100% used, used up, resets soon").share, 1)
+        // A line that is not a window has no bar.
+        XCTAssertNil(quotaLine("plan: prolite").share)
+        XCTAssertNil(quotaLine("5-hour window: close to its limit").share)
+        XCTAssertEqual(quotaLine("no colon here").name, "no colon here")
+    }
+
+    func testMarksFiltersAndProblemLines() throws {
+        let issues = try JSONDecoder.api.decode([Issue].self, from: Data(issuesJSON.utf8))
+        XCTAssertEqual(issues.map { mark(of: $0) }, [.needs, .done, .waiting, .pullRequest])
+        // An issue the scheduler parked reads differently from one that waits in a step.
+        XCTAssertEqual(mark(of: issues[2], parked: true), .parked)
+        XCTAssertEqual(issues.filter { matches($0, filter: "", project: nil) }.count, 4)
+        XCTAssertEqual(issues.filter { matches($0, filter: "tab ver", project: nil) }.map(\.number), [24])
+        XCTAssertEqual(issues.filter { matches($0, filter: "#7", project: nil) }.map(\.number), [7])
+        XCTAssertEqual(issues.filter { matches($0, filter: "", project: "o/other") }.count, 0)
+        let text = "workflow:\n  - develop: { module: agent/dev }\n  - verify:  { module: check/verifyy }\non_fail:\n  verify: develop\n"
+        XCTAssertEqual(problemLine("step 'verify': module 'check/verifyy' does not exist", in: text), 3)
+        XCTAssertNil(problemLine("limits: fix_rounds must be at most 5", in: text))
+        XCTAssertEqual(refusedSteps(["step 'verify': module 'check/verifyy' does not exist", "step 'review' (agent/review): needs 'verify_log', which no earlier step produces", "limits are wrong"]), ["verify": "module not found", "review": "needs verify_log"])
+        // A module is in use only when a step names exactly it.
+        XCTAssertTrue(names("agent/dev", in: text))
+        XCTAssertFalse(names("check/verify", in: text))
+        XCTAssertTrue(names("check/verifyy", in: text))
+        XCTAssertEqual(engineLine(address: "http://127.0.0.1:7878", reached: true, updated: Date(timeIntervalSince1970: 100), now: Date(timeIntervalSince1970: 102)), "Engine at 127.0.0.1:7878 · updated 2 s ago")
+        XCTAssertEqual(engineLine(address: "http://127.0.0.1:7878", reached: false, updated: nil, now: Date()), "No answer from the engine at 127.0.0.1:7878")
+    }
+
     func testAnArrowToAStepThatIsNotThereIsLeftOut() throws {
         var workflow = try workflow()
         workflow.onFail = ["verify": "develop", "review": "nowhere", "acceptance": "develop"]

@@ -311,7 +311,7 @@ extension JSONDecoder {
 
 /// How the list groups issues, in the order a person needs them.
 enum IssueGroup: String, CaseIterable {
-    case needsAPerson = "Needs a person"
+    case needsAPerson = "Needs you"
     case active = "Running and waiting"
     case open = "Pull request open"
     case done = "Done"
@@ -358,4 +358,149 @@ func duration(_ seconds: Double) -> String {
     if seconds < 1 { return "under 1 s" }
     if seconds < 90 { return "\(Int(seconds.rounded())) s" }
     return "\(Int(seconds / 60)) min \(Int(seconds) % 60) s"
+}
+
+// MARK: - What the redesigned screens are built from
+
+/// Which mark an issue gets. An issue the scheduler has parked is waiting
+/// for quota, which reads differently from waiting inside a step.
+func mark(of issue: Issue, parked: Bool = false) -> Mark {
+    switch issue.state {
+    case "needs-a-person": return .needs
+    case "running": return .running
+    case "waiting": return parked ? .parked : .waiting
+    case "pr-open", "passed": return .pullRequest
+    case "merged": return .done
+    case "dropped": return .dropped
+    default: return .notStarted
+    }
+}
+
+/// Whether an issue matches what was typed into the filter and the project
+/// that was picked. Nothing typed and no project picked match everything.
+func matches(_ issue: Issue, filter: String, project: String?) -> Bool {
+    if let project, issue.repo != project { return false }
+    let words = filter.lowercased().split(separator: " ")
+    let text = "#\(issue.number) \(issue.title) \(issue.key) \(issue.repo) \(issue.stage)".lowercased()
+    return words.allSatisfy { text.contains($0) }
+}
+
+/// One step of the workflow as the strip above an issue shows it.
+struct StageChip: Equatable, Identifiable {
+    var name: String
+    /// `ok`, `skip`, `fail`, `current` or `pending`.
+    var state: String
+    /// How often it ran.
+    var times: Int
+
+    var id: String { name }
+    var mark: String {
+        switch state {
+        case "ok": return "✓"
+        case "skip": return "–"
+        case "fail": return "✕"
+        case "current": return "▶"
+        default: return ""
+        }
+    }
+    var extra: String {
+        if state == "skip" { return " skipped" }
+        return times > 1 ? " ×\(times)" : ""
+    }
+}
+
+let failingVerdicts: Set<String> = ["fail", "invalid", "failed", "changes", "timeout", "no-verdict", "conflict", "refused"]
+
+/// The workflow's steps in order, each with how it went for this issue.
+/// `order` is the workflow's own list when it is known. Without it the steps
+/// are taken as they ran. `current` is the step an unfinished issue is at.
+func stageChips(steps: [StepRow], order: [String]?, current: String?) -> [StageChip] {
+    var seen: [String] = []
+    for step in steps where !seen.contains(step.step) { seen.append(step.step) }
+    let names = order ?? seen
+    return names.map { name in
+        let runs = steps.filter { $0.step == name }
+        let state: String
+        if name == current {
+            state = "current"
+        } else if let last = runs.last {
+            state = last.verdict == "skipped" ? "skip" : (failingVerdicts.contains(last.verdict) ? "fail" : "ok")
+        } else {
+            state = "pending"
+        }
+        return StageChip(name: name, state: state, times: runs.count)
+    }
+}
+
+/// The steps of one pass, with a line on why the pass began.
+struct PassGroup: Equatable, Identifiable {
+    var pass: Int
+    var note: String
+    var steps: [StepRow]
+    var id: Int { pass }
+}
+
+func passGroups(_ steps: [StepRow]) -> [PassGroup] {
+    var groups: [PassGroup] = []
+    for step in steps {
+        if let last = groups.indices.last, groups[last].pass == step.pass {
+            groups[last].steps.append(step)
+        } else {
+            // A later pass begins because the base branch came in, or
+            // because something failed and went back.
+            let before = groups.last?.steps.last?.verdict
+            let note = groups.isEmpty ? "" : (before == "merged-base" ? "after the base branch was merged in" : "after a step sent it back")
+            groups.append(PassGroup(pass: step.pass, note: note, steps: [step]))
+        }
+    }
+    for index in groups.indices where groups[index].note.isEmpty {
+        let count = groups[index].steps.count
+        groups[index].note = "\(count) step\(count == 1 ? "" : "s")"
+    }
+    return groups
+}
+
+/// A line of a quota reading, such as `5-hour window: 43% used, resets ...`,
+/// taken apart for a bar. A line that is not a window, such as `plan: pro`,
+/// has no share.
+struct QuotaLine: Equatable {
+    var name: String
+    /// 0 to 1, when the line says how much is used.
+    var share: Double?
+    var used: String
+    var detail: String
+}
+
+func quotaLine(_ line: String) -> QuotaLine {
+    guard let colon = line.range(of: ": ") else { return QuotaLine(name: line, share: nil, used: "", detail: "") }
+    let name = String(line[..<colon.lowerBound])
+    let rest = String(line[colon.upperBound...])
+    let parts = rest.components(separatedBy: ", ")
+    let used = parts.first ?? rest
+    var share: Double?
+    if used.hasSuffix("% used"), let percent = Double(used.dropLast("% used".count)) {
+        share = percent / 100
+    }
+    return QuotaLine(name: name, share: share, used: used, detail: parts.dropFirst().joined(separator: ", "))
+}
+
+/// The line of a workflow file a problem is about, counted from 1, when the
+/// problem names a step: `step 'verify': ...` is about the line `- verify:`.
+func problemLine(_ problem: String, in text: String) -> Int? {
+    guard let open = problem.range(of: "step '"), let close = problem[open.upperBound...].firstIndex(of: "'") else { return nil }
+    let name = problem[open.upperBound..<close]
+    let lines = text.components(separatedBy: "\n")
+    return lines.firstIndex { $0.trimmingCharacters(in: .whitespaces).hasPrefix("- \(name):") }.map { $0 + 1 }
+}
+
+/// The step a problem names, if it names one.
+func problemStep(_ problem: String) -> String? {
+    guard let open = problem.range(of: "step '"), let close = problem[open.upperBound...].firstIndex(of: "'") else { return nil }
+    return String(problem[open.upperBound..<close])
+}
+
+/// How long ago the engine last answered, in words.
+func agoLine(_ seconds: Int) -> String {
+    if seconds < 1 { return "updated just now" }
+    return "updated \(duration(Double(seconds))) ago"
 }

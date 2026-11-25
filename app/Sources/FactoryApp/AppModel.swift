@@ -18,9 +18,21 @@ final class AppModel: ObservableObject {
     @Published var problem: String?
     /// What the last retry or drop did.
     @Published var notice: String?
+    /// When the engine last answered.
+    @Published var updatedAt: Date?
+    /// Only this repository's issues are listed. Nil lists every project's.
+    @Published var project: String?
 
     @AppStorage("address") var address = "http://127.0.0.1:7878"
     @AppStorage("token") var token = ""
+
+    /// The "to look at" items a person has ticked. Kept on this machine only.
+    @Published var looked: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "looked") ?? [])
+
+    func toggleLooked(_ key: String) {
+        if looked.contains(key) { looked.remove(key) } else { looked.insert(key) }
+        UserDefaults.standard.set(Array(looked).sorted(), forKey: "looked")
+    }
 
     private var loop: Task<Void, Never>?
     private var knownStuck: Set<String> = []
@@ -29,6 +41,14 @@ final class AppModel: ObservableObject {
     var needingAPerson: [Issue] { issues.filter { $0.state == "needs-a-person" } }
     var active: [Issue] { issues.filter { $0.state == "running" || $0.state == "waiting" } }
     var selectedIssue: Issue? { issues.first { $0.id == selected } }
+    /// Every repository there is something to show for.
+    var projects: [String] { Array(Set(repos + issues.map(\.repo))).sorted() }
+    /// The repository whose workflow is shown.
+    var workflowRepo: String? { [project, selectedIssue?.repo, repos.first].compactMap { $0 }.first { repos.contains($0) } }
+    /// Issues a scheduler has parked until somebody has quota.
+    var parked: Set<String> {
+        Set((schedule?.schedulers ?? []).flatMap { board in board.projects.flatMap { project in project.parked.map { "\(project.repo)#\($0.number)" } } })
+    }
 
     func start() {
         loop?.cancel()
@@ -48,6 +68,10 @@ final class AppModel: ObservableObject {
             self.repos = health.repos
             self.issues = issues
             self.problem = nil
+            self.updatedAt = Date()
+            if let project, !health.repos.contains(project), !issues.contains(where: { $0.repo == project }) {
+                self.project = nil
+            }
             if selected == nil || !issues.contains(where: { $0.id == selected }) {
                 selected = (needingAPerson.first ?? active.first ?? issues.first)?.id
             }
@@ -61,7 +85,7 @@ final class AppModel: ObservableObject {
             }
             self.usage = (try? await client.get("usage")) ?? []
             self.schedule = try? await client.get("schedule")
-            if let repo = selectedIssue?.repo ?? health.repos.first, health.repos.contains(repo) {
+            if let repo = project ?? selectedIssue?.repo ?? health.repos.first, health.repos.contains(repo) {
                 let query = repo.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? repo
                 self.workflow = try? await client.get("workflow?repo=\(query)")
             } else {
