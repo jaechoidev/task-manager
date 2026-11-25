@@ -351,7 +351,7 @@ factory service status
 factory service uninstall
 ```
 
-`install` makes the scheduler and the API two launchd agents of this Mac. They start at login and are started again when they stop. From then on, putting the label on an issue is all it takes, and the app always has an engine to talk to.
+`install` makes the scheduler and the API two launchd agents of this Mac. They start at login and are started again when they stop. `status` exits 1 unless both run and the API answers as its own agent, so a script can tell. From then on, putting the label on an issue is all it takes, and the app always has an engine to talk to.
 
 | Agent | Runs | Output |
 | --- | --- | --- |

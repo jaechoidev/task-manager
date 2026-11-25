@@ -249,7 +249,8 @@ enum ServiceCommand {
     /// Stop both and remove them. Issues at work pick up where they were
     /// the next time they are run
     Uninstall,
-    /// Whether each is installed and running, and where its output goes
+    /// Whether each is installed and running, and where its output goes.
+    /// Exits 1 unless both run and the API answers as its own agent
     Status,
 }
 
@@ -516,7 +517,11 @@ fn run() -> Result<bool> {
                     println!("Both start at login and are started again when they stop. Label an issue and the scheduler picks it up.");
                 }
                 ServiceCommand::Uninstall => engine::service::uninstall()?.iter().for_each(|line| println!("{line}")),
-                ServiceCommand::Status => engine::service::print(&engine::service::status()?),
+                ServiceCommand::Status => {
+                    let states = engine::service::status()?;
+                    engine::service::print(&states);
+                    return Ok(engine::service::healthy(&states));
+                }
             }
             Ok(true)
         }

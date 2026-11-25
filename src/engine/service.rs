@@ -196,10 +196,17 @@ fn plain(text: &str) -> String {
 /// the file again a few times if launchd still refuses it.
 fn restart(target: &str, domain: &str, file: &Path, run: &mut dyn FnMut(&[&str]) -> Result<Said>, wait: &mut dyn FnMut(Duration)) -> Result<std::result::Result<(), String>> {
     run(&["bootout", target])?;
-    let mut waited = Duration::ZERO;
-    while run(&["print", target])?.ok && waited < GONE_WITHIN {
-        wait(LOOK_EVERY);
-        waited += LOOK_EVERY;
+    let mut failed = None;
+    let mut gone = || match run(&["print", target]) {
+        Ok(said) => !said.ok,
+        Err(e) => {
+            failed = Some(e);
+            true
+        }
+    };
+    within(GONE_WITHIN, &mut gone, wait);
+    if let Some(e) = failed {
+        return Err(e);
     }
     let file = file.display().to_string();
     let mut last = String::new();
@@ -270,18 +277,23 @@ pub fn health(address: &str, within: Duration) -> Option<Option<u32>> {
     Some(pid)
 }
 
-/// Looks until `check` is true, for at most `limit`.
+/// Looks until `check` is true, for at most `limit`. The time a look takes
+/// counts too: asking a port that accepts and never replies takes the whole
+/// timeout of the ask.
 fn within(limit: Duration, check: &mut dyn FnMut() -> bool, wait: &mut dyn FnMut(Duration)) -> bool {
-    let mut waited = Duration::ZERO;
+    let mut spent = Duration::ZERO;
     loop {
-        if check() {
+        let started = std::time::Instant::now();
+        let done = check();
+        spent += started.elapsed();
+        if done {
             return true;
         }
-        if waited >= limit {
+        if spent >= limit {
             return false;
         }
         wait(LOOK_EVERY);
-        waited += LOOK_EVERY;
+        spent += LOOK_EVERY;
     }
 }
 
@@ -387,6 +399,11 @@ pub fn status() -> Result<Vec<State>> {
             Ok(state)
         })
         .collect()
+}
+
+/// Whether both agents run, and the API answers as its own agent.
+pub fn healthy(states: &[State]) -> bool {
+    states.iter().all(|state| state.loaded && state.pid.is_some() && state.api.as_ref().is_none_or(|api| api.answer == Answer::Ours))
 }
 
 pub fn print(states: &[State]) {
@@ -560,6 +577,31 @@ mod tests {
         let mut waited = Duration::ZERO;
         assert!(!within(ANSWERS_WITHIN, &mut || false, &mut |d| waited += d));
         assert_eq!(waited, ANSWERS_WITHIN);
+    }
+
+    #[test]
+    fn a_slow_look_counts_toward_the_limit() {
+        // Each look takes 100 ms, as an ask of a port that never replies
+        // takes its whole timeout. With 250 ms between looks, a 400 ms limit
+        // allows two, not the three that counting only the pauses would.
+        let mut looks = 0;
+        let slow = &mut || {
+            looks += 1;
+            std::thread::sleep(Duration::from_millis(100));
+            false
+        };
+        assert!(!within(Duration::from_millis(400), slow, &mut |_| {}));
+        assert_eq!(looks, 2);
+    }
+
+    #[test]
+    fn healthy_means_both_run_and_the_api_answers_as_itself() {
+        let state = |pid: Option<u32>, answer: Option<Answer>| State { label: "x".into(), installed: true, loaded: true, pid, log: PathBuf::from("/l"), api: answer.map(|answer| Api { address: "a".into(), answer }) };
+        assert!(healthy(&[state(Some(1), None), state(Some(2), Some(Answer::Ours))]));
+        assert!(!healthy(&[state(Some(1), None), state(None, Some(Answer::Someone(Some(9))))]));
+        assert!(!healthy(&[state(Some(1), None), state(Some(2), Some(Answer::Nobody))]));
+        assert!(!healthy(&[state(None, None), state(Some(2), Some(Answer::Ours))]));
+        assert!(!healthy(&[State { loaded: false, ..state(None, None) }]));
     }
 
     #[test]
