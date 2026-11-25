@@ -335,10 +335,32 @@ The simulators and the agent subscriptions are already shared between projects, 
 - **Parked issues are not in the way.** A project whose issues are all parked for quota counts as having nothing left, in both modes.
 - **Inside a project nothing changes.** Priority labels, blocked-by links and the rule that overlapping scopes never run together work as in `factory queue`. Scopes are only compared within a project.
 - **The machine guard.** A further issue starts only while `factory capacity` would say the machine has room. The first one always starts. `--no-guard` turns this off.
-- **`--watch`** never ends. With nothing to do it looks again every 30 seconds, so labelling an issue `today` is all it takes to start it. This is the long-running form. Nothing installs it as a service yet.
+- **`--watch`** never ends. With nothing to do it looks again every 30 seconds, so labelling an issue `today` is all it takes to start it. This is the long-running form, and what the service runs. A watching scheduler does not end when GitHub fails to answer: it says so once, keeps what it listed last, and looks again.
 - **An issue someone else is running** is left alone and not counted as blocked.
 
 Projects are kept in `~/.factory/config.yaml`, in the order they were added. `factory serve` with no `--repo-dir` serves the registered projects. In the output an issue is named with its repository, as in `todo-trial#37`.
+
+### Running as a service
+
+```
+factory service install
+factory service status
+factory service uninstall
+```
+
+`install` makes the scheduler and the API two launchd agents of this Mac. They start at login and are started again when they stop. From then on, putting the label on an issue is all it takes, and the app always has an engine to talk to.
+
+| Agent | Runs | Output |
+| --- | --- | --- |
+| `dev.factory.schedule` | `factory schedule --watch`, with the flags given to `install` (`--parallel`, `--in-order`, `--no-merge`, `--no-guard`) | `~/.factory/service/schedule.log` |
+| `dev.factory.serve` | `factory serve --bind 127.0.0.1:7878`, or the address given with `--bind` | `~/.factory/service/serve.log` |
+
+- **What goes into an agent's environment** is only the `PATH` of the shell that installed it, and `FACTORY_HOME` when that was set. So install it from a shell that finds `git`, `gh`, `claude`, `codex` and the Xcode tools. No login of that shell is carried over: the agents' calls use this machine's own logins.
+- **It needs a registered project.** `install` refuses when `factory project list` is empty.
+- **To change how it runs,** run `install` again with other flags. It stops what is loaded and starts the new settings.
+- **The agents run the program where it was when `install` ran.** Building again replaces that file, and an agent picks the new build up the next time it starts.
+- **`uninstall` cuts off issues at work.** They pick up at the step they were on the next time they are run.
+- **Don't also start `factory serve` by hand** on the same address. The second one can't listen.
 
 ### What a machine can run at once
 

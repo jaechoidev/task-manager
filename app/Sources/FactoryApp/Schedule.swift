@@ -12,7 +12,7 @@ struct SchedulePane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
             if schedule.schedulers.isEmpty {
-                ScreenTitle(over: "factory schedule", title: "Schedule", under: "No scheduler is running. `factory schedule` starts one over the registered projects.")
+                ScreenTitle(over: "factory schedule", title: "Schedule", under: "No scheduler is running. `factory service install` keeps one running, and `factory schedule` starts one by hand.")
             }
             ForEach(schedule.schedulers) { board in
                 let projects = board.projects.filter { project == nil || $0.repo == project }
