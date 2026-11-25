@@ -379,8 +379,10 @@ pub struct ProviderRow {
     /// How its login is selected, and whether that file or folder exists.
     pub login: Login,
     pub quota: Option<Quota>,
-    /// What the provider's own quota report said, one line per window.
+    /// What the last reading of its plan said, one line per window.
     pub quota_windows: Vec<String>,
+    /// When that was read, in seconds since 1970.
+    pub quota_read_at: Option<u64>,
     pub tiers: Vec<TierRow>,
 }
 
@@ -452,6 +454,7 @@ fn build(file: &Path, loaded: Option<&Providers>, checks: &qualify::Store, known
             login,
             quota: provider.quota,
             quota_windows: known.quota.get(name).map(|reading| reading.windows.clone()).unwrap_or_default(),
+            quota_read_at: known.quota.get(name).map(|reading| reading.at),
             tiers: provider
                 .tiers
                 .iter()
@@ -506,11 +509,14 @@ pub fn print(report: &Report) {
             Login::EnvFile { path, exists } => format!("env file {path}{}", if *exists { "" } else { " (MISSING)" }),
             Login::ConfigDir { path, exists } => format!("config folder {path}{}", if *exists { "" } else { " (MISSING)" }),
         };
-        let quota = match row.quota {
-            Some(Quota::Zai) => "quota readable (zai)",
-            None => "quota known only from errors",
+        let quota = match (row.quota, row.cli) {
+            (Some(Quota::Zai), _) => "quota readable (zai)",
+            // Both say how much of the plan is used as part of every call.
+            (None, Cli::Codex | Cli::Claude) => "quota read after each call",
+            (None, Cli::Agy) => "quota known only from errors",
         };
-        println!("  {}  {} at {program}, {login}, {quota}", row.name, row.cli.program());
+        let read = row.quota_read_at.map(|at| format!(", last read {}", super::util::clock(at))).unwrap_or_default();
+        println!("  {}  {} at {program}, {login}, {quota}{read}", row.name, row.cli.program());
         for window in &row.quota_windows {
             println!("    {window}");
         }
@@ -671,7 +677,7 @@ mod tests {
         assert!(!problems.contains("provider chatgpt"));
         let glm = report.providers.iter().find(|row| row.name == "glm").unwrap();
         assert_eq!(glm.login, Login::EnvFile { path: "~/.zai/env.sh".into(), exists: false });
-        assert_eq!(glm.quota_windows, ["5-hour window: 12% used"]);
+        assert_eq!((glm.quota_windows.as_slice(), glm.quota_read_at), (["5-hour window: 12% used".to_string()].as_slice(), Some(90)));
         let claude = report.providers.iter().find(|row| row.name == "claude").unwrap();
         let out: Vec<(&str, Option<u64>)> = claude.tiers.iter().map(|tier| (tier.tier.as_str(), tier.out_until)).collect();
         assert_eq!(out, [("fast", None), ("high", Some(500)), ("standard", None)]);

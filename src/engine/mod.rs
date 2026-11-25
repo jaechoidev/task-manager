@@ -756,6 +756,17 @@ impl Run<'_> {
                 web: step.def.web.unwrap_or(false),
             })?;
             drop(slot);
+            // What the call said about its plan is kept for every run on
+            // this machine. Where the provider has a report of its own to
+            // ask for, that one stands.
+            if by.quota.is_none() {
+                if let Some(reading) = reply.quota.clone() {
+                    if let Some(until) = reading.out_until {
+                        println!("  {name}: {} reports its plan used up. Set aside until {}", by.provider, util::clock(until));
+                    }
+                    ledger::note(&self.home, &by.provider, reading)?;
+                }
+            }
             let files = [
                 Some(reply.input_path.as_path()),
                 Some(reply.output_path.as_path()),

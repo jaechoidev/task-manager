@@ -467,10 +467,17 @@ A call that fails with signs of a usage or rate limit is not a failed attempt. T
 
 - **Set aside for how long.** 1 minute after the first limit, then 5, 15, 30 and 60 minutes for each further one in a row. A good reply ends the row. The engine does not read a reset time from an error message.
 - **Z.ai is read directly.** For a provider with `quota: zai` the engine asks Z.ai how much of the 5-hour and weekly windows is used, at most once a minute. A full window sets every model of that provider aside until the reset time Z.ai names. The address is not in Z.ai's documentation, so a reading that fails changes nothing.
+- **Claude and Codex say it with every call.** Neither has a report to ask for, but each tells how much of the plan is used as part of a reply, and the engine keeps the latest reading per provider.
+  - Claude prints an event with its 5-hour and weekly windows in its streaming output, which is why the engine calls it with `--output-format stream-json`. When Claude says a window is used up, that is the limit, whatever the error text says.
+  - Codex writes the same into its own session file after each reply. The engine reads that file and nothing else of Codex's. The format is Codex's own and not documented, so a file it can't read gives no reading.
+  - A used-up 5-hour or weekly window sets every model of the provider aside until it resets, but for an hour at most. Such a reading can only be renewed by a call, so after an hour one call is tried, and that call brings a new reading. A used-up window for one model of Claude sets only that model aside, through the failed call.
+  - The engine never asks for a login or a token for any of this.
 - **A parked issue** has status `waiting` and a wake time. Nothing failed, nobody is asked to look, and it holds no simulator or agent slot. `factory run` exits with code 75 and says until when. Run again before then, it parks again without spending a call.
 - **`factory queue` handles parking by itself.** It goes on with other issues, starts the parked one again at its wake time, at the step it stopped at, and when only parked issues are left it waits for the first wake time.
 
-Neither CLI documents a stable format for a limit, so the engine looks for the phrases both use ("usage limit", "rate limit", "429", "too many requests") in the error and in error lines of the output.
+Codex documents no stable format for a failed call, so there the engine looks for the phrases a limit is worded with ("usage limit", "rate limit", "429", "too many requests") in the error and in error lines of the output. It does the same for Claude when Claude's own event does not say.
+
+`factory providers` prints each provider's latest reading and when it was read. `GET /v1/schedule` and the app's Schedule pane show the same.
 
 ## Modules
 

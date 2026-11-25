@@ -122,6 +122,8 @@ struct Answer {
     error: Option<String>,
     /// Everything the call printed or wrote, to search for the secret.
     seen: String,
+    /// How much of the provider's plan is used, when the call said.
+    quota: Option<super::ledger::Reading>,
 }
 
 fn ask(ask: &Ask) -> Result<Answer> {
@@ -140,7 +142,7 @@ fn ask(ask: &Ask) -> Result<Answer> {
     })?;
     let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
     let seen = format!("{}\n{}\n{}", read(&reply.stdout_path), read(&reply.stderr_path), read(&reply.output_path));
-    Ok(Answer { output: reply.output, error: reply.error, seen })
+    Ok(Answer { output: reply.output, error: reply.error, seen, quota: reply.quota })
 }
 
 fn now() -> u64 {
@@ -215,6 +217,11 @@ pub fn check(home: &Path, name: &str, provider: &Provider, tier: &str) -> Result
             stem: "1-inside",
         },
     )?;
+    // The call also said how much of the plan is used. That is kept, unless
+    // the provider has a report of its own to ask for.
+    if let (None, Some(reading)) = (provider.quota, first.quota.clone()) {
+        let _ = super::ledger::note(home, name, reading);
+    }
     checked.structured = first.output.as_ref().is_some_and(|value| value.get("wrote").is_some_and(Value::is_boolean));
     checked.wrote_inside = inside.join("inside.txt").is_file();
     if let Some(error) = first.error {

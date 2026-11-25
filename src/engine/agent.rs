@@ -16,8 +16,10 @@
 //!   engine only uses a provider that passed `factory providers check`, and
 //!   Antigravity does not. Its flags are here for that check.
 
+use super::ledger;
 use super::proc::{self, Outcome};
 use super::providers::Cli;
+use super::util;
 use super::workflow::{Access, Vendor};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -83,6 +85,8 @@ pub struct Reply {
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
     pub session_id: Option<String>,
+    /// How much of the provider's plan is used, when the call said.
+    pub quota: Option<ledger::Reading>,
 }
 
 fn text(path: &Path) -> String {
@@ -124,6 +128,13 @@ pub fn call(call: &Call) -> Result<Reply> {
             (output, None, error)
         }
     };
+    // What the call said about the plan it ran on. Never a reason to fail.
+    let now = util::now_secs();
+    let quota = match cli {
+        Cli::Codex => session_id.as_deref().and_then(|session| codex_limits(&codex_home(call.runner), session)).and_then(|limits| ledger::read_codex(&limits, now)),
+        Cli::Claude => claude_limits(&stdout).and_then(|info| ledger::read_claude(&info, now)),
+        Cli::Agy => None,
+    };
     if let (Cli::Claude | Cli::Agy, Some(value)) = (cli, &output) {
         std::fs::write(&output_path, serde_json::to_string_pretty(value)?)?;
     }
@@ -139,7 +150,7 @@ pub fn call(call: &Call) -> Result<Reply> {
         });
     }
 
-    Ok(Reply { outcome, output, error, input_path, output_path, stdout_path, stderr_path, session_id })
+    Ok(Reply { outcome, output, error, input_path, output_path, stdout_path, stderr_path, session_id, quota })
 }
 
 /// A command line, ready to run.
@@ -234,9 +245,19 @@ pub fn rate_limited(reply: &Reply) -> Option<String> {
         return None;
     }
     let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+    let stdout = read(&reply.stdout_path);
+    // Claude says so itself, in the event it prints with each reply.
+    if let Some(info) = claude_limits(&stdout).filter(|info| info.get("status").and_then(Value::as_str) == Some("rejected")) {
+        let window = info.get("rateLimitType").and_then(Value::as_str).unwrap_or("usage");
+        return Some(format!("claude: the {} limit is reached", window.replace('_', " ")));
+    }
     // In stdout only lines that report an error count: a prompt echoed back
     // or a file the agent printed could mention a limit for other reasons.
-    let stdout_errors: String = read(&reply.stdout_path).lines().filter(|l| l.to_lowercase().contains("error")).collect::<Vec<_>>().join("\n");
+    // Claude's stream has a line per message, and its own word on limits was
+    // read above, so of a stream only the result line counts.
+    let results: Vec<&str> = stdout.lines().filter(|line| is_claude_result(line)).collect();
+    let lines: Vec<&str> = if results.is_empty() { stdout.lines().collect() } else { results };
+    let stdout_errors: String = lines.into_iter().filter(|l| l.to_lowercase().contains("error")).collect::<Vec<_>>().join("\n");
     reply
         .error
         .as_deref()
@@ -277,7 +298,10 @@ fn claude_args(call: &Call) -> Vec<String> {
     if call.web {
         tools.extend(["WebSearch", "WebFetch"]);
     }
-    let mut args: Vec<String> = ["-p", "--output-format", "json", "--json-schema", call.schema, "--settings", CLAUDE_SETTINGS]
+    // The stream, not the single result: it carries the same result as its
+    // last line, and before it an event that says how much of the plan is
+    // used. The stream needs --verbose in print mode.
+    let mut args: Vec<String> = ["-p", "--output-format", "stream-json", "--verbose", "--json-schema", call.schema, "--settings", CLAUDE_SETTINGS]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -340,9 +364,70 @@ fn read_codex(stdout: &str, output: &Path) -> (Option<Value>, Option<String>, Op
     }
 }
 
-/// Claude prints one JSON result with the schema-checked reply inside it.
+/// Where Codex keeps its sessions: the runner's own folder, or what the
+/// environment names, or `~/.codex`.
+fn codex_home(runner: &Runner) -> PathBuf {
+    if let Some(dir) = &runner.config_dir {
+        return dir.clone();
+    }
+    // A runner with its own env file starts without the inherited variable.
+    if runner.env_file.is_none() {
+        if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|dir| !dir.is_empty()) {
+            return PathBuf::from(dir);
+        }
+    }
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex")
+}
+
+/// The newest `rate_limits` record in the file Codex keeps for a session:
+/// `sessions/<year>/<month>/<day>/rollout-<time>-<session>.jsonl`. Codex
+/// writes one after each reply. This reads the file and nothing else of
+/// Codex's: no login, no token.
+fn codex_limits(home: &Path, session: &str) -> Option<Value> {
+    // A session id is letters, digits and dashes. Anything else is not looked for.
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let ending = format!("-{session}.jsonl");
+    let mut folders = vec![(home.join("sessions"), 0)];
+    let mut file = None;
+    while let Some((folder, depth)) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() && depth < 3 {
+                folders.push((path, depth + 1));
+            } else if entry.file_name().to_string_lossy().ends_with(&ending) {
+                file = Some(path);
+            }
+        }
+    }
+    let text = std::fs::read_to_string(file?).ok()?;
+    text.lines().rev().filter(|line| line.contains("rate_limits")).filter_map(|line| serde_json::from_str::<Value>(line).ok()).find_map(|record| {
+        let payload = record.get("payload")?;
+        [payload.get("rate_limits"), payload.get("info").and_then(|info| info.get("rate_limits"))].into_iter().flatten().find(|limits| limits.is_object()).cloned()
+    })
+}
+
+fn is_claude_result(line: &str) -> bool {
+    serde_json::from_str::<Value>(line).is_ok_and(|value| value.get("type").and_then(Value::as_str) == Some("result"))
+}
+
+/// The `rate_limit_info` of the last limit event in Claude's stream.
+fn claude_limits(stdout: &str) -> Option<Value> {
+    stdout
+        .lines()
+        .rev()
+        .filter(|line| line.contains("rate_limit_event"))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("rate_limit_event"))
+        .find_map(|event| event.get("rate_limit_info").filter(|info| info.is_object()).cloned())
+}
+
+/// Claude prints a line per message. The last one of type `result` holds the
+/// schema-checked reply. A single result with nothing before it reads the same.
 fn read_claude(stdout: &str) -> (Option<Value>, Option<String>, Option<String>) {
-    let Ok(result) = serde_json::from_str::<Value>(stdout.trim()) else {
+    let found = stdout.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find(|value| value.get("type").and_then(Value::as_str) == Some("result"));
+    let Some(result) = found.or_else(|| serde_json::from_str::<Value>(stdout.trim()).ok()) else {
         return (None, None, Some("claude did not print a JSON result".into()));
     };
     let session = result.get("session_id").and_then(Value::as_str).map(str::to_string);
@@ -375,6 +460,49 @@ mod tests {
     }
 
     #[test]
+    fn claude_s_stream_gives_the_result_and_what_it_said_about_the_plan() {
+        let stream = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s9\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":\"working\"}}\n",
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\",\"rateLimitType\":\"five_hour\",\"unifiedWindows\":{\"five_hour\":{\"utilization\":0.5,\"resetsAt\":7200,\"status\":\"allowed\"}}}}\n",
+            "{\"type\":\"result\",\"is_error\":false,\"session_id\":\"s9\",\"structured_output\":{\"verdict\":\"approve\"}}\n",
+        );
+        let (output, session, error) = read_claude(stream);
+        assert_eq!((output.unwrap()["verdict"].as_str(), session.as_deref(), error), (Some("approve"), Some("s9"), None));
+        let info = claude_limits(stream).unwrap();
+        assert_eq!(ledger::read_claude(&info, 100).unwrap().windows, ["5-hour window: 50% used, resets 1970-01-01 02:00 UTC"]);
+        // A stream that was cut off before its result is not a reply.
+        let cut = stream.lines().take(3).collect::<Vec<_>>().join("\n");
+        assert_eq!(read_claude(&cut).2.as_deref(), Some("claude did not print a JSON result"));
+        // No event, no reading. Text that only mentions one is not an event.
+        assert_eq!(claude_limits("{\"type\":\"assistant\",\"message\":\"a rate_limit_event is printed\"}"), None);
+    }
+
+    #[test]
+    fn codex_s_session_file_says_how_much_of_the_plan_is_used() {
+        let home = std::env::temp_dir().join(format!("factory-codex-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let day = home.join("sessions/2026/11/24");
+        std::fs::create_dir_all(&day).unwrap();
+        let record = |percent: u32| format!("{{\"timestamp\":\"t\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{{\"primary\":{{\"used_percent\":{percent}.0,\"window_minutes\":10080,\"resets_at\":9000}},\"secondary\":null}}}}}}");
+        // The newest record of the session's own file is the one that counts.
+        std::fs::write(day.join("rollout-2026-11-24T22-10-26-abc-123.jsonl"), format!("{{\"type\":\"session_meta\"}}\n{}\n{{\"type\":\"response_item\"}}\n{}\n", record(2), record(7))).unwrap();
+        std::fs::write(day.join("rollout-2026-11-24T22-11-00-other-9.jsonl"), record(99)).unwrap();
+        let limits = codex_limits(&home, "abc-123").unwrap();
+        assert_eq!(limits["primary"]["used_percent"], 7.0);
+        assert_eq!(ledger::read_codex(&limits, 100).unwrap().windows, ["weekly window: 7% used, resets 1970-01-01 02:30 UTC"]);
+        // Another session, a session with no file, and an id that is no id.
+        assert_eq!(codex_limits(&home, "other-9").unwrap()["primary"]["used_percent"], 99.0);
+        assert_eq!(codex_limits(&home, "nobody"), None);
+        assert_eq!(codex_limits(&home, "../abc-123"), None);
+        assert_eq!(codex_limits(&home.join("missing"), "abc-123"), None);
+        // The runner's own folder is where its sessions are.
+        let own = Runner { config_dir: Some(home.clone()), ..Runner::of(Vendor::Codex, None) };
+        assert_eq!(codex_home(&own), home);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_usage_limit_is_told_apart_from_other_failures() {
         let dir = std::env::temp_dir().join(format!("factory-limit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -390,6 +518,7 @@ mod tests {
                 stdout_path: dir.join("out"),
                 stderr_path: dir.join("err"),
                 session_id: None,
+                quota: None,
             }
         };
         // Claude reports it in its result. Codex prints an error event and exits 1.
@@ -402,6 +531,18 @@ mod tests {
         let chatter = "{\"type\":\"item\",\"text\":\"I added a rate limit to the API client\"}";
         assert!(rate_limited(&reply(Some("codex wrote no final message"), chatter, "", false)).is_none());
         assert!(rate_limited(&reply(None, event, "rate limit", true)).is_none());
+        // In Claude's stream only its own word and the result line count. An
+        // event that says the plan is fine is not a limit, whatever else
+        // failed, and neither is a message that talks about one.
+        let fine = "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\",\"rateLimitType\":\"five_hour\",\"errorCode\":null}}";
+        let talk = "{\"type\":\"assistant\",\"message\":\"an error: the API answers 429 when the rate limit is reached\"}";
+        let broken = "{\"type\":\"result\",\"is_error\":true,\"result\":\"error: the reply is not valid JSON\"}";
+        let stream = format!("{fine}\n{talk}\n{broken}\n");
+        assert!(rate_limited(&reply(Some("claude reported an error: the reply is not valid JSON"), &stream, "", false)).is_none());
+        // When Claude says the window is used up, that is the reason.
+        let used_up = fine.replace("allowed", "rejected");
+        let stream = format!("{used_up}\n{broken}\n");
+        assert_eq!(rate_limited(&reply(Some("claude reported an error"), &stream, "", false)).as_deref(), Some("claude: the five hour limit is reached"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -181,6 +181,12 @@ out=""; model=""; prev=""
 for arg in "$@"; do [ "$prev" = "-o" ] && out="$arg"; [ "$prev" = "-m" ] && model="$arg"; prev="$arg"; done
 # Which login and model the engine chose for this call.
 echo "codex ${STUB_WHO:-default} ${model:-none}" >> "$STUB_DIR/who"
+# What Codex keeps for each session: how much of the plan is used after the reply.
+session_file() {
+  [ -n "$STUB_CODEX_USED" ] || return 0
+  mkdir -p "$CODEX_HOME/sessions/2026/11/24"
+  echo "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"primary\":{\"used_percent\":$STUB_CODEX_USED.0,\"window_minutes\":10080,\"resets_at\":4102444800},\"secondary\":null,\"plan_type\":\"stub\"}}}" >> "$CODEX_HOME/sessions/2026/11/24/rollout-2026-11-24T00-00-00-$1.jsonl"
+}
 if [ "$STUB_CODEX_LIMIT" = "always" ]; then
   echo '{"type":"error","message":"You have hit your usage limit. Try again at 3:10 PM."}'
   exit 1
@@ -190,6 +196,7 @@ if grep -q "^You are the reviewer" "$STUB_DIR/codex.prompt.$n"; then
   echo review >> "$STUB_DIR/codex.roles"
   sha=$(sed -n 's/.*Commit under review: `\([0-9a-f]*\)`.*/\1/p' "$STUB_DIR/codex.prompt.$n" | head -1)
   echo '{"thread_id":"stub-review-session"}'
+  session_file stub-review-session
   echo "{\"verdict\":\"approve\",\"head_sha\":\"$sha\",\"summary\":\"looked at it\",\"items\":[]}" > "$out"
   exit 0
 fi
@@ -247,6 +254,7 @@ case "$STUB_DEV" in
     fi ;;
 esac
 echo '{"thread_id":"stub-session"}'
+session_file stub-session
 echo "{\"summary\":\"attempt $n\",\"commit_subject\":\"feat(a): attempt $n\",\"files_changed\":[\"Sources/A.swift\"],\"verify_ran\":\"not_run\",\"notes\":\"\",\"flow_change_request\":${request:-null}}" > "$out"
 "#;
 
@@ -265,6 +273,11 @@ reply() { echo "{\"type\":\"result\",\"is_error\":false,\"session_id\":\"stub-cl
 model=""; prev=""
 for arg in "$@"; do [ "$prev" = "--model" ] && model="$arg"; prev="$arg"; done
 echo "claude ${STUB_WHO:-default} ${model:-none}" >> "$STUB_DIR/who"
+# What Claude prints with each reply in its stream: how much of the plan is used.
+if [ -n "$STUB_CLAUDE_USED" ]; then
+  echo "{\"type\":\"system\",\"subtype\":\"init\"}"
+  echo "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\",\"rateLimitType\":\"five_hour\",\"unifiedWindows\":{\"five_hour\":{\"utilization\":$STUB_CLAUDE_USED,\"resetsAt\":4102444800,\"status\":\"allowed\"}}}}"
+fi
 if [ -n "$STUB_CLAUDE_LIMIT" ] && [ "$STUB_CLAUDE_LIMIT" = "${STUB_WHO:-default}" ]; then
   echo '{"type":"result","is_error":true,"result":"API Error: Rate limit reached"}'
   exit 1
@@ -314,8 +327,9 @@ if grep -q "^You write the summary" "$STUB_DIR/claude.prompt.$n"; then
   fi
   exit 0
 fi
-if grep -q "^You are the developer" "$STUB_DIR/claude.prompt.$n"; then
-  # The vendors were swapped: Claude develops, and gets it right.
+if grep -q "^You are the developer\|^Your work on issue" "$STUB_DIR/claude.prompt.$n"; then
+  # The vendors were swapped: Claude develops, and gets it right. A fix
+  # round's prompt opens differently, and it may reach a new developer.
   echo develop >> "$STUB_DIR/claude.roles"
   mkdir -p Sources
   printf 'let a = 1\n// FIXED\n' > Sources/A.swift
@@ -505,6 +519,8 @@ impl Trial {
         command
             .env("PATH", path)
             .env("FACTORY_HOME", self.dir.join("home"))
+            // Never the real one: the engine reads Codex's session files.
+            .env("CODEX_HOME", self.dir.join("codex-home"))
             .env("STUB_DIR", self.dir.join("stub"))
             .env("GIT_CONFIG_GLOBAL", self.dir.join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1");
@@ -1529,6 +1545,46 @@ fn a_role_goes_to_the_next_provider_when_the_first_is_out_of_quota() {
     let log = trial.log();
     assert!(log.contains("\"vendor\":\"glm\"") && log.contains("\"model\":\"glm-big\"") && log.contains("\"subscription\":\"glm\""), "{log}");
     assert!(log.contains("\"verdict\":\"rate-limited\""), "{log}");
+}
+
+#[test]
+fn each_call_leaves_a_reading_of_its_plan_for_the_whole_machine() {
+    let roles = "  develop: [{ use: chatgpt, tier: standard }]\n  review: [{ use: claude, tier: high }]\n";
+    let trial = Trial::new("p-readings", 1).with_providers(roles, ALL_PASSED);
+    let env = [("STUB_DEV", "right-first-time"), ("STUB_REVIEW", "approve"), ("STUB_CODEX_USED", "12"), ("STUB_CLAUDE_USED", "0.4")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert!(output.status.success(), "{text}");
+    // Codex said it in its own session file, Claude in its stream. Neither
+    // is out, so nobody was set aside.
+    let known: serde_json::Value = serde_json::from_str(&fs::read_to_string(trial.dir.join("home/availability.json")).unwrap()).unwrap();
+    assert_eq!(known["quota"]["chatgpt"]["windows"], serde_json::json!(["weekly window: 12% used, resets 2100-01-01 00:00 UTC", "plan: stub"]), "{known}");
+    assert_eq!(known["quota"]["claude"]["windows"], serde_json::json!(["5-hour window: 40% used, resets 2100-01-01 00:00 UTC"]), "{known}");
+    assert!(known["quota"]["chatgpt"]["out_until"].is_null() && known["out"].as_object().unwrap().is_empty(), "{known}");
+    assert!(!text.contains("used up"), "{text}");
+    // `factory providers` shows the last reading of each.
+    let (_, report) = trial.cli(&["providers"], &[]);
+    assert!(report.contains("quota read after each call, last read "), "{report}");
+    assert!(report.contains("    weekly window: 12% used") && report.contains("    5-hour window: 40% used"), "{report}");
+}
+
+#[test]
+fn a_plan_reported_as_used_up_sends_the_next_call_to_someone_else() {
+    let roles = "  develop: [{ use: chatgpt, tier: standard }, { use: glm, tier: high }]\n  review: [{ use: claude, tier: high }, { use: glm, tier: high }]\n";
+    let trial = Trial::new("p-used-up", 2).with_providers(roles, ALL_PASSED);
+    // Codex's first reply works, but leaves the code unfixed and says the
+    // plan is at 100%. No call failed, and no usage limit was hit.
+    let env = [("STUB_DEV", "fix-on-second"), ("STUB_REVIEW", "approve"), ("STUB_CODEX_USED", "100")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("develop: chatgpt reports its plan used up. Set aside until "), "{text}");
+    assert!(!text.contains("hit a usage limit"), "{text}");
+    // The fix went to the next in the list without Codex being tried again.
+    assert_eq!(trial.who(), ["codex default gpt-x", "claude glm glm-big", "claude default opus"]);
+    assert_eq!(trial.stub("codex.count"), "1");
+    // The reading holds for an hour at most, though the reset is far away.
+    let known: serde_json::Value = serde_json::from_str(&fs::read_to_string(trial.dir.join("home/availability.json")).unwrap()).unwrap();
+    let (at, until) = (known["quota"]["chatgpt"]["at"].as_u64().unwrap(), known["quota"]["chatgpt"]["out_until"].as_u64().unwrap());
+    assert_eq!(until - at, 3600, "{known}");
 }
 
 #[test]

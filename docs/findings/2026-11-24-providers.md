@@ -64,7 +64,7 @@ This is the finding that matters most, and it happened during this work.
 - **No real run with a providers file.** This machine has none in `~/.factory`. The checked trial file is in `~/.factory/trial/`.
 - **Antigravity.** Its permission settings may be able to confine it. Not explored. Until something does, it cannot be used.
 - **A reader with Antigravity would get the same sandbox as a writer.** The engine has no read-only mode for it. Moot while it fails the check.
-- **Reset times in error messages are not read.** "Try again at 3:10 PM" is treated like any limit, with the fixed waits.
+- **Reset times in error messages are not read.** "Try again at 3:10 PM" is treated like any limit, with the fixed waits. Later the same day the engine began reading each plan's usage and reset times from the calls themselves: see [reading each plan's usage](2026-11-24-plan-usage.md).
 - **The reader gap is unchanged.** Codex reads anywhere on the machine. The check reports it and does not fail it.
 - **Model names are the user's.** `gpt-6.2-sol` and `gpt-6.2-astra` both answered. Which one is `high` is a choice the file makes, not the engine.
 - **`factory run` alone parks and exits.** Only the queue comes back by itself.
