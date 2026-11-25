@@ -467,7 +467,7 @@ roles:
 
 A role with a list uses it, and the vendor in the workflow file is ignored for that role. A role with no list uses the workflow file's vendor, as before. With no file nothing changes.
 
-A role with no list is not pinned to a model. The built-in workflow names a vendor and no model for most steps, so the program's own default answers, and that default is a setting of the machine (for Claude, the `model` in `~/.claude/settings.json`). The Mac Studio's first acceptance flows were written on Fable for that reason. To pin a job, give it a list. `factory providers` names each job that has none.
+A role with no list is not pinned to a model. The built-in workflow names a vendor and no model for most steps, so the program's own default answers, and that default is a setting of the machine (for Claude, the `model` in `~/.claude/settings.json`). The Mac Studio's first acceptance flows were written on Fable, the model its Claude settings name. To pin a job, give it a list. `factory providers` names each job that has none.
 
 Who answers a call is the first in the role's list that passes three tests:
 
