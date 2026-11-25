@@ -48,7 +48,7 @@ The model names are from each call's own output, except the developer's: Codex's
 - **The squash commit is the agent's.** The engine's own commits carry this machine's git identity, Jae's. The squash commit on `dev` is authored by `neostudiodot`'s GitHub identity, because the account that squash merges authors the result. On the MacBook both were Jae.
 - **GLM is left out.** There is no `~/.zai/env.sh` here. So each job has one name: develop ChatGPT `sol`, review Claude `high`, summary Claude `fast`. The summary went to Claude, where the MacBook's went to GLM. If ChatGPT runs out, an issue parks, because nobody else may develop.
 - **The acceptance writer ran on Fable.** Acceptance has no list in `providers.yaml`, so it falls back to the workflow's `claude` with no model, which is the program's default. `~/.claude/settings.json` on this machine names `fable`. That this setting is where the default came from is a guess, not checked. The MacBook's findings say "default model" without naming it.
-- **Verify took 102 seconds** for 7 flows. On the MacBook it was 46 to 55 seconds for 3. Different suite and machine, so not comparable.
+- **Verify took 102 seconds** for 7 flows. On the MacBook, counter-trial's verify took 91 to 107 seconds with five or six flows ([a view of the scheduler](2026-11-24-schedule-view.md)), so this machine is in line with it.
 
 ## Not covered by this run
 
@@ -58,6 +58,14 @@ The model names are from each call's own output, except the developer's: Codex's
 
 ## Open items
 
-- **Preflight as the agent account.** Either it skips the invitations check, and says so, when the caller is not an admin, or the README says the owner runs it.
-- **The README's Maestro line** needs `brew trust` before it, and a word on putting the JDK on PATH.
-- **The acceptance writer's model depends on the machine's Claude settings.** A `roles.acceptance` list in `providers.yaml` would pin it.
+Three were found here and are done on `main`:
+
+- **Preflight as the agent account.** `repo init` and `repo preflight` now stop early with a clear message, exit 2, when `gh`'s account isn't an admin. The README says to run preflight as the owner. `ab2f8bc`.
+- **The README's Maestro line.** It now runs `brew trust --formula mobile-dev-inc/tap/maestro` first, and gives the `~/.zprofile` line for `openjdk`, `rustup` and `~/.cargo/bin`. `0afc3b0`.
+- **The acceptance writer's model.** The engine already read `roles.acceptance`. Only the files lacked it. `factory providers` now names each job with no list as not pinned to a model, the example file gives acceptance a list, and the app says so for an empty list. `a6bf483`. Pinning it on the Mac Studio is still an edit of its `providers.yaml`, and Jae's choice. With develop on ChatGPT only, the acceptance writer has to come from another family, so Claude at some tier.
+
+Still open:
+
+- **Whose name the engine's commits carry.** On the Mac Studio they carry Jae's git identity, not `neostudiodot`'s. If the agent machine's work should be told apart in history, its `git config user.name` and `user.email` should be the agent's. Jae's call.
+
+After this run, the service was installed on the Mac Studio: both agents run from `~/.cargo/bin/factory`, and the API answers on `127.0.0.1:7878`. No issue has run under it yet, so "Not covered" above still holds.
