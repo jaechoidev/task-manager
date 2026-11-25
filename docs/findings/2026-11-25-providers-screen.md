@@ -9,7 +9,7 @@ The question was "can't I change which model to use in the UI?" The answer was n
 | Built | `GET` and `POST /v1/providers`, `POST /v1/providers/check`, an editor for the file that keeps its comments, and the Providers screen |
 | Tested with stand-ins | 135 unit tests and 55 scenarios in the engine, 17 tests in the app |
 | Run for real | In the real window against a scratch copy of the providers file: reordering a job's list, adding someone to a job, and saving. A model change through the API with a made-up model name, whose check then ran for real and failed |
-| Not run for real | Typing a model into a field in the real window. A model change that passes its check. Anything against the real providers file |
+| Not run for real | A model change that passes its check. A save against the real providers file |
 
 ## What the screen does
 
@@ -35,13 +35,13 @@ Against a scratch engine holding a copy of the real file:
 ## Problems hit
 
 1. **The check hid Codex's own words.** Codex said "The 'gpt-0-test' model is not supported when using Codex with a ChatGPT account." The engine reported that the final message was not JSON. It now reports what Codex said, in a check and in a run.
-2. **The model fields could not be typed into by the test.** The window was driven in the background through the system's accessibility. The sidebar's filter field takes text that way. The model fields do not, and the cause was not found. Moving the label onto the field itself did not change it. A person typing into them was not tried.
+2. **The model fields could not be typed into by the test.** The window was driven in the background through the system's accessibility. The sidebar's filter field takes text that way. The model fields do not, and the cause was not found. Moving the label onto the field itself did not change it. The owner then typed into one by hand, and it works: the fault is in how the test reaches the field, not in the field.
 3. **Text meant for a model field went into the filter.** A side effect of the above, on the scratch app only. Cleared.
 4. **The row for adding someone stayed open after a save.** It closes now.
 
 ## Open items
 
-- **Typing into a model field** is the one thing the screen exists for that nobody has done by hand.
+- **Why the test could not type into a model field** is still not known. By hand it works.
 - **Tiers can be added, not renamed or removed.** A rename would have to follow into every list.
 - **Providers can't be added.** A provider has a login, which is a file or a folder on disk, not something to type into an app.
 - **A model name is free text.** Nothing lists the models an account has. A wrong name is found by the check, which costs one refused call.
