@@ -36,13 +36,15 @@ struct StateDot: View {
 struct IssueRowView: View {
     var issue: Issue
     var selected: Bool
+    /// Says which repository the issue is in. Two projects both have a #4.
+    var showRepo = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             StateDot(state: issue.state).padding(.top, 5)
             VStack(alignment: .leading, spacing: 2) {
                 Text("#\(issue.number) \(issue.title)").font(.body).lineLimit(2)
-                Text(stateLabel(issue) + (issue.pass > 1 ? ", pass \(issue.pass)" : ""))
+                Text(stateCaption(issue, showRepo: showRepo))
                     .font(.caption).foregroundStyle(.secondary)
                 if !issue.waitsOn.isEmpty {
                     Text(issue.waitsOn).font(.caption).foregroundStyle(Color.forState(issue.state)).lineLimit(2)
@@ -67,12 +69,13 @@ struct IssueListPane: View {
             if issues.isEmpty {
                 Text("No issue has been run yet.").foregroundStyle(.secondary).padding(8)
             }
+            let several = Set(issues.map(\.repo)).count > 1
             ForEach(grouped(issues), id: \.group) { section in
                 Text(section.group.rawValue.uppercased())
                     .font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
                     .padding(.top, 10).padding(.horizontal, 8)
                 ForEach(section.issues) { issue in
-                    IssueRowView(issue: issue, selected: issue.id == selected)
+                    IssueRowView(issue: issue, selected: issue.id == selected, showRepo: several)
                         .onTapGesture { select(issue.id) }
                 }
             }
@@ -163,7 +166,7 @@ struct IssueDetailPane: View {
                             GridRow {
                                 Text("\(step.pass)")
                                 Text(step.step)
-                                Text(step.vendor ?? "engine").foregroundStyle(.secondary)
+                                Text(stepWho(step)).foregroundStyle(.secondary)
                                 Text(step.verdict).foregroundStyle(verdictColor(step.verdict))
                                 Text(duration(step.seconds)).foregroundStyle(.secondary)
                             }
@@ -288,6 +291,132 @@ struct WorkflowPane: View {
         }
         path.closeSubpath()
         return path
+    }
+}
+
+/// What runs where: each scheduler's places and who has them, what waits and
+/// what for, each pool's slots, and who is out of quota.
+struct SchedulePane: View {
+    var schedule: Schedule
+    /// Opens an issue, by its id.
+    var open: (String) -> Void = { _ in }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if schedule.schedulers.isEmpty {
+                Card(title: "Scheduler") {
+                    Text("No scheduler is running. `factory schedule` starts one over the registered projects.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            ForEach(schedule.schedulers) { board in
+                Card(title: "Places") {
+                    Text(placesLine(board)).font(.callout)
+                    if let reason = board.heldBack {
+                        Text("Starting nothing further: \(reason)").font(.callout).foregroundStyle(.orange)
+                    }
+                    ForEach(board.projects) { project in
+                        projectSection(project)
+                    }
+                }
+            }
+            if !schedule.pools.isEmpty {
+                Card(title: "Pools") {
+                    Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 3) {
+                        GridRow {
+                            Text("Pool"); Text("Slot"); Text("Held by"); Text("For"); Text("Time")
+                        }
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        ForEach(schedule.pools) { pool in
+                            ForEach(pool.slots) { slot in
+                                GridRow {
+                                    Text(slot.slot == 1 ? pool.name : "")
+                                    Text("\(slot.slot) of \(pool.size)").foregroundStyle(.secondary)
+                                    if let holder = slot.holder {
+                                        Text("\(shortRepo(holder.repo)) #\(holder.number)")
+                                        Text(holder.what)
+                                        Text(duration(Double(max(0, schedule.now - holder.since)))).foregroundStyle(.secondary)
+                                    } else {
+                                        Text("free").foregroundStyle(.secondary)
+                                        Text("")
+                                        Text("")
+                                    }
+                                }
+                                .font(.callout.monospacedDigit())
+                            }
+                        }
+                    }
+                }
+            }
+            if !schedule.out.isEmpty || !schedule.quota.isEmpty {
+                Card(title: "Quota") {
+                    if schedule.out.isEmpty {
+                        Text("Nobody is set aside for a usage limit.").font(.callout).foregroundStyle(.secondary)
+                    }
+                    ForEach(schedule.out) { entry in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("\(entry.who) is set aside until \(clockTime(entry.until))" + (entry.hits > 1 ? ", after \(entry.hits) limits in a row" : ""))
+                                .font(.callout).foregroundStyle(.orange)
+                            Text(entry.reason).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                    }
+                    ForEach(schedule.quota) { reading in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(reading.provider + (reading.outUntil.map { ": used up until \(clockTime($0))" } ?? "") + ", read at \(clockTime(reading.at))")
+                                .font(.callout.weight(.semibold)).foregroundStyle(reading.outUntil == nil ? Color.primary : Color.orange)
+                            ForEach(reading.windows, id: \.self) { window in
+                                Text(window).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func projectSection(_ project: ProjectBoard) -> some View {
+        let limit = project.maxParallel.map { ", at most \($0) at once" } ?? ""
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(project.repo).font(.subheadline.weight(.semibold))
+                Text("issues labelled '\(project.label)'\(limit)").font(.caption).foregroundStyle(.secondary)
+            }
+            if project.running.isEmpty && project.waiting.isEmpty && project.parked.isEmpty {
+                Text("Nothing is running or waiting.").font(.callout).foregroundStyle(.secondary)
+            }
+            ForEach(project.running) { entry in
+                row(entry, in: project, state: entry.state == "waiting" ? "waiting" : "running", detail: runningLine(entry, now: schedule.now))
+            }
+            ForEach(project.parked) { entry in
+                let until = entry.until.map { "Parked until \(clockTime($0))" } ?? "Parked"
+                row(entry, in: project, state: "waiting", detail: until + ((entry.waitsOn ?? "").isEmpty ? "" : ": \(entry.waitsOn ?? "")"))
+            }
+            ForEach(project.waiting) { entry in
+                row(entry, in: project, state: "unknown", detail: "Not started. Waits on \(entry.waitsOn ?? "a free place")")
+            }
+            let ended = [("Merged", project.merged), ("Pull request open", project.opened), ("Blocked", project.failed)]
+                .filter { !$0.1.isEmpty }
+                .map { "\($0.0): " + $0.1.map { "#\($0)" }.joined(separator: ", ") }
+            if !ended.isEmpty {
+                Text(ended.joined(separator: ". ")).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.top, 6)
+    }
+
+    private func row(_ entry: BoardEntry, in project: ProjectBoard, state: String, detail: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            StateDot(state: state).padding(.top, 5)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("#\(entry.number) \(entry.title)").font(.callout).lineLimit(1)
+                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { open("\(project.repo)#\(entry.number)") }
     }
 }
 

@@ -13,6 +13,13 @@ pub fn home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".factory"))
 }
 
+/// Whether a process of this user still exists. Asks the system, and takes
+/// nothing from the process.
+pub fn alive(pid: u32) -> bool {
+    use std::process::{Command, Stdio};
+    Command::new("kill").args(["-0", &pid.to_string()]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|status| status.success())
+}
+
 /// `owner/name` as one path segment.
 pub fn repo_dir_name(repo: &str) -> String {
     repo.replace('/', "__")

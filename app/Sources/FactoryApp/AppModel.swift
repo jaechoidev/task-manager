@@ -11,6 +11,8 @@ final class AppModel: ObservableObject {
     @Published var log: LogTail?
     @Published var workflow: Workflow?
     @Published var usage: [UsageRow] = []
+    /// Who has each place and each slot. Nil when the engine is older than this.
+    @Published var schedule: Schedule?
     @Published var repos: [String] = []
     /// Why the engine can't be reached, when it can't.
     @Published var problem: String?
@@ -58,6 +60,7 @@ final class AppModel: ObservableObject {
                 self.log = nil
             }
             self.usage = (try? await client.get("usage")) ?? []
+            self.schedule = try? await client.get("schedule")
             if let repo = selectedIssue?.repo ?? health.repos.first, health.repos.contains(repo) {
                 let query = repo.addingPercentEncoding(withAllowedCharacters: .urlQueryValueAllowed) ?? repo
                 self.workflow = try? await client.get("workflow?repo=\(query)")

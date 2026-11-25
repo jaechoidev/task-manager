@@ -6,11 +6,12 @@ A window and a menu bar item onto the engine. It is a client of `factory serve` 
 
 | Part | What is there |
 | --- | --- |
-| Issue list | Every issue the engine has run, grouped: needs a person, running and waiting, pull request open, done |
+| Issue list | Every issue the engine has run, grouped: needs a person, running and waiting, pull request open, done. With more than one repository, each row says which |
 | Issue | Its state and what it waits on, the summary written for a person, every step with who ran it and how long it took, and the end of the newest output |
 | Needs you | For a stuck issue: what failed, what the judgment said, and two buttons, "Start over" and "Take off the queue" |
 | Workflow | The repository's steps as a graph, with an arrow from each step to where its failure goes. Read only |
 | Edit workflow | The workflow file's text, checked by the engine as you type, with the graph of the draft, the modules it may use, and a form that scaffolds a new module. "Open a pull request" is how a change is saved |
+| Schedule | What runs where. Each running scheduler's places with the issue that holds each and the step it is at, what has not started and what it waits on, what is parked until when. Each pool's slots with who holds them. Who is set aside for a usage limit |
 | Usage | Calls, time and usage limits hit, per vendor |
 | Menu bar | How many issues need a person, and what is running |
 

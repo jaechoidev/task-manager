@@ -143,7 +143,7 @@ pub fn export(opts: &HandoffOptions) -> Result<Vec<PathBuf>> {
             let steps = store
                 .steps(&row.repo, row.number, &row.run_id)?
                 .into_iter()
-                .map(|(step, vendor, _, verdict, _, duration_ms, pass)| (step, vendor, verdict, duration_ms as f64 / 1000.0, pass))
+                .map(|ran| (ran.step, ran.vendor, ran.verdict, ran.duration_ms as f64 / 1000.0, ran.round))
                 .collect();
             let run_dir = home.join("runs").join(util::repo_dir_name(&row.repo)).join(format!("issue-{}", row.number)).join(&row.run_id);
             let summary = std::fs::read_to_string(run_dir.join("summary.json")).ok().and_then(|text| serde_json::from_str(&text).ok());

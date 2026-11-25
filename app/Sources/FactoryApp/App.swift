@@ -25,9 +25,9 @@ struct RootView: View {
                         .padding(8).background(Color.accentColor.opacity(0.15))
                 }
                 Picker("", selection: $tab) {
-                    ForEach(["Issue", "Workflow", "Edit workflow", "Usage"], id: \.self) { Text($0) }
+                    ForEach(["Issue", "Schedule", "Workflow", "Edit workflow", "Usage"], id: \.self) { Text($0) }
                 }
-                .pickerStyle(.segmented).labelsHidden().padding(12).frame(maxWidth: 520)
+                .pickerStyle(.segmented).labelsHidden().padding(12).frame(maxWidth: 620)
                 ScrollView([.vertical, .horizontal]) {
                     Group {
                         switch tab {
@@ -43,6 +43,17 @@ struct RootView: View {
                                     .task(id: repo) { await editor.load(repo: repo, client: model.client) }
                             } else {
                                 Text("Start the engine with `--repo-dir <checkout>` to edit a repository's workflow.").foregroundStyle(.secondary)
+                            }
+                        case "Schedule":
+                            if let schedule = model.schedule {
+                                SchedulePane(schedule: schedule) { id in
+                                    model.selected = id
+                                    tab = "Issue"
+                                    Task { await model.refresh() }
+                                }
+                                .frame(width: 640)
+                            } else {
+                                Text("This engine does not report its schedule. Build a newer `factory`.").foregroundStyle(.secondary)
                             }
                         case "Usage":
                             UsagePane(usage: model.usage).frame(width: 520)
@@ -79,14 +90,17 @@ struct MenuContent: View {
         if let problem = model.problem {
             Text(problem)
         }
+        ForEach(model.schedule?.schedulers ?? []) { board in
+            Text("Scheduler: \(placesLine(board))")
+        }
         if model.needingAPerson.isEmpty && model.active.isEmpty {
             Text("Nothing is running, and nothing needs you")
         }
         ForEach(model.needingAPerson) { issue in
-            Text("Needs you: #\(issue.number) \(issue.title)")
+            Text("Needs you: \(shortRepo(issue.repo)) #\(issue.number) \(issue.title)")
         }
         ForEach(model.active) { issue in
-            Text("\(stateLabel(issue)): #\(issue.number) \(issue.title)")
+            Text("\(stateLabel(issue)): \(shortRepo(issue.repo)) #\(issue.number) \(issue.title)")
         }
         Divider()
         Button("Quit Factory") { NSApplication.shared.terminate(nil) }

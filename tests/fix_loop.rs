@@ -356,6 +356,14 @@ if [ -f "$STUB_DIR/issues.json" ]; then
   # Several issues share this "simulator". Leave a trace of who used it when.
   name=$(basename "$(pwd)")
   echo "verify-start $name slot${FACTORY_SLOT_SIMULATOR:-none}" >> "$STUB_DIR/events"
+  # What the scheduler's board says at this moment, one board to a line.
+  for board in "$FACTORY_HOME"/schedulers/*.json; do
+    if [ -f "$board" ]; then tr -d '\n' < "$board" >> "$STUB_DIR/boards"; echo >> "$STUB_DIR/boards"; fi
+  done
+  # What the slot's note says while this run holds it.
+  if [ -n "$FACTORY_SLOT_SIMULATOR" ]; then
+    echo "$name $(cat "$FACTORY_HOME/locks/simulator-$FACTORY_SLOT_SIMULATOR.holder" 2>/dev/null)" >> "$STUB_DIR/holders"
+  fi
   sleep 1
   echo "verify-end $name slot${FACTORY_SLOT_SIMULATOR:-none}" >> "$STUB_DIR/events"
 fi
@@ -630,6 +638,11 @@ impl Trial {
             }
         }
         (most, seen)
+    }
+
+    /// The scheduler's board as each verify found it, oldest first.
+    fn boards(&self) -> Vec<serde_json::Value> {
+        self.stub("boards").lines().map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("not a board: {e}: {line}"))).collect()
     }
 
     /// What the stand-ins did, in order: `dev-start 7`, `verify-end issue-8 slot1`, ...
@@ -1079,6 +1092,17 @@ fn a_simulator_pool_of_two_lets_two_verifies_in_and_keeps_the_third_out() {
     // Each run's own log says which slot it was given.
     let logs: String = fs::read_dir(trial.dir.join("home/queue/o__r")).unwrap().map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap()).collect();
     assert!(logs.contains("simulator 1 of 2") && logs.contains("simulator 2 of 2"), "{logs}");
+    // While a verify held a slot, the note next to it named that issue and
+    // that step. Nothing is left of the notes afterwards.
+    let notes = trial.stub("holders");
+    for issue in [7, 8, 9] {
+        let line = notes.lines().find(|line| line.starts_with(&format!("issue-{issue} "))).unwrap_or_else(|| panic!("no note for issue {issue}: {notes}"));
+        assert!(line.contains(&format!("\"issue\":{issue},")) && line.contains("\"pool\":\"simulator\"") && line.contains("\"repo\":\"o/r\"") && line.contains("\"what\":\"verify\""), "{line}");
+    }
+    let left: Vec<String> = fs::read_dir(trial.dir.join("home/locks")).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().to_string()).filter(|name| name.ends_with(".holder")).collect();
+    assert!(left.is_empty(), "{left:?}");
+    // The scheduler's own board is gone once it has ended.
+    assert_eq!(fs::read_dir(trial.dir.join("home/schedulers")).unwrap().count(), 0);
 }
 
 #[test]
@@ -1666,6 +1690,23 @@ fn two_projects_share_the_machine_side_by_side() {
     // The simulator belongs to the machine, not to a project: with one
     // slot, verifies of different projects still took turns.
     assert_eq!(trial.verify_overlap().0, 1, "{:?}", trial.events());
+    // What the scheduler wrote down while the first verify ran: one issue of
+    // each project has a place, and the other of each waits for one.
+    let boards = trial.boards();
+    let first = &boards[0];
+    assert_eq!((first["places"].as_u64(), first["in_order"].as_bool()), (Some(2), Some(false)), "{first}");
+    for (project, repo, running, waiting) in [(0, "o/r", 7, 8), (1, "o/r2", 17, 18)] {
+        let board = &first["projects"][project];
+        assert_eq!(board["repo"], repo, "{first}");
+        assert_eq!((board["running"][0]["number"].as_u64(), board["running"].as_array().unwrap().len()), (Some(running), 1), "{first}");
+        assert!(board["running"][0]["since"].as_u64().is_some_and(|since| since > 0), "{first}");
+        assert_eq!((board["waiting"][0]["number"].as_u64(), board["waiting"][0]["waits_on"].as_str()), (Some(waiting), Some("a free place")), "{first}");
+    }
+    // By the last verify the first two had merged, and nothing waited any more.
+    let last = boards.last().unwrap();
+    let merged: usize = (0..2).map(|project| last["projects"][project]["merged"].as_array().unwrap().len()).sum();
+    let waiting: usize = (0..2).map(|project| last["projects"][project]["waiting"].as_array().unwrap().len()).sum();
+    assert!(merged >= 2 && waiting == 0, "{last}");
 }
 
 #[test]
@@ -1679,6 +1720,11 @@ fn in_order_one_project_is_finished_before_the_next_starts() {
     assert!(text.find("r#7 a ended").unwrap() < second_starts && text.find("r#8 b ended").unwrap() < second_starts, "{text}");
     assert!(text.contains("schedule done for o/r. Merged: ") && text.contains("schedule done for o/r2. Merged: "), "{text}");
     assert!(!text.contains("Blocked: #"), "{text}");
+    // While the first project worked, the board said what the second waited on.
+    let first = &trial.boards()[0];
+    assert_eq!(first["projects"][0]["running"].as_array().unwrap().len(), 2, "{first}");
+    let behind: Vec<&str> = first["projects"][1]["waiting"].as_array().unwrap().iter().map(|entry| entry["waits_on"].as_str().unwrap()).collect();
+    assert_eq!(behind, ["the project ahead of it", "the project ahead of it"], "{first}");
 }
 
 #[test]
@@ -1710,6 +1756,16 @@ fn watching_the_scheduler_picks_up_work_that_arrives_later_and_does_not_end() {
         .unwrap();
     std::thread::sleep(std::time::Duration::from_secs(2));
     assert!(child.try_wait().unwrap().is_none(), "it ended with nothing to do: {}", fs::read_to_string(&log).unwrap());
+    // While it runs, it keeps a board of what it is doing for other
+    // processes to read: both projects, and nothing running yet.
+    let board = || {
+        let files: Vec<PathBuf> = fs::read_dir(trial.dir.join("home/schedulers")).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.extension().is_some_and(|e| e == "json")).collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        fs::read_to_string(&files[0]).unwrap().split_whitespace().collect::<String>()
+    };
+    let idle = board();
+    assert!(idle.contains(&format!("\"pid\":{},", child.id())) && idle.contains("\"watch\":true"), "{idle}");
+    assert!(idle.contains("\"repo\":\"o/r\"") && idle.contains("\"repo\":\"o/r2\"") && !idle.contains("\"merged\":[17]"), "{idle}");
     // A person labels an issue of the second project.
     fs::write(trial.dir.join("stub/r2/issues.json"), issues_json(&[(17, "c", "Sources/I17/", &["today"], &[])])).unwrap();
     let merged = trial.dir.join("stub/r2/closed-17");
@@ -1721,14 +1777,16 @@ fn watching_the_scheduler_picks_up_work_that_arrives_later_and_does_not_end() {
     }
     std::thread::sleep(std::time::Duration::from_secs(2));
     let still_running = child.try_wait().unwrap().is_none();
+    let done = board();
     let _ = child.kill();
     let _ = child.wait();
     let text = fs::read_to_string(&log).unwrap();
     assert!(merged.exists(), "{text}");
     assert!(text.contains("r2#17 c started") && text.contains("r2#17 c ended"), "{text}");
     assert!(text.contains("keeps looking for new work until stopped"), "{text}");
-    // Done with that, it went on watching.
+    // Done with that, it went on watching, and its board says what it did.
     assert!(still_running, "{text}");
+    assert!(done.contains("\"merged\":[17]") && done.contains("\"running\":[]"), "{done}");
     assert!(trial.files_on("origin2.git").contains("Sources/I17/File.swift"));
 }
 

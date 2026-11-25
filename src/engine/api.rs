@@ -9,7 +9,7 @@
 //! must carry that token.
 
 use super::state::{IssueRow, Store};
-use super::{editing, first_line, git, util};
+use super::{board, config::Config, editing, first_line, git, ledger, lock, util};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -67,7 +67,7 @@ fn judgment_of(row: &IssueRow) -> Option<String> {
 fn issue_json(store: &Store, row: &IssueRow) -> Result<Value> {
     let (state, waits_on) = describe(row);
     let steps = store.steps(&row.repo, row.number, &row.run_id)?;
-    let pass = steps.iter().map(|s| s.6).max().unwrap_or(0) + 1;
+    let pass = steps.iter().map(|s| s.round).max().unwrap_or(0) + 1;
     Ok(json!({
         "repo": row.repo,
         "number": row.number,
@@ -95,8 +95,8 @@ fn detail_json(home: &Path, store: &Store, row: &IssueRow) -> Result<Value> {
     let steps: Vec<Value> = store
         .steps(&row.repo, row.number, &row.run_id)?
         .into_iter()
-        .map(|(step, vendor, attempt, verdict, exit_code, duration_ms, pass)| {
-            json!({ "step": step, "vendor": vendor, "attempt": attempt, "verdict": verdict, "exit_code": exit_code, "seconds": duration_ms as f64 / 1000.0, "pass": pass + 1 })
+        .map(|ran| {
+            json!({ "step": ran.step, "vendor": ran.vendor, "model": ran.model, "attempt": ran.attempt, "verdict": ran.verdict, "exit_code": ran.exit_code, "seconds": ran.duration_ms as f64 / 1000.0, "pass": ran.round + 1 })
         })
         .collect();
     let dir = run_dir(home, row);
@@ -147,18 +147,86 @@ fn log_json(home: &Path, row: &IssueRow, file: Option<&str>) -> Value {
 fn usage_json(store: &Store) -> Result<Value> {
     let mut by_vendor: BTreeMap<String, (u64, f64, u64)> = BTreeMap::new();
     for row in store.issues()? {
-        for (_, vendor, _, verdict, _, duration_ms, _) in store.steps(&row.repo, row.number, &row.run_id)? {
-            let Some(vendor) = vendor else { continue };
+        for ran in store.steps(&row.repo, row.number, &row.run_id)? {
+            let Some(vendor) = ran.vendor else { continue };
             let entry = by_vendor.entry(vendor).or_default();
             entry.0 += 1;
-            entry.1 += duration_ms as f64 / 1000.0;
-            if verdict == "rate-limited" {
+            entry.1 += ran.duration_ms as f64 / 1000.0;
+            if ran.verdict == "rate-limited" {
                 entry.2 += 1;
             }
         }
     }
     let list: Vec<Value> = by_vendor.into_iter().map(|(vendor, (calls, seconds, limited))| json!({ "vendor": vendor, "calls": calls, "seconds": seconds, "rate_limited": limited })).collect();
     Ok(json!(list))
+}
+
+/// What runs where, across every project: each running scheduler's places,
+/// who holds each slot of each pool, and who is out of quota until when.
+fn schedule_json(home: &Path, store: &Store) -> Result<Value> {
+    let now = util::now_secs();
+    let rows = store.issues()?;
+    // What the database knows about an issue the scheduler names.
+    let known = |repo: &str, entry: &mut Value| -> Result<()> {
+        let number = entry.get("number").and_then(Value::as_u64).unwrap_or(0);
+        if let (Some(row), Some(object)) = (rows.iter().find(|row| row.repo == repo && row.number == number), entry.as_object_mut()) {
+            let issue = issue_json(store, row)?;
+            for field in ["state", "stage", "pass"] {
+                object.insert(field.into(), issue[field].clone());
+            }
+            // A waiting issue's own reason is not replaced.
+            if object.get("waits_on").is_none_or(Value::is_null) {
+                object.insert("waits_on".into(), issue["waits_on"].clone());
+            }
+        }
+        Ok(())
+    };
+    let mut schedulers = Vec::new();
+    for scheduler in board::live(home) {
+        let mut value = serde_json::to_value(&scheduler)?;
+        for (index, project) in scheduler.projects.iter().enumerate() {
+            for list in ["running", "parked"] {
+                for entry in value["projects"][index][list].as_array_mut().into_iter().flatten() {
+                    known(&project.repo, entry)?;
+                }
+            }
+        }
+        schedulers.push(value);
+    }
+
+    let holders = lock::holders(home);
+    let config = Config::load(home).unwrap_or_default();
+    let mut names: Vec<String> = config.pools.keys().cloned().chain(holders.iter().map(|holder| holder.pool.clone())).collect();
+    names.sort();
+    names.dedup();
+    let pools: Vec<Value> = names
+        .iter()
+        .map(|name| {
+            let highest = holders.iter().filter(|holder| &holder.pool == name).map(|holder| holder.slot).max().unwrap_or(0);
+            let size = config.pool(name).max(highest);
+            let slots: Vec<Value> = (1..=size)
+                .map(|slot| {
+                    let holder = holders.iter().find(|holder| &holder.pool == name && holder.slot == slot);
+                    json!({ "slot": slot, "holder": holder.map(|h| json!({ "repo": h.repo, "number": h.issue, "what": h.what, "since": h.since })) })
+                })
+                .collect();
+            json!({ "name": name, "size": size, "slots": slots })
+        })
+        .collect();
+
+    let availability = ledger::load(home);
+    let out: Vec<Value> = availability
+        .out
+        .iter()
+        .filter(|(_, entry)| entry.until > now)
+        .map(|(who, entry)| json!({ "who": who, "until": entry.until, "hits": entry.hits, "reason": first_line(&entry.reason) }))
+        .collect();
+    let quota: Vec<Value> = availability
+        .quota
+        .iter()
+        .map(|(provider, reading)| json!({ "provider": provider, "at": reading.at, "windows": reading.windows, "out_until": reading.out_until.filter(|until| *until > now) }))
+        .collect();
+    Ok(json!({ "now": now, "schedulers": schedulers, "pools": pools, "out": out, "quota": quota }))
 }
 
 fn find(store: &Store, owner: &str, name: &str, number: &str) -> Result<Option<IssueRow>> {
@@ -183,6 +251,7 @@ pub fn route(context: &Context_, request: &Request) -> (u16, Value) {
                 (200, json!(rows.iter().map(|row| issue_json(&store, row)).collect::<Result<Vec<_>>>()?))
             }
             ("GET", ["v1", "usage"]) => (200, usage_json(&store)?),
+            ("GET", ["v1", "schedule"]) => (200, schedule_json(&context.home, &store)?),
             ("GET", ["v1", "capacity"]) => (200, serde_json::to_value(super::capacity::read())?),
             ("GET", ["v1", "workflow"]) | ("GET", ["v1", "modules"]) | ("POST", ["v1", "workflow", "validate"]) | ("POST", ["v1", "workflow", "propose"]) | ("POST", ["v1", "modules"]) => {
                 let repo = request.query.get("repo").cloned().or_else(|| context.repos.keys().next().cloned()).unwrap_or_default();
@@ -359,7 +428,7 @@ mod tests {
                 kind: "agent".into(),
                 module: format!("agent/{name}"),
                 vendor: vendor.map(str::to_string),
-                model: None,
+                model: vendor.map(|_| "gpt-x".to_string()),
                 subscription: None,
                 round,
                 attempt: 1,
@@ -414,6 +483,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(detail["steps"].as_array().unwrap().len(), 2);
         assert_eq!(detail["steps"][1]["pass"], 2);
+        assert_eq!((detail["steps"][0]["vendor"].as_str(), detail["steps"][0]["model"].as_str()), (Some("codex"), Some("gpt-x")));
         assert_eq!(detail["summary"]["what_changed"], "x");
         assert_eq!(detail["failure"], "3 fix rounds were used.\nlog");
         assert!(detail["files"].as_array().unwrap().iter().any(|f| f == "summary.json"));
@@ -429,6 +499,70 @@ mod tests {
         assert_eq!(get(&context, "/v1/issues/o/r/99").0, 404);
         assert_eq!(get(&context, "/v2/issues").0, 404);
         assert_eq!(get(&context, "/v1/workflow?repo=o/r").0, 404);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_schedule_says_who_has_each_place_and_each_slot() {
+        let home = home("schedule");
+        let store = Store::open(&home).unwrap();
+        let context = Context_ { home: home.clone(), repos: BTreeMap::new(), program: PathBuf::from("factory") };
+        // Nothing runs: no scheduler, and every slot of every pool is free.
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.yaml"), "pools:\n  simulator: 2\n  claude: 1\n").unwrap();
+        let (status, idle) = get(&context, "/v1/schedule");
+        assert_eq!(status, 200);
+        assert_eq!(idle["schedulers"], json!([]));
+        assert_eq!(idle["pools"][1], json!({ "name": "simulator", "size": 2, "slots": [{ "slot": 1, "holder": null }, { "slot": 2, "holder": null }] }));
+
+        // A scheduler with one issue running, one waiting and one parked.
+        store.start_issue("o/r", 7, "trial", "a", "Add the file", "run1", "b", "/w", "abc").unwrap();
+        step(&store, 7, "develop", Some("chatgpt"), "replied", 0);
+        store.set_stage("o/r", 7, "verify", "waiting", Some("a free simulator: all 2 are in use by other issues")).unwrap();
+        store.start_issue("o/r", 9, "trial", "c", "Park it", "run1", "b", "/w", "abc").unwrap();
+        store.set_parked("o/r", 9, "develop", 5_000_000_000, "everyone who may develop is out of quota").unwrap();
+        let entry = |number: u64, key: &str| board::Entry { number, key: key.into(), title: format!("Issue {number}"), ..board::Entry::default() };
+        let project = board::ProjectBoard {
+            repo: "o/r".into(),
+            label: "today".into(),
+            max_parallel: Some(1),
+            running: vec![board::Entry { since: Some(1_000), ..entry(7, "a") }],
+            waiting: vec![board::Entry { waits_on: Some("this project's limit of 1 at once".into()), ..entry(8, "b") }],
+            parked: vec![board::Entry { until: Some(5_000_000_000), ..entry(9, "c") }],
+            merged: vec![3],
+            opened: Vec::new(),
+            failed: Vec::new(),
+        };
+        let scheduler = board::Board { pid: std::process::id(), started_at: 900, updated_at: 1_000, places: 3, in_order: false, watch: false, held_back: None, projects: vec![project] };
+        board::write(&home, &scheduler).unwrap();
+        let who = lock::Who { repo: "o/r".into(), issue: 7, what: "verify".into() };
+        let (_held, slot) = lock::acquire_slot(&home, "simulator", 2, Some(&who), &|| {}).unwrap();
+        // A pool the config does not list still shows up while it is held.
+        let caller = lock::Who { repo: "o/r".into(), issue: 7, what: "review, opus".into() };
+        let (_call, _) = lock::acquire_slot(&home, "glm", 1, Some(&caller), &|| {}).unwrap();
+        ledger::hit(&home, "chatgpt/gpt-x", "You have hit your usage limit\nTry again later").unwrap();
+
+        let (_, busy) = get(&context, "/v1/schedule");
+        let board = &busy["schedulers"][0];
+        assert_eq!((board["places"].as_u64(), board["pid"].as_u64()), (Some(3), Some(u64::from(std::process::id()))));
+        let project = &board["projects"][0];
+        // What the scheduler wrote, joined with what the database knows.
+        let running = &project["running"][0];
+        assert_eq!((running["number"].as_u64(), running["since"].as_u64(), running["stage"].as_str(), running["state"].as_str()), (Some(7), Some(1_000), Some("verify"), Some("waiting")));
+        assert_eq!(running["waits_on"], "a free simulator: all 2 are in use by other issues");
+        // An issue that never ran has only the scheduler's word.
+        assert_eq!(project["waiting"][0]["waits_on"], "this project's limit of 1 at once");
+        assert_eq!(project["waiting"][0].get("stage"), None);
+        assert_eq!((project["parked"][0]["until"].as_u64(), project["parked"][0]["waits_on"].as_str()), (Some(5_000_000_000), Some("everyone who may develop is out of quota")));
+        let names: Vec<&str> = busy["pools"].as_array().unwrap().iter().map(|pool| pool["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["claude", "glm", "simulator"]);
+        let simulator = &busy["pools"][2];
+        assert_eq!(slot, 1);
+        assert_eq!((simulator["slots"][0]["holder"]["number"].as_u64(), simulator["slots"][0]["holder"]["what"].as_str()), (Some(7), Some("verify")));
+        assert_eq!(simulator["slots"][1]["holder"], Value::Null);
+        assert_eq!(busy["pools"][1]["slots"][0]["holder"]["what"], "review, opus");
+        assert_eq!((busy["out"][0]["who"].as_str(), busy["out"][0]["reason"].as_str(), busy["out"][0]["hits"].as_u64()), (Some("chatgpt/gpt-x"), Some("You have hit your usage limit"), Some(1)));
+        assert!(busy["out"][0]["until"].as_u64() > busy["now"].as_u64());
         let _ = std::fs::remove_dir_all(&home);
     }
 

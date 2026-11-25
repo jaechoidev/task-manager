@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod board;
 pub mod capacity;
 pub mod config;
 pub mod editing;
@@ -612,6 +613,11 @@ impl Run<'_> {
         Ok(Start { index: progress.index, used: progress.used, feedback: progress.feedback })
     }
 
+    /// What a slot's note says about this run.
+    fn holding(&self, what: &str) -> lock::Who {
+        lock::Who { repo: self.repo.clone(), issue: self.issue.number, what: what.to_string() }
+    }
+
     /// The part of a file name that says which round it belongs to.
     fn round_tag(&self) -> String {
         if self.round == 0 {
@@ -730,7 +736,7 @@ impl Run<'_> {
             // A provider with a cap on this machine is a pool too. The slot is
             // held only for the call, so a wait on a usage limit frees it.
             let slot = match self.config.vendor_pool(&by.provider) {
-                Some(size) => Some(lock::acquire_slot(&self.home, &by.provider, size, &|| {
+                Some(size) => Some(lock::acquire_slot(&self.home, &by.provider, size, Some(&self.holding(&format!("{name}, {}", by.model()))), &|| {
                     println!("  {name}: waiting for a free {} call, all {size} in use", by.provider);
                     let _ = self.store.set_stage(&self.repo, self.issue.number, name, "waiting", Some(&format!("a free {} call: all {size} are in use", by.provider)));
                 })?),
@@ -904,9 +910,9 @@ impl Run<'_> {
             .store
             .steps(&self.repo, self.issue.number, &self.run_id)?
             .iter()
-            .map(|(step, vendor, _, verdict, _, duration_ms, round)| {
-                let who = vendor.as_deref().map(|v| format!(" ({v})")).unwrap_or_default();
-                format!("pass {}: {step}{who}: {verdict}, {:.0} s", round + 1, *duration_ms as f64 / 1000.0)
+            .map(|ran| {
+                let who = ran.vendor.as_deref().map(|v| format!(" ({v})")).unwrap_or_default();
+                format!("pass {}: {}{who}: {}, {:.0} s", ran.round + 1, ran.step, ran.verdict, ran.duration_ms as f64 / 1000.0)
             })
             .collect();
         let fixes: Vec<String> = self.fixes.iter().map(|f| format!("`{}` failed: {} Fixed in \"{}\"", f.from, f.why, f.subject)).collect();
@@ -1275,7 +1281,7 @@ impl Run<'_> {
         let mut env: Vec<(String, String)> = Vec::new();
         for name in &wanted {
             let size = self.config.pool(name);
-            let (slot_held, slot) = lock::acquire_slot(&self.home, name, size, &|| {
+            let (slot_held, slot) = lock::acquire_slot(&self.home, name, size, Some(&self.holding(&step.name)), &|| {
                 println!("  {}: waiting for a free {name}, all {size} in use", step.name);
                 let _ = self.store.set_stage(&self.repo, self.issue.number, &step.name, "waiting", Some(&format!("a free {name}: all {size} are in use by other issues")));
             })?;
@@ -1647,10 +1653,10 @@ impl Run<'_> {
             .store
             .steps(&self.repo, self.issue.number, &self.run_id)?
             .iter()
-            .map(|(step, vendor, _, verdict, exit_code, duration_ms, round)| {
-                let who = vendor.as_deref().map(|v| format!(" ({v})")).unwrap_or_default();
-                let code = exit_code.map(|c| format!(", exit {c}")).unwrap_or_default();
-                format!("pass {}: {step}{who}: {verdict}{code}, {:.0} s", round + 1, *duration_ms as f64 / 1000.0)
+            .map(|ran| {
+                let who = ran.vendor.as_deref().map(|v| format!(" ({v})")).unwrap_or_default();
+                let code = ran.exit_code.map(|c| format!(", exit {c}")).unwrap_or_default();
+                format!("pass {}: {}{who}: {}{code}, {:.0} s", ran.round + 1, ran.step, ran.verdict, ran.duration_ms as f64 / 1000.0)
             })
             .collect();
         let review = match &self.review {
@@ -2349,7 +2355,7 @@ pub fn status() -> Result<()> {
             println!("  pull request {url}");
         }
         let mut shown_round = 0;
-        for (step, vendor, attempt, verdict, exit_code, duration_ms, round) in store.steps(&row.repo, row.number, &row.run_id)? {
+        for state::Ran { step, vendor, attempt, verdict, exit_code, duration_ms, round, .. } in store.steps(&row.repo, row.number, &row.run_id)? {
             if round != shown_round {
                 println!("    back for pass {}", round + 1);
                 shown_round = round;

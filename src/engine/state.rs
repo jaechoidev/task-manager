@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS steps (
     kind         TEXT NOT NULL,
     module       TEXT NOT NULL,
     vendor       TEXT,
+    model        TEXT,
     round        INTEGER NOT NULL DEFAULT 0,
     attempt      INTEGER NOT NULL,
     sha          TEXT,
@@ -102,6 +103,22 @@ pub struct IssueRow {
     pub wake_at: Option<u64>,
 }
 
+/// A step that ran, as the database keeps it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ran {
+    pub step: String,
+    /// Who answered, for an agent step: the provider, or the vendor.
+    pub vendor: Option<String>,
+    /// The model it was started with. Empty for steps from before this was kept.
+    pub model: Option<String>,
+    pub attempt: u32,
+    pub verdict: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    /// 0 for the first pass.
+    pub round: u32,
+}
+
 pub struct Store {
     db: Connection,
     log: PathBuf,
@@ -118,6 +135,11 @@ impl Store {
         let has_round = db.prepare("SELECT 1 FROM pragma_table_info('steps') WHERE name = 'round'")?.exists([])?;
         if !has_round {
             db.execute_batch("ALTER TABLE steps ADD COLUMN round INTEGER NOT NULL DEFAULT 0")?;
+        }
+        // Databases from before the model was kept have no `model` column.
+        let has_model = db.prepare("SELECT 1 FROM pragma_table_info('steps') WHERE name = 'model'")?.exists([])?;
+        if !has_model {
+            db.execute_batch("ALTER TABLE steps ADD COLUMN model TEXT")?;
         }
         // Databases from before parking have no `wake_at` column.
         let has_wake = db.prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name = 'wake_at'")?.exists([])?;
@@ -191,8 +213,8 @@ impl Store {
     pub fn record(&self, step: &StepRecord) -> Result<()> {
         self.db.execute(
             "INSERT INTO steps (repo, number, run_id, step, kind, module, vendor, attempt, sha, exit_code, timed_out,
-                                verdict, duration_ms, input_path, output_path, session_id, finished_at, round)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                                verdict, duration_ms, input_path, output_path, session_id, finished_at, round, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 step.repo,
                 step.issue,
@@ -211,7 +233,8 @@ impl Store {
                 step.output,
                 step.session_id,
                 step.ts,
-                step.round
+                step.round,
+                step.model
             ],
         )?;
         let mut file = OpenOptions::new().create(true).append(true).open(&self.log)?;
@@ -248,15 +271,23 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Steps of one run, oldest first: (step, vendor, attempt, verdict, exit code, duration ms, round).
-    #[allow(clippy::type_complexity)]
-    pub fn steps(&self, repo: &str, number: u64, run_id: &str) -> Result<Vec<(String, Option<String>, u32, String, Option<i32>, u64, u32)>> {
+    /// Steps of one run, oldest first.
+    pub fn steps(&self, repo: &str, number: u64, run_id: &str) -> Result<Vec<Ran>> {
         let mut statement = self.db.prepare(
-            "SELECT step, vendor, attempt, verdict, exit_code, duration_ms, round FROM steps
+            "SELECT step, vendor, model, attempt, verdict, exit_code, duration_ms, round FROM steps
              WHERE repo = ?1 AND number = ?2 AND run_id = ?3 ORDER BY id",
         )?;
         let rows = statement.query_map(params![repo, number, run_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+            Ok(Ran {
+                step: row.get(0)?,
+                vendor: row.get(1)?,
+                model: row.get(2)?,
+                attempt: row.get(3)?,
+                verdict: row.get(4)?,
+                exit_code: row.get(5)?,
+                duration_ms: row.get(6)?,
+                round: row.get(7)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -307,7 +338,7 @@ mod tests {
         assert_eq!((issues[0].stage.as_str(), issues[0].status.as_str()), ("verify", "failed"));
         assert_eq!(issues[0].failure.as_deref(), Some("exit 65"));
         let steps = store.steps("o/r", 4, "run1").unwrap();
-        assert_eq!((steps[0].3.as_str(), steps[0].6), ("fail", 2));
+        assert_eq!((steps[0].verdict.as_str(), steps[0].round, steps[0].model.as_deref()), ("fail", 2, None));
         let log = std::fs::read_to_string(home.join("requests.jsonl")).unwrap();
         assert!(log.contains("\"module\":\"check/verify\""));
         let _ = std::fs::remove_dir_all(&home);
@@ -320,7 +351,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         {
             let db = Connection::open(home.join("state.db")).unwrap();
-            db.execute_batch(&SCHEMA.replace("    round        INTEGER NOT NULL DEFAULT 0,\n", "")).unwrap();
+            db.execute_batch(&SCHEMA.replace("    round        INTEGER NOT NULL DEFAULT 0,\n", "").replace("    model        TEXT,\n", "")).unwrap();
             db.execute_batch(
                 "INSERT INTO steps (repo, number, run_id, step, kind, module, attempt, timed_out, verdict, duration_ms, finished_at)
                  VALUES ('o/r', 4, 'run0', 'develop', 'agent', 'agent/dev', 1, 0, 'replied', 5, 't')",
@@ -329,7 +360,7 @@ mod tests {
         }
         let store = Store::open(&home).unwrap();
         let steps = store.steps("o/r", 4, "run0").unwrap();
-        assert_eq!((steps[0].0.as_str(), steps[0].6), ("develop", 0));
+        assert_eq!((steps[0].step.as_str(), steps[0].round, steps[0].model.as_deref()), ("develop", 0, None));
         // Opening again must not try to add the column twice.
         drop(store);
         Store::open(&home).unwrap();

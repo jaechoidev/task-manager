@@ -69,7 +69,7 @@ A todo-trial verify is now about 300 seconds even alone. The likely cause is tha
 
 ## Open items
 
-- **No view of the scheduler.** The macOS app lists issues with their steps, and labels each with its repository. It does not show the places, what waits for one, which simulator a step holds, who answered a call, or what is parked until when. Those are in the logs only. The app's bundle also predates pools, providers and the scheduler, and nobody has used it with two projects.
+- **No view of the scheduler.** When this was written the macOS app listed issues with their steps and showed nothing of the places, the pools or the quota. Built later the same day: see [a view of the scheduler](2026-11-24-schedule-view.md).
 - **`factory status` is one long list.** It prints every issue the machine has run, with no filter by project or by run.
 - **Verify time grows with the suite.** At 300 seconds for 13 flows, an issue that has to be verified again costs five minutes each time. Verifying a batch together, or running only the flows a change can affect, is not built.
 - **Fair share counts issues, not cost.** A todo-trial issue held a place two to four times as long as a counter-trial one.

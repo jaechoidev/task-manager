@@ -9,6 +9,7 @@
 //! already shared, through the pools. What this adds is who gets the next
 //! free place.
 
+use super::board::{self, Board, Entry, ProjectBoard};
 use super::issue;
 use super::util;
 use crate::gh;
@@ -129,6 +130,34 @@ pub fn pick(ready: &[Candidate], running: &[Candidate], slots: usize) -> Vec<Can
     picked
 }
 
+/// What a labelled issue that has not started waits on, for a person
+/// looking at the scheduler. `busy` is what runs or is parked in its
+/// project, `limit` the project's own cap when it is reached, `held_back`
+/// why the machine takes no further issue, and `behind` whether a project
+/// ahead of it has to finish first.
+pub fn waits_on(candidate: &Candidate, busy: &[Candidate], limit: Option<usize>, held_back: Option<&str>, behind: bool) -> String {
+    if candidate.held {
+        return "a person: it carries the 'blocked' label".to_string();
+    }
+    if !candidate.blockers.is_empty() {
+        let blockers: Vec<String> = candidate.blockers.iter().map(|n| format!("#{n}")).collect();
+        return format!("{} to be closed", blockers.join(", "));
+    }
+    if let Some(other) = busy.iter().find(|other| scopes_overlap(&candidate.scope, &other.scope).is_some()) {
+        return format!("#{}, which changes the same files", other.number);
+    }
+    if let Some(reason) = held_back {
+        return format!("the machine: {reason}");
+    }
+    if let Some(limit) = limit {
+        return format!("this project's limit of {limit} at once");
+    }
+    if behind {
+        return "the project ahead of it".to_string();
+    }
+    "a free place".to_string()
+}
+
 fn labels_of(value: &Value) -> Vec<String> {
     value
         .get("labels")
@@ -170,6 +199,8 @@ struct Running {
     child: Child,
     log: PathBuf,
     started: Instant,
+    /// The same moment in seconds since 1970, for the board.
+    started_at: u64,
 }
 
 fn last_line(log: &Path) -> String {
@@ -211,6 +242,33 @@ struct State {
     merged: Vec<u64>,
     opened: Vec<u64>,
     failed: Vec<u64>,
+}
+
+/// What the scheduler is doing now, for other processes to read.
+fn board_of(opts: &Options, states: &[State], running: &[Running], held_back: Option<&str>, started_at: u64) -> Board {
+    let entry = |candidate: &Candidate| Entry { number: candidate.number, key: candidate.key.clone(), title: candidate.title.clone(), ..Entry::default() };
+    let mut projects = Vec::new();
+    for (project, state) in states.iter().enumerate() {
+        let mine: Vec<&Running> = running.iter().filter(|run| run.project == project).collect();
+        let busy: Vec<Candidate> = mine.iter().map(|run| run.candidate.clone()).chain(state.parked.iter().map(|(candidate, _)| candidate.clone())).collect();
+        let limit = state.max.filter(|max| mine.len() >= *max);
+        // In order, a project waits while one ahead of it has work running or ready.
+        let behind = opts.in_order && states[..project].iter().enumerate().any(|(ahead, other)| running.iter().any(|run| run.project == ahead) || !ready(&other.all, &other.tried).is_empty());
+        let mut waiting: Vec<&Candidate> = state.all.iter().filter(|candidate| !state.tried.contains(&candidate.number)).collect();
+        waiting.sort_by_key(|candidate| (candidate.held || !candidate.blockers.is_empty(), candidate.priority, candidate.number));
+        projects.push(ProjectBoard {
+            repo: state.repo.clone(),
+            label: state.label.clone(),
+            max_parallel: state.max,
+            running: mine.iter().map(|run| Entry { since: Some(run.started_at), ..entry(&run.candidate) }).collect(),
+            waiting: waiting.into_iter().map(|candidate| Entry { waits_on: Some(waits_on(candidate, &busy, limit, held_back, behind)), ..entry(candidate) }).collect(),
+            parked: state.parked.iter().map(|(candidate, wake)| Entry { until: Some(*wake), ..entry(candidate) }).collect(),
+            merged: state.merged.clone(),
+            opened: state.opened.clone(),
+            failed: state.failed.clone(),
+        });
+    }
+    Board { pid: std::process::id(), started_at, updated_at: util::now_secs(), places: opts.parallel, in_order: opts.in_order, watch: opts.watch, held_back: held_back.map(str::to_string), projects }
 }
 
 /// Runs every ready issue of every project until none is left, or for ever
@@ -264,6 +322,19 @@ pub fn run(opts: &Options) -> Result<bool> {
             println!("  {}: issues labelled '{}'{max}", state.repo, state.label);
         }
     }
+
+    // What this scheduler is doing, written down for `factory serve` each
+    // time it changes. Nothing here depends on it having been written.
+    board::sweep(&home);
+    let began = util::now_secs();
+    let warned = std::cell::Cell::new(false);
+    let publish = |states: &[State], running: &[Running], held_back: Option<&str>| {
+        if let Err(e) = board::write(&home, &board_of(opts, states, running, held_back, began)) {
+            if !warned.replace(true) {
+                eprintln!("warning: could not write down what the scheduler is doing: {e:#}");
+            }
+        }
+    };
 
     let mut running: Vec<Running> = Vec::new();
     let mut held_back: Option<String> = None;
@@ -330,8 +401,9 @@ pub fn run(opts: &Options) -> Result<bool> {
             let child = command.stdin(Stdio::null()).stdout(out).stderr(err).spawn().context("starting a run")?;
             println!("  {} {} started. Log: {}", tag(project, candidate.number), candidate.key, log.display());
             state.tried.insert(candidate.number);
-            running.push(Running { project, candidate, child, log, started: Instant::now() });
+            running.push(Running { project, candidate, child, log, started: Instant::now(), started_at: util::now_secs() });
         }
+        publish(&states, &running, held_back.as_deref());
 
         if running.is_empty() {
             let wake = states.iter().flat_map(|state| state.parked.iter().map(|(_, wake)| *wake)).min();
@@ -399,6 +471,7 @@ pub fn run(opts: &Options) -> Result<bool> {
             let wake = store.issue(&state.repo, number)?.and_then(|row| row.wake_at).unwrap_or(util::now_secs() + 60);
             println!("  {name} {} parked after {:.0} s, until {}: {result}", done.candidate.key, done.started.elapsed().as_secs_f64(), util::clock(wake));
             state.parked.push((done.candidate, wake));
+            publish(&states, &running, held_back.as_deref());
             continue;
         }
         if !status.success() && result.contains(super::ALREADY_RUNNING) {
@@ -413,6 +486,12 @@ pub fn run(opts: &Options) -> Result<bool> {
             state.failed.push(number);
         } else if result.starts_with("MERGED") {
             state.merged.push(number);
+        } else {
+            state.opened.push(number);
+        }
+        publish(&states, &running, held_back.as_deref());
+        if status.success() && result.starts_with("MERGED") {
+            let state = &states[done.project];
             // GitHub closes the issue a moment after the merge. Issues it
             // blocks only become ready once it is closed.
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -423,10 +502,9 @@ pub fn run(opts: &Options) -> Result<bool> {
                 }
                 std::thread::sleep(pause());
             }
-        } else {
-            state.opened.push(number);
         }
     }
+    board::remove(&home, std::process::id());
 
     let list = |numbers: &[u64]| if numbers.is_empty() { "none".to_string() } else { numbers.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ") };
     for state in &states {
@@ -495,6 +573,23 @@ mod tests {
         assert_eq!(next_project(true, &[load(0, 0), load(0, 0)]), None);
         // Its own limit holds the first back without letting the second in.
         assert_eq!(next_project(true, &[Load { running: 1, startable: 2, max: Some(1) }, load(0, 2)]), None);
+    }
+
+    #[test]
+    fn an_issue_that_has_not_started_says_what_it_waits_on() {
+        let plain = candidate(8, &["Sources/A/"], 1);
+        // The first reason that applies is the one a person can act on.
+        assert_eq!(waits_on(&plain, &[], None, None, false), "a free place");
+        assert_eq!(waits_on(&plain, &[], None, None, true), "the project ahead of it");
+        assert_eq!(waits_on(&plain, &[], Some(1), None, true), "this project's limit of 1 at once");
+        assert_eq!(waits_on(&plain, &[], Some(1), Some("memory is short"), true), "the machine: memory is short");
+        let running = [candidate(7, &["Sources/"], 1)];
+        assert_eq!(waits_on(&plain, &running, Some(1), Some("memory is short"), false), "#7, which changes the same files");
+        let mut blocked = plain.clone();
+        blocked.blockers = vec![3, 4];
+        assert_eq!(waits_on(&blocked, &running, None, None, false), "#3, #4 to be closed");
+        blocked.held = true;
+        assert_eq!(waits_on(&blocked, &running, None, None, false), "a person: it carries the 'blocked' label");
     }
 
     #[test]

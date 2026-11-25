@@ -20,6 +20,9 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(groups.map { $0.issues.map(\.number) }, [[24], [25], [5], [7]])
         XCTAssertEqual(stateLabel(issues[0]), "Stopped at verify")
         XCTAssertEqual(stateLabel(issues[2]), "Waiting at github")
+        // With two projects in the list, a row says which one it is in.
+        XCTAssertEqual(stateCaption(issues[0], showRepo: false), "Stopped at verify, pass 2")
+        XCTAssertEqual(stateCaption(issues[0], showRepo: true), "r · Stopped at verify, pass 2")
     }
 
     func testDetailDecodesWithAndWithoutASummary() throws {
@@ -114,6 +117,63 @@ final class ModelTests: XCTestCase {
         XCTAssertTrue(withAgent.contains("  - review: { module: agent/review, vendor: claude }\non_fail:\n  verify: develop"))
         // A file with no step list is left alone.
         XCTAssertEqual(insertStep(into: "limits:\n", module: lint, developer: nil), "limits:\n")
+    }
+
+    /// What `GET /v1/schedule` answers, in the shape the engine's own test checks.
+    let scheduleJSON = """
+    {"now":1300,
+     "schedulers":[{"pid":4242,"started_at":900,"updated_at":1290,"places":3,"in_order":false,"watch":true,"held_back":null,
+       "projects":[
+        {"repo":"o/todo","label":"today","max_parallel":null,
+         "running":[{"number":45,"key":"stats","title":"Stats","since":1000,"until":null,"waits_on":"","state":"running","stage":"verify","pass":2},
+                    {"number":46,"key":"build","title":"Build","since":1240,"until":null,"waits_on":"a free claude call: all 2 are in use","state":"waiting","stage":"review","pass":1}],
+         "waiting":[{"number":47,"key":"later","title":"Later","since":null,"until":null,"waits_on":"a free place"}],
+         "parked":[{"number":48,"key":"parked","title":"Parked","since":null,"until":4000,"waits_on":"everyone who may develop is out of quota","state":"waiting","stage":"develop","pass":1}],
+         "merged":[44],"opened":[],"failed":[]},
+        {"repo":"o/counter","label":"today","max_parallel":1,"running":[{"number":3,"key":"counter","title":"Counter","since":1290,"until":null,"waits_on":null}],"waiting":[],"parked":[],"merged":[],"opened":[],"failed":[]}]}],
+     "pools":[{"name":"simulator","size":2,"slots":[{"slot":1,"holder":{"repo":"o/todo","number":45,"what":"verify","since":1100}},{"slot":2,"holder":null}]}],
+     "out":[{"who":"chatgpt/gpt-x","until":4000,"hits":2,"reason":"You have hit your usage limit"}],
+     "quota":[{"provider":"glm","at":1200,"windows":["5-hour window: 1% used"],"out_until":null}]}
+    """
+
+    func testTheScheduleDecodesAndSaysWhoHasEachPlace() throws {
+        let schedule = try JSONDecoder.api.decode(Schedule.self, from: Data(scheduleJSON.utf8))
+        let board = schedule.schedulers[0]
+        XCTAssertEqual(board.inUse, 3)
+        XCTAssertEqual(placesLine(board), "3 places, 3 in use, projects side by side, watching for new work")
+        let todo = board.projects[0]
+        // A running issue says its step and how long it has had its place.
+        XCTAssertEqual(runningLine(todo.running[0], now: schedule.now), "verify · pass 2 · 5 min 0 s")
+        // One that waits inside its place says what for.
+        XCTAssertEqual(runningLine(todo.running[1], now: schedule.now), "waiting at review for a free claude call: all 2 are in use · 60 s")
+        // One the database has not heard of yet has only just been started.
+        XCTAssertEqual(runningLine(board.projects[1].running[0], now: schedule.now), "starting · 10 s")
+        XCTAssertEqual(todo.waiting[0].waitsOn, "a free place")
+        XCTAssertNil(todo.waiting[0].stage)
+        XCTAssertEqual(todo.parked[0].until, 4000)
+        XCTAssertEqual(board.projects[1].maxParallel, 1)
+        XCTAssertEqual(schedule.pools[0].held, 1)
+        XCTAssertEqual(schedule.pools[0].slots[0].holder?.what, "verify")
+        XCTAssertNil(schedule.pools[0].slots[1].holder)
+        XCTAssertEqual(schedule.out[0].hits, 2)
+        XCTAssertNil(schedule.quota[0].outUntil)
+    }
+
+    func testSmallPhrasesOfTheSchedule() throws {
+        var board = try JSONDecoder.api.decode(Schedule.self, from: Data(scheduleJSON.utf8)).schedulers[0]
+        board.inOrder = true
+        board.watch = false
+        XCTAssertEqual(placesLine(board), "3 places, 3 in use, one project after the other")
+        // With one project there is no order to speak of.
+        board.projects.removeLast()
+        board.places = 1
+        XCTAssertEqual(placesLine(board), "1 place, 2 in use")
+        XCTAssertEqual(shortRepo("o/todo"), "todo")
+        XCTAssertEqual(clockTime(3 * 3600 + 5 * 60, in: TimeZone(identifier: "UTC")!), "03:05")
+        let step = { (vendor: String?, model: String?) in StepRow(step: "review", vendor: vendor, model: model, attempt: 1, verdict: "approve", exitCode: 0, seconds: 1, pass: 1) }
+        XCTAssertEqual(stepWho(step("glm", "haiku")), "glm · haiku")
+        XCTAssertEqual(stepWho(step("codex", nil)), "codex")
+        XCTAssertEqual(stepWho(step(nil, nil)), "engine")
     }
 
     func testAnArrowToAStepThatIsNotThereIsLeftOut() throws {

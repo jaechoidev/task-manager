@@ -256,7 +256,7 @@ It is generated from the state database and the run files, with no LLM call, and
 | --- | --- |
 | `GET /v1/health` | The version and the repositories the server may act on |
 | `GET /v1/issues` | Every issue run so far: its state, its stage, what it waits on, which pass it is on |
-| `GET /v1/issues/<owner>/<repo>/<n>` | One issue: every step, the summary, what failed, the judgment, the run's files |
+| `GET /v1/issues/<owner>/<repo>/<n>` | One issue: every step with who answered and on which model, the summary, what failed, the judgment, the run's files |
 | `GET /v1/issues/<owner>/<repo>/<n>/log` | The end of the newest output of that run |
 | `GET /v1/blocked` | The issues waiting for a person |
 | `GET /v1/workflow?repo=<owner>/<repo>` | The workflow as a graph: steps in order, and where each failure goes. Also the file's text |
@@ -265,6 +265,7 @@ It is generated from the state database and the run files, with no LLM call, and
 | `POST /v1/workflow/propose?repo=...` | Checks it, then opens a pull request for it |
 | `POST /v1/modules?repo=...` | Scaffolds `{"module": "<kind>/<name>", "role": ...}` into a pull request |
 | `GET /v1/usage` | Calls, time and usage limits hit, per vendor |
+| `GET /v1/schedule` | What runs where: each running scheduler's places with what holds them, what waits and what for, what is parked until when, who holds each slot of each pool, and who is out of quota |
 | `GET /v1/capacity` | What `factory capacity` reports, as data |
 | `POST /v1/issues/<owner>/<repo>/<n>/retry` | Starts `factory retry` for the issue |
 | `POST /v1/issues/<owner>/<repo>/<n>/drop` | Runs `factory drop` for the issue |
@@ -277,6 +278,15 @@ Who may call it:
 - **Any other address needs `--token`.** The server refuses to start without one, and then every request must send `Authorization: Bearer <token>`.
 
 The engine returns data and no layout. Clients poll: there is no event stream yet.
+
+### What the schedule is read from
+
+The scheduler and `serve` are separate processes, so the scheduler writes down what it decided and `serve` reads it. None of these files decides anything. A lock holds a slot, and the scheduler's own memory holds the places.
+
+- **A scheduler's board** is `~/.factory/schedulers/<pid>.json`, written whole each time something starts, ends or is parked. It lists each project's running, waiting and parked issues. A board whose process is gone is ignored, and the next scheduler removes it.
+- **A slot's note** is `~/.factory/locks/<pool>-<slot>.holder`, left by the run that holds the slot and removed when it lets go: the issue, the step and since when. For an agent call it also names the model. A note whose process is gone is ignored.
+- **What an issue that has not started waits on** is one of: a person (the `blocked` label), other issues to be closed, an issue that changes the same files, the machine being busy, its project's own limit, the project ahead of it, or a free place.
+- **Quota** is `~/.factory/availability.json`, as in [Usage limits](#usage-limits).
 
 ## The queue
 
@@ -539,6 +549,7 @@ cargo install --path .
 | `src/engine/judgment.rs` | What a judgment's answer is allowed to do, and a split as a plan file |
 | `src/engine/handoff.rs` | The handoff document and the promote pull request |
 | `src/engine/api.rs` | The local API |
+| `src/engine/board.rs` | What a running scheduler is doing, written where `serve` can read it |
 | `src/engine/editing.rs` | Checking a workflow draft, listing and scaffolding modules, proposing a change as a pull request |
 | `app/` | The macOS app, a Swift package |
 | `src/engine/lock.rs` | Locks that hold across processes |

@@ -10,12 +10,15 @@ enum Render {
     }
 
     @MainActor
-    static func image(issues: [Issue], selected: Issue?, detail: IssueDetail?, log: LogTail?, workflow: Workflow?, usage: [UsageRow]) -> NSImage? {
+    static func image(issues: [Issue], selected: Issue?, detail: IssueDetail?, log: LogTail?, workflow: Workflow?, usage: [UsageRow], schedule: Schedule? = nil) -> NSImage? {
         let view = HStack(alignment: .top, spacing: 0) {
             IssueListPane(issues: issues, selected: selected?.id)
                 .frame(width: 300).padding(10)
             Divider()
             VStack(alignment: .leading, spacing: 18) {
+                if let schedule {
+                    SchedulePane(schedule: schedule).frame(width: 640)
+                }
                 if let selected {
                     IssueDetailPane(issue: selected, detail: detail, log: log).frame(width: 640)
                 }
@@ -104,7 +107,8 @@ enum Render {
         let log: LogTail? = selected.flatMap { fetch(address, $0.path + "/log") }
         let workflow: Workflow? = fetch(address, "workflow")
         let usage: [UsageRow] = fetch(address, "usage") ?? []
-        let image = MainActor.assumeIsolated { Render.image(issues: issues, selected: selected, detail: detail, log: log, workflow: workflow, usage: usage) }
+        let schedule: Schedule? = fetch(address, "schedule")
+        let image = MainActor.assumeIsolated { Render.image(issues: issues, selected: selected, detail: detail, log: log, workflow: workflow, usage: usage, schedule: schedule) }
         guard let tiff = image?.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) else {
             FileHandle.standardError.write(Data("could not draw the image\n".utf8))
             return 1
