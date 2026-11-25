@@ -17,6 +17,7 @@ use super::util;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// How the scheduler and the API are to be run.
 pub struct Options {
@@ -136,9 +137,63 @@ fn domain() -> Result<String> {
     Ok(format!("gui/{uid}"))
 }
 
-fn launchctl(args: &[&str]) -> Result<(bool, String)> {
+/// What one `launchctl` call answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Said {
+    pub ok: bool,
+    pub text: String,
+}
+
+fn launchctl(args: &[&str]) -> Result<Said> {
     let output = Command::new("launchctl").args(args).stdin(Stdio::null()).output().context("running launchctl")?;
-    Ok((output.status.success(), format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr))))
+    Ok(Said { ok: output.status.success(), text: format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)) })
+}
+
+/// How long launchd may take to finish removing an agent, and how often to look.
+const GONE_WITHIN: Duration = Duration::from_secs(10);
+const LOOK_EVERY: Duration = Duration::from_millis(250);
+/// How many times to offer launchd the new file, a second apart.
+const TAKE_TRIES: u32 = 5;
+
+/// launchctl's own text, without its advice to run as root, which is wrong
+/// for an agent of the login session.
+fn plain(text: &str) -> String {
+    text.lines().filter(|line| !line.contains("re-running the command as root")).collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
+/// Stops the agent if it is loaded and starts it from `file`.
+///
+/// `bootout` returns before launchd has finished removing the agent, and a
+/// `bootstrap` of a label still being removed fails with "5: Input/output
+/// error". So this waits until launchd no longer knows the label, and offers
+/// the file again a few times if launchd still refuses it.
+fn restart(target: &str, domain: &str, file: &Path, run: &mut dyn FnMut(&[&str]) -> Result<Said>, wait: &mut dyn FnMut(Duration)) -> Result<std::result::Result<(), String>> {
+    run(&["bootout", target])?;
+    let mut waited = Duration::ZERO;
+    while run(&["print", target])?.ok && waited < GONE_WITHIN {
+        wait(LOOK_EVERY);
+        waited += LOOK_EVERY;
+    }
+    let file = file.display().to_string();
+    let mut last = String::new();
+    for attempt in 1..=TAKE_TRIES {
+        let said = run(&["bootstrap", domain, &file])?;
+        if said.ok {
+            return Ok(Ok(()));
+        }
+        last = plain(&said.text);
+        if attempt < TAKE_TRIES {
+            wait(Duration::from_secs(1));
+        }
+    }
+    Ok(Err(format!("launchd did not take {file} after {TAKE_TRIES} tries: {last}")))
+}
+
+/// The PATH with each folder once, where it first appears, and no empty
+/// entries. The first of two copies is the one that was found first anyway.
+pub fn tidy_path(path: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    path.split(':').filter(|dir| !dir.is_empty() && seen.insert(*dir)).collect::<Vec<_>>().join(":")
 }
 
 /// The process of a loaded agent, from what `launchctl print` says.
@@ -147,37 +202,50 @@ pub fn pid_of(print: &str) -> Option<u32> {
 }
 
 fn state_of(job: &Job, file: &Path) -> Result<State> {
-    let (loaded, print) = launchctl(&["print", &format!("{}/{}", domain()?, job.label)])?;
-    Ok(State { label: job.label.clone(), installed: file.is_file(), loaded, pid: if loaded { pid_of(&print) } else { None }, log: job.log.clone() })
+    let print = launchctl(&["print", &format!("{}/{}", domain()?, job.label)])?;
+    Ok(State { label: job.label.clone(), installed: file.is_file(), loaded: print.ok, pid: if print.ok { pid_of(&print.text) } else { None }, log: job.log.clone() })
+}
+
+/// What `install` left: each agent's state, and why any was not taken.
+pub struct Installed {
+    pub states: Vec<State>,
+    pub refused: Vec<String>,
 }
 
 /// Writes both agents and starts them. An agent that is already there is
-/// stopped first and started with the new settings.
-pub fn install(opts: &Options) -> Result<Vec<State>> {
+/// stopped first and started with the new settings. One that launchd
+/// refuses doesn't stop the other from being tried.
+pub fn install(opts: &Options) -> Result<Installed> {
     let home = util::home()?;
     if Config::load(&home)?.projects.is_empty() {
         bail!("no project is registered, so the scheduler would have nothing to watch. Add one with `factory project add <checkout>`");
     }
     let program = std::env::current_exe().context("finding the factory program")?;
-    let path = std::env::var("PATH").map_err(|_| anyhow!("PATH is not set, so the service could not find git, gh or the agent programs"))?;
+    let path = tidy_path(&std::env::var("PATH").map_err(|_| anyhow!("PATH is not set, so the service could not find git, gh or the agent programs"))?);
     let factory_home = std::env::var_os("FACTORY_HOME").filter(|dir| !dir.is_empty()).map(PathBuf::from);
     let dir = agents_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::create_dir_all(home.join("service"))?;
     let domain = domain()?;
+    let jobs = jobs(&home, opts);
+    // Every file is written before anything is stopped, so a file that can't
+    // be written leaves what runs as it was.
+    for job in &jobs {
+        let file = dir.join(format!("{}.plist", job.label));
+        std::fs::write(&file, plist(job, &program, &path, factory_home.as_deref())).with_context(|| format!("writing {}", file.display()))?;
+    }
     let mut states = Vec::new();
-    for job in jobs(&home, opts) {
+    let mut refused = Vec::new();
+    for job in &jobs {
         let file = dir.join(format!("{}.plist", job.label));
         // Loaded with other settings: stop it, so the new file is what runs.
-        let _ = launchctl(&["bootout", &format!("{domain}/{}", job.label)]);
-        std::fs::write(&file, plist(&job, &program, &path, factory_home.as_deref())).with_context(|| format!("writing {}", file.display()))?;
-        let (ok, said) = launchctl(&["bootstrap", &domain, &file.display().to_string()])?;
-        if !ok {
-            bail!("launchd did not take {}: {}", file.display(), said.trim());
+        let target = format!("{domain}/{}", job.label);
+        if let Err(why) = restart(&target, &domain, &file, &mut launchctl, &mut std::thread::sleep)? {
+            refused.push(format!("{}: {why}", job.label));
         }
-        states.push(state_of(&job, &file)?);
+        states.push(state_of(job, &file)?);
     }
-    Ok(states)
+    Ok(Installed { states, refused })
 }
 
 /// Stops both agents and removes their files. Issues at work are cut off
@@ -189,7 +257,7 @@ pub fn uninstall() -> Result<Vec<String>> {
     let mut done = Vec::new();
     for job in jobs(&home, &Options { parallel: None, in_order: false, no_merge: false, no_guard: false, bind: String::new() }) {
         let file = dir.join(format!("{}.plist", job.label));
-        let (stopped, _) = launchctl(&["bootout", &format!("{domain}/{}", job.label)])?;
+        let stopped = launchctl(&["bootout", &format!("{domain}/{}", job.label)])?.ok;
         let removed = std::fs::remove_file(&file).is_ok();
         done.push(match (stopped, removed) {
             (true, _) => format!("{}: stopped and removed", job.label),
@@ -257,6 +325,63 @@ mod tests {
         assert_eq!(text.matches("<key>").count(), 11, "{text}");
         let light = plist(&Job { heavy: false, ..job }, Path::new("/f"), "/bin", None);
         assert!(light.contains("<string>Standard</string>") && !light.contains("FACTORY_HOME"), "{light}");
+    }
+
+    type Calls = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+    /// A launchctl that answers from a script, and the calls it was given.
+    fn scripted(answers: Vec<(&'static str, bool, &'static str)>) -> (impl FnMut(&[&str]) -> Result<Said>, Calls) {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = calls.clone();
+        let mut answers = answers.into_iter();
+        let run = move |args: &[&str]| {
+            seen.borrow_mut().push(args[0].to_string());
+            let (verb, ok, text) = answers.next().expect("an answer for every call");
+            assert_eq!(verb, args[0], "calls so far: {:?}", seen.borrow());
+            Ok(Said { ok, text: text.to_string() })
+        };
+        (run, calls)
+    }
+
+    const REFUSED: &str = "Bootstrap failed: 5: Input/output error\nTry re-running the command as root for richer errors.\n";
+
+    #[test]
+    fn a_restart_waits_for_the_old_agent_to_go_and_offers_the_file_again() {
+        // launchd still knows the label twice after bootout, then refuses the
+        // file once, as it does while the old agent is being removed.
+        let (mut run, calls) = scripted(vec![("bootout", true, ""), ("print", true, "state = running"), ("print", true, "state = exiting"), ("print", false, ""), ("bootstrap", false, REFUSED), ("bootstrap", true, "")]);
+        let mut waits = Vec::new();
+        let taken = restart("gui/501/dev.factory.serve", "gui/501", Path::new("/a/serve.plist"), &mut run, &mut |d| waits.push(d)).unwrap();
+        assert_eq!(taken, Ok(()));
+        assert_eq!(*calls.borrow(), ["bootout", "print", "print", "print", "bootstrap", "bootstrap"]);
+        assert_eq!(waits, [LOOK_EVERY, LOOK_EVERY, Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn a_file_launchd_keeps_refusing_is_reported_without_launchctls_advice() {
+        let mut answers = vec![("bootout", false, "Boot-out failed: 3: No such process"), ("print", false, "")];
+        answers.extend(std::iter::repeat_n(("bootstrap", false, REFUSED), TAKE_TRIES as usize));
+        let (mut run, calls) = scripted(answers);
+        let why = restart("gui/501/x", "gui/501", Path::new("/a/x.plist"), &mut run, &mut |_| {}).unwrap().unwrap_err();
+        assert_eq!(why, format!("launchd did not take /a/x.plist after {TAKE_TRIES} tries: Bootstrap failed: 5: Input/output error"));
+        assert_eq!(calls.borrow().iter().filter(|c| *c == "bootstrap").count(), TAKE_TRIES as usize);
+    }
+
+    #[test]
+    fn an_agent_that_never_goes_is_waited_for_only_so_long() {
+        let looks = (GONE_WITHIN.as_millis() / LOOK_EVERY.as_millis()) as usize;
+        let mut answers = vec![("bootout", true, "")];
+        answers.extend(std::iter::repeat_n(("print", true, "state = running"), looks + 1));
+        answers.push(("bootstrap", true, ""));
+        let (mut run, _) = scripted(answers);
+        let mut waited = Duration::ZERO;
+        assert_eq!(restart("t", "d", Path::new("/f"), &mut run, &mut |d| waited += d).unwrap(), Ok(()));
+        assert_eq!(waited, GONE_WITHIN);
+    }
+
+    #[test]
+    fn the_path_keeps_each_folder_once_where_it_first_appears() {
+        assert_eq!(tidy_path("/a/bin:/usr/bin::/h/.local/bin:/usr/bin:/h/.local/bin"), "/a/bin:/usr/bin:/h/.local/bin");
     }
 
     #[test]

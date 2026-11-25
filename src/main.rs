@@ -504,8 +504,15 @@ fn run() -> Result<bool> {
                     if parallel == Some(0) {
                         bail!("--parallel must be at least 1");
                     }
-                    let states = engine::service::install(&engine::service::Options { parallel, in_order, no_merge, no_guard, bind })?;
-                    engine::service::print(&states);
+                    let installed = engine::service::install(&engine::service::Options { parallel, in_order, no_merge, no_guard, bind })?;
+                    engine::service::print(&installed.states);
+                    if !installed.refused.is_empty() {
+                        for why in &installed.refused {
+                            eprintln!("error: {why}");
+                        }
+                        eprintln!("Not every agent is loaded. `factory service install` again stops and starts both.");
+                        return Ok(false);
+                    }
                     println!("Both start at login and are started again when they stop. Label an issue and the scheduler picks it up.");
                 }
                 ServiceCommand::Uninstall => engine::service::uninstall()?.iter().for_each(|line| println!("{line}")),

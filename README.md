@@ -358,9 +358,9 @@ factory service uninstall
 | `dev.factory.schedule` | `factory schedule --watch`, with the flags given to `install` (`--parallel`, `--in-order`, `--no-merge`, `--no-guard`) | `~/.factory/service/schedule.log` |
 | `dev.factory.serve` | `factory serve --bind 127.0.0.1:7878`, or the address given with `--bind` | `~/.factory/service/serve.log` |
 
-- **What goes into an agent's environment** is only the `PATH` of the shell that installed it, and `FACTORY_HOME` when that was set. So install it from a shell that finds `git`, `gh`, `claude`, `codex` and the Xcode tools. No login of that shell is carried over: the agents' calls use this machine's own logins.
+- **What goes into an agent's environment** is only the `PATH` of the shell that installed it, each folder once, and `FACTORY_HOME` when that was set. So install it from a shell that finds `git`, `gh`, `claude`, `codex` and the Xcode tools. No login of that shell is carried over: the agents' calls use this machine's own logins.
 - **It needs a registered project.** `install` refuses when `factory project list` is empty.
-- **To change how it runs,** run `install` again with other flags. It stops what is loaded and starts the new settings.
+- **To change how it runs,** run `install` again with other flags. It stops what is loaded and starts the new settings. It waits up to 10 seconds for launchd to finish removing each old agent, offers the new file up to five times, and tries both agents even when one is refused. When one is still not loaded it says which and exits 1.
 - **The agents run the program where it was when `install` ran.** Building again replaces that file, and an agent picks the new build up the next time it starts.
 - **`uninstall` cuts off issues at work.** They pick up at the step they were on the next time they are run.
 - **Don't also start `factory serve` by hand** on the same address. The second one can't listen.
