@@ -37,7 +37,7 @@ factory status
 | Command | Does | Exit code |
 | --- | --- | --- |
 | `repo init` | Creates a private repo from a template, then sets branches, rulesets, collaborators, labels and Actions permissions. Ends with a preflight. Safe to rerun | 1 when the preflight fails |
-| `repo preflight` | Reads every setting back from GitHub. Changes nothing | 1 when a setting is wrong |
+| `repo preflight` | Reads every setting back from GitHub. Changes nothing. Run it as the repository's owner: some settings are shown only to an admin, so an agent account can't check its own repos | 1 when a setting is wrong, 2 when the account isn't an admin |
 | `plan validate` | Checks plan files and prints the parallel batches. No network | 1 when a plan is invalid |
 | `plan create` | Creates issues, parent links and blocked-by links from valid plans. Safe to rerun | 1 when a plan is invalid |
 | `run` | Takes one issue through acceptance flows, develop, verify and review, opens a pull request, waits for GitHub on the same commit and merges. `--no-merge` leaves the merge to a person, `--no-pr` stops before pushing | 1 when the issue ends blocked |
@@ -451,6 +451,7 @@ providers:
     tiers: { high: opus, standard: sonnet, fast: haiku }
 
 roles:
+  acceptance: [{ use: claude, tier: high }, { use: glm, tier: high }]
   develop: [{ use: chatgpt, tier: standard }, { use: glm, tier: high }]
   review:  [{ use: claude, tier: high }, { use: glm, tier: high }]
   summary: [{ use: glm, tier: fast }, { use: claude, tier: fast }]
@@ -465,6 +466,8 @@ roles:
 | `roles` | For each job, who to try, in order: `research`, `acceptance`, `develop`, `review`, `summary`, `judgment` |
 
 A role with a list uses it, and the vendor in the workflow file is ignored for that role. A role with no list uses the workflow file's vendor, as before. With no file nothing changes.
+
+A role with no list is not pinned to a model. The built-in workflow names a vendor and no model for most steps, so the program's own default answers, and that default is a setting of the machine (for Claude, the `model` in `~/.claude/settings.json`). The Mac Studio's first acceptance flows were written on Fable for that reason. To pin a job, give it a list. `factory providers` names each job that has none.
 
 Who answers a call is the first in the role's list that passes three tests:
 
@@ -566,7 +569,23 @@ Before a run, and before a change to the file is proposed, the engine checks tha
 | `./verify.sh` | The build and every flow in `.maestro/` pass |
 | `./verify.sh --red FLOW...` | Each named flow is valid Maestro, runs, and fails |
 
-The template repo's `verify.sh` does both for an Xcode project and an iOS simulator. It needs Maestro (`brew install mobile-dev-inc/tap/maestro`) and Java 17 or newer.
+The template repo's `verify.sh` does both for an Xcode project and an iOS simulator. It needs Maestro and Java 17 or newer:
+
+```bash
+brew trust --formula mobile-dev-inc/tap/maestro
+```
+
+```bash
+brew install mobile-dev-inc/tap/maestro
+```
+
+Homebrew refuses a formula from a tap it doesn't trust, so the first line comes first. Maestro pulls in `openjdk`, which Homebrew keeps off `PATH`, and `/usr/bin/java` is Apple's stub, which fails without a JDK it knows. Rust from Homebrew's `rustup` is kept off `PATH` the same way. Put them first in `~/.zprofile`:
+
+```bash
+export PATH="/opt/homebrew/opt/openjdk/bin:/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
+```
+
+The service takes its `PATH` from the shell that installs it, so this line is also what lets it find them.
 
 ## Build and test
 
