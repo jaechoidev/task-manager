@@ -11,17 +11,44 @@
 //!   and writes outside the worktree, and it gets no shell beyond a syntax
 //!   check. Listing `Write` as an allowed tool is not enough by itself: that
 //!   allows writes anywhere.
+//! - Antigravity runs with its own `--sandbox`. That does not confine it:
+//!   it wrote into an ordinary folder of the home directory when tried. The
+//!   engine only uses a provider that passed `factory providers check`, and
+//!   Antigravity does not. Its flags are here for that check.
 
 use super::proc::{self, Outcome};
+use super::providers::Cli;
 use super::workflow::{Access, Vendor};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Who answers a call: the program, the model, and the login it uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Runner {
+    pub cli: Cli,
+    /// None leaves the choice to the program's own configuration.
+    pub model: Option<String>,
+    /// A shell file that selects the login, sourced before the program runs.
+    pub env_file: Option<PathBuf>,
+    /// A config folder that selects the login.
+    pub config_dir: Option<PathBuf>,
+}
+
+impl Runner {
+    /// A program with its default login, as a workflow step names it.
+    pub fn of(vendor: Vendor, model: Option<&str>) -> Runner {
+        let cli = match vendor {
+            Vendor::Codex => Cli::Codex,
+            Vendor::Claude => Cli::Claude,
+        };
+        Runner { cli, model: model.map(str::to_string), env_file: None, config_dir: None }
+    }
+}
+
 pub struct Call<'a> {
-    pub vendor: Vendor,
-    pub model: Option<&'a str>,
+    pub runner: &'a Runner,
     pub access: Access,
     /// The worktree the agent runs in.
     pub cwd: &'a Path,
@@ -73,36 +100,117 @@ pub fn call(call: &Call) -> Result<Reply> {
     std::fs::write(&schema_path, call.schema)?;
     let _ = std::fs::remove_file(&output_path);
 
-    let (program, args) = match call.vendor {
-        Vendor::Codex => ("codex", codex_args(call, &schema_path, &output_path)),
-        Vendor::Claude => ("claude", claude_args(call)),
-    };
+    let cli = call.runner.cli;
+    let program = cli.program();
+    let launch = launch(call, &schema_path, &output_path)?;
     let outcome = proc::run(&proc::Spec {
-        program,
-        args,
+        program: &launch.program,
+        args: launch.args,
         cwd: call.cwd,
-        stdin: Some(call.prompt),
+        stdin: launch.stdin.as_deref(),
         stdout: &stdout_path,
         stderr: &stderr_path,
         timeout: call.timeout,
-        env: Vec::new(),
+        env: launch.env,
+        unset: launch.unset,
     })?;
 
     let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
-    let (output, session_id, mut error) = match call.vendor {
-        Vendor::Codex => read_codex(&stdout, &output_path),
-        Vendor::Claude => read_claude(&stdout),
+    let (output, session_id, mut error) = match cli {
+        Cli::Codex => read_codex(&stdout, &output_path),
+        Cli::Claude => read_claude(&stdout),
+        Cli::Agy => {
+            let (output, error) = read_agy(&stdout, &std::fs::read_to_string(&stderr_path).unwrap_or_default());
+            (output, None, error)
+        }
     };
-    if let (Vendor::Claude, Some(value)) = (call.vendor, &output) {
+    if let (Cli::Claude | Cli::Agy, Some(value)) = (cli, &output) {
         std::fs::write(&output_path, serde_json::to_string_pretty(value)?)?;
     }
     if outcome.timed_out {
         error = Some(format!("timed out after {} minutes", call.timeout.as_secs() / 60));
-    } else if !outcome.ok() && error.is_none() {
-        error = Some(format!("{program} exited with {:?}", outcome.exit_code));
+    } else if outcome.exit_code == Some(ENV_FILE_UNREADABLE) && call.runner.env_file.is_some() {
+        error = Some("the env file could not be read".into());
+    } else if !outcome.ok() {
+        // What the program reported says more than its exit code.
+        error = Some(match error {
+            Some(reported) => format!("{program} exited with {:?}: {reported}", outcome.exit_code),
+            None => format!("{program} exited with {:?}", outcome.exit_code),
+        });
     }
 
     Ok(Reply { outcome, output, error, input_path, output_path, stdout_path, stderr_path, session_id })
+}
+
+/// A command line, ready to run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Launch {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    /// Variables the child must not inherit.
+    pub unset: Vec<String>,
+    pub stdin: Option<String>,
+}
+
+/// What the shell wrapper exits with when it can't read the env file.
+const ENV_FILE_UNREADABLE: i32 = 97;
+
+/// Runs a program with what an env file sets. `set -a` exports it. The file
+/// is tested first, because a shell that can't source a file just exits.
+pub(super) const WITH_ENV_FILE: &str = r#"[ -r "$0" ] || exit 97; set -a; . "$0"; set +a; exec "$@""#;
+
+/// The inherited variables that could select a login for this program.
+///
+/// A runner with its own env file or config folder must start without them.
+/// Found the hard way: inside a Claude Code session, `claude` ignores the key
+/// an env file sets and sends the session's own credential, which then goes
+/// to whatever endpoint the env file names.
+pub fn login_variables(cli: Cli, names: impl Iterator<Item = String>) -> Vec<String> {
+    let prefixes: &[&str] = match cli {
+        Cli::Claude => &["ANTHROPIC_", "CLAUDE_", "CLAUDECODE"],
+        Cli::Codex => &["OPENAI_", "CODEX_"],
+        Cli::Agy => &["GEMINI_", "GOOGLE_", "ANTIGRAVITY_"],
+    };
+    let mut found: Vec<String> = names.filter(|name| prefixes.iter().any(|prefix| name.starts_with(prefix))).collect();
+    found.sort();
+    found
+}
+
+/// How a call is started: the program's own flags, and the runner's login.
+pub fn launch(call: &Call, schema: &Path, output: &Path) -> Result<Launch> {
+    let runner = call.runner;
+    let (args, stdin) = match runner.cli {
+        Cli::Codex => (codex_args(call, schema, output), Some(call.prompt.to_string())),
+        Cli::Claude => (claude_args(call), Some(call.prompt.to_string())),
+        Cli::Agy => (agy_args(call), None),
+    };
+    let program = runner.cli.program().to_string();
+    // Its own login means none of ours.
+    let unset = if runner.env_file.is_some() || runner.config_dir.is_some() {
+        login_variables(runner.cli, std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()))
+    } else {
+        Vec::new()
+    };
+    let mut env = Vec::new();
+    if let Some(dir) = &runner.config_dir {
+        let key = match runner.cli {
+            Cli::Claude => "CLAUDE_CONFIG_DIR",
+            Cli::Codex => "CODEX_HOME",
+            Cli::Agy => bail!("config_dir is not supported for agy"),
+        };
+        env.push((key.to_string(), text(dir)));
+    }
+    match &runner.env_file {
+        None => Ok(Launch { program, args, env, unset, stdin }),
+        // The shell reads the file, so the key in it never passes through
+        // the engine.
+        Some(file) => {
+            let mut wrapped = vec!["-c".to_string(), WITH_ENV_FILE.to_string(), text(file), program];
+            wrapped.extend(args);
+            Ok(Launch { program: "sh".into(), args: wrapped, env, unset, stdin })
+        }
+    }
 }
 
 /// Signs that a call failed because a usage or rate limit was reached. Each
@@ -149,8 +257,8 @@ fn codex_args(call: &Call, schema: &Path, output: &Path) -> Vec<String> {
         Some(session) => vec!["exec".into(), "resume".into(), session.into(), "-c".into(), format!("sandbox_mode=\"{sandbox}\"")],
     };
     args.extend(["--output-schema".into(), text(schema), "-o".into(), text(output), "--json".into()]);
-    if let Some(model) = call.model {
-        args.extend(["-m".into(), model.into()]);
+    if let Some(model) = &call.runner.model {
+        args.extend(["-m".into(), model.clone()]);
     }
     args.push("-".into()); // the prompt comes on stdin
     args
@@ -180,12 +288,41 @@ fn claude_args(call: &Call) -> Vec<String> {
     // not part of the task.
     args.extend(["--strict-mcp-config", "--setting-sources", "project,local", "--disable-slash-commands"].map(String::from));
     args.extend(["--permission-mode".into(), mode.into()]);
-    if let Some(model) = call.model {
-        args.extend(["--model".into(), model.into()]);
+    if let Some(model) = &call.runner.model {
+        args.extend(["--model".into(), model.clone()]);
     }
     args.push("--allowedTools".into());
     args.extend(tools.iter().map(|t| t.to_string()));
     args
+}
+
+/// Antigravity takes the prompt as an argument. Its sandbox is the same for
+/// a reader and a writer, and it has no way to continue a session here.
+fn agy_args(call: &Call) -> Vec<String> {
+    let minutes = format!("{}m", (call.timeout.as_secs() / 60).max(1));
+    let mut args: Vec<String> = ["-p", call.prompt, "--output-format", "json", "--json-schema", call.schema, "--sandbox", "--print-timeout", &minutes].iter().map(|s| s.to_string()).collect();
+    if let Some(model) = &call.runner.model {
+        args.extend(["--model".into(), model.clone()]);
+    }
+    args
+}
+
+/// Antigravity prints one JSON result. A tool it was not allowed to use does
+/// not fail the run: it exits 0 with an empty response and says so on stderr.
+fn read_agy(stdout: &str, stderr: &str) -> (Option<Value>, Option<String>) {
+    let Ok(result) = serde_json::from_str::<Value>(stdout.trim()) else {
+        let detail = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no detail");
+        return (None, Some(format!("agy did not print a JSON result: {}", detail.trim())));
+    };
+    if result.get("status").and_then(Value::as_str) != Some("SUCCESS") {
+        let detail = result.get("error").and_then(Value::as_str).unwrap_or("no detail");
+        return (None, Some(format!("agy reported an error: {}", detail.lines().next().unwrap_or(detail))));
+    }
+    match result.get("structured_output") {
+        Some(value) if !value.is_null() => (Some(value.clone()), None),
+        _ if stderr.contains("auto-denied") => (None, Some("agy was refused a tool and returned nothing".into())),
+        _ => (None, Some("agy returned no structured output".into())),
+    }
 }
 
 /// Codex writes its final message to a file and its events to stdout.
@@ -271,9 +408,9 @@ mod tests {
     #[test]
     fn sandbox_flags_follow_access() {
         let dir = std::env::temp_dir();
+        let (codex_runner, claude_runner) = (Runner::of(Vendor::Codex, None), Runner::of(Vendor::Claude, None));
         let call = Call {
-            vendor: Vendor::Codex,
-            model: None,
+            runner: &codex_runner,
             access: Access::WorkspaceWrite,
             cwd: &dir,
             prompt: "p",
@@ -295,14 +432,14 @@ mod tests {
         assert!(codex.ends_with("--json -"), "{codex}");
         assert!(!codex.contains("--cd") && !codex.contains("danger"), "{codex}");
 
-        let review = Call { vendor: Vendor::Claude, access: Access::ReadOnly, resume: None, ..call };
+        let review = Call { runner: &claude_runner, access: Access::ReadOnly, resume: None, ..call };
         let claude = claude_args(&review).join(" ");
         assert!(claude.contains("--permission-mode dontAsk"), "{claude}");
         assert!(!claude.contains("Edit") && !claude.contains("Write ") && !claude.contains("Bash"), "{claude}");
 
         // Every Claude call is confined to its directory, and never gets a
         // shell that could run a script it edited.
-        let writer = Call { vendor: Vendor::Claude, resume: Some("s-9"), ..call };
+        let writer = Call { runner: &claude_runner, resume: Some("s-9"), ..call };
         let claude = claude_args(&writer).join(" ");
         for args in [&claude, &claude_args(&review).join(" ")] {
             assert!(args.contains("blockWritesOutsideWorkingDirectories\":true"), "{args}");
@@ -312,8 +449,80 @@ mod tests {
         assert!(claude.contains("--resume s-9") && claude.contains("--permission-mode acceptEdits"), "{claude}");
         // Web tools are given only when a module asks for them.
         assert!(!claude.contains("WebSearch"), "{claude}");
-        let researcher = Call { vendor: Vendor::Claude, web: true, resume: None, ..call };
+        let researcher = Call { runner: &claude_runner, web: true, resume: None, ..call };
         let claude = claude_args(&researcher).join(" ");
         assert!(claude.contains("WebSearch WebFetch") && claude.contains("blockWritesOutsideWorkingDirectories"), "{claude}");
+    }
+
+    fn call_by<'a>(runner: &'a Runner, dir: &'a Path) -> Call<'a> {
+        Call { runner, access: Access::WorkspaceWrite, cwd: dir, prompt: "do it", schema: "{}", dir, stem: "t", timeout: Duration::from_secs(300), resume: None, web: false }
+    }
+
+    #[test]
+    fn each_program_is_started_confined_with_its_model() {
+        let dir = PathBuf::from("/work");
+        let (schema, out) = (Path::new("s.json"), Path::new("o.json"));
+        let runner = |cli, model: &str| Runner { cli, model: Some(model.into()), env_file: None, config_dir: None };
+
+        let codex = launch(&call_by(&runner(Cli::Codex, "m-1"), &dir), schema, out).unwrap();
+        assert_eq!((codex.program.as_str(), codex.stdin.as_deref()), ("codex", Some("do it")));
+        let line = codex.args.join(" ");
+        assert!(line.contains("--sandbox workspace-write") && line.contains("-m m-1") && !line.contains("danger"), "{line}");
+
+        let other_login = Runner { config_dir: Some("/logins/b".into()), ..runner(Cli::Claude, "m-1") };
+        let claude = launch(&call_by(&other_login, &dir), schema, out).unwrap();
+        let line = claude.args.join(" ");
+        assert!(line.contains("blockWritesOutsideWorkingDirectories") && line.contains("--model m-1"), "{line}");
+        assert_eq!(claude.env, vec![("CLAUDE_CONFIG_DIR".to_string(), "/logins/b".to_string())]);
+
+        let agy = launch(&call_by(&runner(Cli::Agy, "m-1"), &dir), schema, out).unwrap();
+        let line = agy.args.join(" ");
+        assert!(line.starts_with("-p do it") && line.contains("--sandbox") && line.contains("--model m-1") && line.contains("--print-timeout 5m"), "{line}");
+        assert!(!line.contains("skip-permissions") && agy.stdin.is_none());
+        assert!(launch(&call_by(&Runner { config_dir: Some("/x".into()), ..runner(Cli::Agy, "m") }, &dir), schema, out).is_err());
+    }
+
+    #[test]
+    fn an_env_file_is_read_by_the_shell_not_the_engine() {
+        let dir = PathBuf::from("/work");
+        let glm = Runner { cli: Cli::Claude, model: Some("opus".into()), env_file: Some("/keys/env.sh".into()), config_dir: None };
+        let launched = launch(&call_by(&glm, &dir), Path::new("s.json"), Path::new("o.json")).unwrap();
+        assert_eq!(launched.program, "sh");
+        assert_eq!(&launched.args[..4], ["-c", WITH_ENV_FILE, "/keys/env.sh", "claude"]);
+        assert!(launched.args.contains(&"--json-schema".to_string()) && launched.env.is_empty());
+    }
+
+    #[test]
+    fn the_shell_wrapper_exports_what_the_file_sets() {
+        let dir = std::env::temp_dir().join(format!("factory-envfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("env.sh"), "A_KEY=from-file\n").unwrap();
+        let run = |file: &str| std::process::Command::new("sh").args(["-c", WITH_ENV_FILE, file, "sh", "-c", "printf %s \"$A_KEY\""]).output().unwrap();
+        let found = run(&dir.join("env.sh").display().to_string());
+        assert_eq!(String::from_utf8_lossy(&found.stdout), "from-file");
+        assert_eq!(run(&dir.join("missing.sh").display().to_string()).status.code(), Some(ENV_FILE_UNREADABLE));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_runner_with_its_own_login_inherits_no_other() {
+        let names = || ["PATH", "HOME", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "OPENAI_API_KEY", "CODEX_HOME", "GEMINI_API_KEY", "MY_CLAUDE"].iter().map(|s| s.to_string());
+        assert_eq!(login_variables(Cli::Claude, names()), ["ANTHROPIC_BASE_URL", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]);
+        assert_eq!(login_variables(Cli::Codex, names()), ["CODEX_HOME", "OPENAI_API_KEY"]);
+        assert_eq!(login_variables(Cli::Agy, names()), ["GEMINI_API_KEY"]);
+        // The default login keeps the environment as it is.
+        let dir = PathBuf::from("/work");
+        assert!(launch(&call_by(&Runner::of(Vendor::Claude, None), &dir), Path::new("s"), Path::new("o")).unwrap().unset.is_empty());
+    }
+
+    #[test]
+    fn an_agy_run_that_was_refused_a_tool_is_not_a_success() {
+        let ok = r#"{"status":"SUCCESS","response":"{}","structured_output":{"wrote":true}}"#;
+        assert_eq!(read_agy(ok, ""), (Some(serde_json::json!({"wrote": true})), None));
+        let empty = r#"{"status":"SUCCESS","response":""}"#;
+        assert!(read_agy(empty, "jetski: a tool required the \"write_file\" permission, so it was auto-denied").1.unwrap().contains("refused"));
+        assert!(read_agy(empty, "").1.unwrap().contains("no structured output"));
+        assert!(read_agy(r#"{"status":"ERROR","error":"model x is not recognized\nAvailable"}"#, "").1.unwrap().ends_with("model x is not recognized"));
+        assert!(read_agy("", "authentication required").1.unwrap().contains("authentication required"));
     }
 }

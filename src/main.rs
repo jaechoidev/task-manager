@@ -132,6 +132,14 @@ enum Top {
         #[arg(long)]
         prepare: bool,
     },
+    /// List the agent subscriptions this machine has and the order each role
+    /// tries them in, from providers.yaml. Calls no agent and changes nothing
+    Providers {
+        #[arg(long, value_enum, default_value_t = CapacityFormat::Text)]
+        format: CapacityFormat,
+        #[command(subcommand)]
+        command: Option<ProvidersCommand>,
+    },
     /// Serve the local API that the app and other clients use
     Serve {
         /// The address to listen on. Anything but this machine needs --token
@@ -164,6 +172,19 @@ enum Format {
 enum CapacityFormat {
     Text,
     Json,
+}
+
+#[derive(Subcommand)]
+enum ProvidersCommand {
+    /// Try a provider for real: structured output, and whether it stays
+    /// inside its folder. Spends three short calls per tier
+    Check {
+        /// A provider in providers.yaml
+        name: String,
+        /// Only this tier. Every tier when not given
+        #[arg(long)]
+        tier: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -482,7 +503,8 @@ fn run() -> Result<bool> {
             if write {
                 let proposal = engine::capacity::read().proposal;
                 let mut config = engine::config::Config::load(&home)?;
-                config.pools = engine::capacity::pools_of(&proposal);
+                let providers: Vec<String> = engine::providers::Providers::load(&home)?.map(|set| set.providers.keys().cloned().collect()).unwrap_or_default();
+                config.pools = engine::capacity::pools_of(&proposal, &providers);
                 config.save(&home)?;
                 println!("wrote the pools to {}", home.join("config.yaml").display());
             }
@@ -497,6 +519,21 @@ fn run() -> Result<bool> {
                 CapacityFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
             }
             Ok(report.warnings.is_empty())
+        }
+
+        Top::Providers { command: Some(ProvidersCommand::Check { name, tier }), .. } => {
+            let results = engine::qualify::run(&engine::util::home()?, &name, tier.as_deref())?;
+            Ok(results.iter().all(|checked| checked.qualified))
+        }
+
+        Top::Providers { format, command: None } => {
+            quiet_on_closed_pipe();
+            let report = engine::providers::report(&engine::util::home()?)?;
+            match format {
+                CapacityFormat::Text => engine::providers::print(&report),
+                CapacityFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+            }
+            Ok(report.problems.is_empty())
         }
 
         Top::Serve { bind, token, repo_dirs } => {
@@ -546,6 +583,13 @@ fn main() -> ExitCode {
     match run() {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
+        // Parked is not an error: everyone who could do the next call is
+        // out of quota, and the issue continues when it is picked up later.
+        Err(e) if e.is::<engine::Parked>() => {
+            println!("  nothing failed. Run it again after that time, or let `factory queue` do it");
+            println!("PARKED: {e}");
+            ExitCode::from(engine::PARKED_EXIT_CODE)
+        }
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::from(2)

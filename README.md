@@ -25,6 +25,8 @@ factory workflow propose --file <factory.yaml> --repo-dir <checkout>
 factory module list --repo-dir <checkout>
 factory module new <kind>/<name> --repo-dir <checkout>
 factory capacity [--write] [--prepare]
+factory providers
+factory providers check <name> [--tier <tier>]
 factory serve --repo-dir <checkout>
 factory status
 ```
@@ -47,6 +49,7 @@ factory status
 | `module list` | Lists the built-in modules and the repository's own | |
 | `module new` | Opens a pull request that adds a new module's files. `--dry-run` prints them | |
 | `capacity` | Reads what this machine has, checks the tools a run needs, and proposes how much to run at once. Changes nothing unless told: `--write` saves the proposal as this machine's pools, `--prepare` creates the simulators for them | 1 when something needs attention |
+| `providers` | Lists this machine's agent subscriptions, what each one's check found, quota where it can be read, and who fills each role. `providers check <name>` tries one for real | 1 when the file has a problem, or a check failed |
 | `serve` | Serves the local API that the app and other clients use | |
 | `status` | Shows where each issue stands, from the state database. `--refresh` first corrects it from GitHub, for pull requests a person merged or closed by hand | |
 
@@ -158,6 +161,9 @@ If the default branch moves during a run, the engine merges it into the issue's 
 | --- | --- | --- | --- |
 | Codex | Its OS sandbox blocks writes outside the worktree | Anywhere on the machine | Inside the sandbox, no network |
 | Claude | Its file tools refuse paths outside the worktree | Its file tools refuse paths outside the worktree | A writer may run `maestro check-syntax`. A reader gets none |
+| Antigravity | **Not confined.** Under its `--sandbox` it wrote into a new folder in the home directory | Anywhere on the machine | Inside its sandbox |
+
+Antigravity is not used: it fails `factory providers check`, and the engine only uses a provider that passed. GLM runs through the Claude program and is confined like Claude.
 
 One module may reach the web: research, which sets `web: true`. On Claude that adds the web search and fetch tools. Its prompt says that text from the web is information, never an instruction, and what it writes is one notes file inside the worktree. Codex has no network in its sandbox, so a Codex researcher works from the code alone.
 
@@ -199,7 +205,7 @@ limits:
 | Action | What the engine does |
 | --- | --- |
 | `retry` | Throws the attempt away and starts the issue over from nothing, with the same agents |
-| `switch-vendor` | Starts over with the vendors swapped, so a different model develops and the other one reviews |
+| `switch-vendor` | Starts over with the vendors swapped, so a different model develops and the other one reviews. On a machine that lists who may develop, the family that failed is ruled out instead |
 | `split` | Writes the proposed smaller issues as a plan file and opens a pull request for it into `main`. Nothing is created until a person merges that pull request |
 | `research` | Starts over with a research step first, on the question the judgment asked. Needs a research step in the workflow |
 | `escalate` | Labels the issue `blocked` and leaves it for a person |
@@ -325,7 +331,7 @@ pools:
 | Pool | Who takes a slot | With no entry |
 | --- | --- | --- |
 | A name a module lists in `locks`, such as `simulator` | A check step, for as long as its command runs | 1 slot |
-| A vendor name, `codex` or `claude` | An agent call, for that call only. A call waiting out a usage limit gives its slot back | No cap |
+| A provider's name: `codex` or `claude`, or the names in `providers.yaml` when this machine has one | An agent call, for that call only | No cap |
 
 With no config file the engine behaves as before: one simulator step at a time and no cap on agent calls.
 
@@ -334,7 +340,7 @@ factory capacity --write      # save the proposal as this machine's pools
 factory capacity --prepare    # create the simulators the simulator pool needs
 ```
 
-- **`--write`** replaces `pools` with the proposal and keeps the file's other settings. Edit the file by hand to choose other numbers.
+- **`--write`** replaces `pools` with the proposal and keeps the file's other settings. Agent calls get one entry per provider this machine lists, or `codex` and `claude` when it lists none. Edit the file by hand to choose other numbers.
 - **`--prepare`** creates `factory-sim-1` to `factory-sim-N` on the newest iOS, boots each once, waits for the machine to calm down and shuts it down. A simulator's first boot keeps the machine busy for minutes, and that should not happen in the middle of a run.
 
 A check is told its slot in the environment, as `FACTORY_SLOT_<POOL>`, for example `FACTORY_SLOT_SIMULATOR=2`. What the slot means is the project's business. The template's `verify.sh` uses the simulator named `factory-sim-<slot>`. Slot 1 falls back to the `SIMULATOR` it names when that simulator does not exist. Any other slot fails with a message to run `--prepare`, because two verifies on one simulator would break each other.
@@ -352,11 +358,76 @@ Before each step the engine writes what the run knows to `progress.json` in the 
 
 The queue needs nothing special for this: the issue is still open and labelled, so it is picked, and its run resumes.
 
+### Providers
+
+A workflow file names a vendor per step, `codex` or `claude`, and by default that is who answers. A machine can know more than that: which subscriptions it has, which models each offers, and who to try for each job, in what order. That lives in `~/.factory/providers.yaml`. It holds no secret.
+
+```yaml
+providers:
+  chatgpt:
+    cli: codex
+    family: openai
+    tiers:
+      high: gpt-6.2-astra
+      standard: gpt-6.2-sol
+  claude:
+    cli: claude
+    family: anthropic
+    tiers: { high: opus, standard: sonnet, fast: haiku }
+  glm:
+    cli: claude                 # GLM runs through the Claude program
+    family: zhipu
+    env_file: ~/.zai/env.sh     # sets the endpoint and key. Yours, read by the shell
+    quota: zai                  # its remaining quota can be read
+    tiers: { high: opus, standard: sonnet, fast: haiku }
+
+roles:
+  develop: [{ use: chatgpt, tier: standard }, { use: glm, tier: high }]
+  review:  [{ use: claude, tier: high }, { use: glm, tier: high }]
+  summary: [{ use: glm, tier: fast }, { use: claude, tier: fast }]
+```
+
+| Part | Meaning |
+| --- | --- |
+| `cli` | The program that runs it: `codex`, `claude` or `agy`. The engine knows each one's flags |
+| `family` | Who made the model. A tier may name its own, as one subscription can serve several |
+| `env_file` or `config_dir` | How this login is selected. Without either, the program's own login |
+| `tiers` | Your names for its models. Model names go stale, so they live here and nowhere in the engine |
+| `roles` | For each job, who to try, in order: `research`, `acceptance`, `develop`, `review`, `summary`, `judgment` |
+
+A role with a list uses it, and the vendor in the workflow file is ignored for that role. A role with no list uses the workflow file's vendor, as before. With no file nothing changes.
+
+Who answers a call is the first in the role's list that passes three tests:
+
+1. **It passed its check.** `factory providers check <name>` makes three short real calls per tier, in `~/.factory/checks/`. One must return structured output and write a file in its own folder. Two are asked to write outside it: next to the folder, and in a new folder in the home directory, which is removed afterwards. The verdict comes from what is on disk, never from what the agent says. A result belongs to the model the tier named, so changing a tier's model means checking again.
+2. **It is independent.** The reviewer and the acceptance writer never come from the developer's family. This is decided per issue, as the run goes, because who develops depends on who had quota. The developer gets its first choice and the others work around it.
+3. **It is in quota.** See [Usage limits](#usage-limits).
+
+When nobody passes, the issue stops and says why for each one. A list like `review: [glm]` is valid, but an issue GLM developed then has no reviewer.
+
+- **A login of its own starts clean.** A provider with an `env_file` or `config_dir` is started without the inherited variables that could select another login (`ANTHROPIC_*`, `CLAUDE_*`, `OPENAI_*`, `CODEX_*`). The shell sources the env file, so the key in it never passes through the engine.
+- **A session belongs to who made it.** A fix round continues the developer's session only when the same provider and model answer again.
+- **`switch-vendor`** from a judgment, on a machine that lists who may develop, rules out the family that failed for the next attempt.
+- **`factory providers`** lists all of this: where each program is, how each login is selected, what each tier's check found, what Z.ai reports, and who is set aside. It exits 1 when the file has a problem. A run refuses to start on a file with a problem.
+
+What was found when the four subscriptions on the build machine were checked is in [docs/findings/2026-11-24-providers.md](docs/findings/2026-11-24-providers.md). In short: Claude, GLM and ChatGPT pass. Antigravity fails, because its sandbox let it write into the home directory.
+
 ### Usage limits
 
-A call that fails with signs of a usage or rate limit is not a failed attempt. The engine marks the issue as waiting, sleeps, and makes the same call again: after 1, 5, 15 and 30 minutes, then hourly, for about six hours in all. After that the run stops.
+A call that fails with signs of a usage or rate limit is not a failed attempt. The provider and model are set aside, in `~/.factory/availability.json`, which every run on the machine reads. So the next issue does not try them either.
 
-Neither CLI documents a stable format for this, so the engine looks for the phrases both use ("usage limit", "rate limit", "429", "too many requests") in the error and in error lines of the output. It does not read a reset time.
+| Then | What happens |
+| --- | --- |
+| Someone else in the role's list may answer | They do, at once |
+| Nobody may, and the first comes back within 90 seconds | The call waits in place |
+| Nobody may, and it takes longer | The issue is parked |
+
+- **Set aside for how long.** 1 minute after the first limit, then 5, 15, 30 and 60 minutes for each further one in a row. A good reply ends the row. The engine does not read a reset time from an error message.
+- **Z.ai is read directly.** For a provider with `quota: zai` the engine asks Z.ai how much of the 5-hour and weekly windows is used, at most once a minute. A full window sets every model of that provider aside until the reset time Z.ai names. The address is not in Z.ai's documentation, so a reading that fails changes nothing.
+- **A parked issue** has status `waiting` and a wake time. Nothing failed, nobody is asked to look, and it holds no simulator or agent slot. `factory run` exits with code 75 and says until when. Run again before then, it parks again without spending a call.
+- **`factory queue` handles parking by itself.** It goes on with other issues, starts the parked one again at its wake time, at the step it stopped at, and when only parked issues are left it waits for the first wake time.
+
+Neither CLI documents a stable format for a limit, so the engine looks for the phrases both use ("usage limit", "rate limit", "429", "too many requests") in the error and in error lines of the output.
 
 ## Modules
 
@@ -440,6 +511,9 @@ cargo install --path .
 | `src/engine/lock.rs` | Locks that hold across processes |
 | `src/engine/capacity.rs` | What the machine has, and how much to run at once |
 | `src/engine/config.rs` | This machine's settings: pools, the handoff folder |
+| `src/engine/providers.rs` | This machine's subscriptions, and who may fill which role |
+| `src/engine/qualify.rs` | The check a provider must pass before the engine uses it |
+| `src/engine/ledger.rs` | Who is out of quota, and until when |
 | `src/engine/github.rs` | Checks, the review verdict and the merge, each tied to one commit |
 | `tests/fix_loop.rs` | The real engine run against stand-ins for `gh`, `codex` and `claude` |
 | `src/engine/flows.rs` | What the engine checks in a flow file without running it |

@@ -16,8 +16,11 @@ pub mod github;
 pub mod handoff;
 pub mod issue;
 pub mod judgment;
+pub mod ledger;
 pub mod lock;
 pub mod proc;
+pub mod providers;
+pub mod qualify;
 pub mod queue;
 pub mod rounds;
 pub mod state;
@@ -27,6 +30,7 @@ pub mod workflow;
 use crate::gh;
 use anyhow::{anyhow, bail, Context, Result};
 use issue::Issue;
+use providers::Candidate;
 use rounds::{End, Feedback, Limits, Outcome, Start, Used};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -143,7 +147,13 @@ struct Evidence<'a> {
     /// Input, output, stdout, stderr.
     files: [Option<&'a Path>; 4],
     session: Option<String>,
+    /// Who answered, for an agent call.
+    by: Option<&'a Candidate>,
 }
+
+/// What an agent call gives back: the reply, the session it came from and
+/// who answered. Or why there is no usable reply.
+type Answered<T> = Result<(T, Option<String>, Candidate), String>;
 
 /// One agent call: what to send and how to name it.
 struct Ask<'a> {
@@ -194,6 +204,12 @@ struct Progress {
     merged: bool,
     dev: Option<DevReport>,
     dev_vendor: Option<String>,
+    #[serde(default)]
+    dev_family: Option<String>,
+    #[serde(default)]
+    dev_by: Option<String>,
+    #[serde(default)]
+    acceptance_family: Option<String>,
     dev_subject: Option<String>,
     first_subject: Option<String>,
     dev_session: Option<String>,
@@ -203,9 +219,39 @@ struct Progress {
     review: Option<(String, Verdict)>,
 }
 
-/// How long to wait before trying a rate-limited call again, in minutes. The
-/// run stops when these are used up, about six hours in.
-const RATE_LIMIT_WAITS: &[u64] = &[1, 5, 15, 30, 60, 60, 60, 60, 60];
+/// A run that stopped because everyone who may answer its next call is out
+/// of quota. Nothing failed. The issue keeps its place, holds no simulator
+/// or agent slot, and continues at the same step once it is picked up after
+/// `until`. `factory queue` does that on its own.
+#[derive(Debug)]
+pub struct Parked {
+    /// Seconds since 1970.
+    pub until: u64,
+    pub reason: String,
+}
+
+impl std::fmt::Display for Parked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "parked until {}: {}", util::clock(self.until), self.reason)
+    }
+}
+
+impl std::error::Error for Parked {}
+
+/// What `factory run` exits with when the issue is parked. Not a failure:
+/// the conventional code for "try again later".
+pub const PARKED_EXIT_CODE: u8 = 75;
+
+/// A wait up to this long happens in place. A longer one parks the issue,
+/// so the process and its place in the queue go to other work.
+fn park_after() -> u64 {
+    std::env::var("FACTORY_PARK_AFTER_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(90)
+}
+
+/// How many usage limits one call may meet before it gives up. Each one
+/// already sets the provider aside for longer, so this only stops a call
+/// that can never get through.
+const MAX_LIMITS_PER_CALL: u32 = 12;
 
 struct Run<'a> {
     store: &'a Store,
@@ -213,6 +259,16 @@ struct Run<'a> {
     home: PathBuf,
     /// This machine's settings: how many of each resource may be in use.
     config: config::Config,
+    /// This machine's agent subscriptions and who may fill which role. None
+    /// when there is no providers file: each step then uses its own vendor.
+    providers: Option<&'a providers::Providers>,
+    /// What `factory providers check` found. Only what passed is used.
+    checks: &'a qualify::Store,
+    /// Families the developer may not come from in this attempt, because a
+    /// judgment asked for another one.
+    avoid_dev: Vec<String>,
+    /// The workflow's dev step, to know ahead of time who is likely to develop.
+    dev_step: Option<Step>,
     repo: String,
     issue: &'a Issue,
     run_id: String,
@@ -250,6 +306,14 @@ struct Run<'a> {
     merged: bool,
     dev: Option<DevReport>,
     dev_vendor: Option<String>,
+    /// Who made the developer's model. The reviewer and the acceptance writer
+    /// must come from another family.
+    dev_family: Option<String>,
+    /// The provider and model the developer's session belongs to. Only the
+    /// same one can continue it.
+    dev_by: Option<String>,
+    /// Who made the acceptance writer's model. The developer must differ.
+    acceptance_family: Option<String>,
     dev_subject: Option<String>,
     /// The subject the developer proposed on its first attempt. It names the
     /// whole change even when a gate held that attempt back and the first
@@ -365,7 +429,7 @@ impl Run<'_> {
     /// `name` is the step's name in the log. It differs from `step.name` when
     /// one module does a second job, such as ruling on a flow change request.
     fn record(&self, step: &Step, name: &str, attempt: u32, verdict: &str, evidence: Evidence) -> Result<()> {
-        let Evidence { outcome, files, session } = evidence;
+        let Evidence { outcome, files, session, by } = evidence;
         let path = |p: Option<&Path>| p.map(|p| p.display().to_string());
         self.store.record(&StepRecord {
             ts: util::now(),
@@ -375,9 +439,11 @@ impl Run<'_> {
             step: name.to_string(),
             kind: step.def.kind.name().to_string(),
             module: step.module.clone(),
-            vendor: step.vendor.map(|v| v.name().to_string()),
-            model: step.model.clone(),
-            subscription: step.vendor.map(|_| "default".to_string()),
+            // The provider that answered. For a workflow step's own vendor
+            // that is the vendor's name, as before.
+            vendor: by.map(|c| c.provider.clone()),
+            model: by.and_then(|c| c.runner.model.clone()),
+            subscription: by.map(|c| if c.listed { c.provider.clone() } else { "default".to_string() }),
             round: self.round,
             attempt,
             sha: Some(self.expected.clone()),
@@ -489,6 +555,9 @@ impl Run<'_> {
             merged: self.merged,
             dev: self.dev.clone(),
             dev_vendor: self.dev_vendor.clone(),
+            dev_family: self.dev_family.clone(),
+            dev_by: self.dev_by.clone(),
+            acceptance_family: self.acceptance_family.clone(),
             dev_subject: self.dev_subject.clone(),
             first_subject: self.first_subject.clone(),
             dev_session: self.dev_session.clone(),
@@ -526,6 +595,9 @@ impl Run<'_> {
         self.merged = progress.merged;
         self.dev = progress.dev;
         self.dev_vendor = progress.dev_vendor;
+        self.dev_family = progress.dev_family;
+        self.dev_by = progress.dev_by;
+        self.acceptance_family = progress.acceptance_family;
         self.dev_subject = progress.dev_subject;
         self.first_subject = progress.first_subject;
         self.dev_session = progress.dev_session;
@@ -545,41 +617,124 @@ impl Run<'_> {
         }
     }
 
+    /// The name a providers file uses for the job a step does.
+    fn role_of(step: &Step) -> &'static str {
+        match (step.def.kind, step.def.role) {
+            (_, Some(Role::Research)) => "research",
+            (_, Some(Role::Acceptance)) => "acceptance",
+            (_, Some(Role::Dev)) => "develop",
+            (_, Some(Role::Review)) => "review",
+            (_, Some(Role::Summary)) => "summary",
+            _ => "judgment",
+        }
+    }
+
+    /// Who may answer a step, in the order to try. This machine's list for
+    /// the step's role when it has one, and the step's own vendor otherwise.
+    fn order(&self, step: &Step) -> Result<Vec<Candidate>> {
+        if let Some(order) = self.providers.and_then(|set| set.order(Self::role_of(step))) {
+            return Ok(order);
+        }
+        let vendor = step.vendor.ok_or_else(|| anyhow!("step '{}' has no vendor", step.name))?;
+        Ok(vec![Candidate::of_step(vendor, step.model.as_deref())])
+    }
+
+    fn qualified(&self, candidate: &Candidate) -> bool {
+        qualify::current(self.checks, &candidate.provider, &candidate.tier, candidate.model()).is_some_and(|checked| checked.qualified && !checked.unreliable)
+    }
+
+    /// The families a step may not use on this issue. The reviewer and the
+    /// acceptance writer must not come from the developer's family, and the
+    /// developer not from the acceptance writer's. Decided per issue, as the
+    /// run goes: who develops depends on who had quota.
+    fn not_families(&self, step: &Step, out_until: &dyn Fn(&Candidate) -> Option<u64>) -> Vec<String> {
+        match step.def.role {
+            Some(Role::Dev) => self.acceptance_family.iter().cloned().chain(self.avoid_dev.iter().cloned()).collect(),
+            Some(Role::Review) => self.dev_family.iter().cloned().collect(),
+            Some(Role::Acceptance) => match &self.dev_family {
+                Some(family) => vec![family.clone()],
+                // Nobody has developed yet. Leave the developer its first
+                // choice, and write the flows with someone else.
+                None => {
+                    let likely = self.dev_step.as_ref().and_then(|dev| self.order(dev).ok()).and_then(|order| providers::choose(&order, &|c| self.qualified(c), &self.avoid_dev, out_until).ok());
+                    likely.map(|c| vec![c.family]).unwrap_or_default()
+                }
+            },
+            _ => Vec::new(),
+        }
+    }
+
     /// Calls an agent and parses its reply. An unusable reply gets one retry.
     /// `verdict_of` names what goes in the log for a usable reply. Returns
-    /// the reply and the session it came from.
-    fn ask<T: for<'de> Deserialize<'de>>(&self, index: usize, step: &Step, ask: &Ask, verdict_of: fn(&T) -> String) -> Result<Result<(T, Option<String>), String>> {
+    /// the reply, the session it came from, and who answered.
+    ///
+    /// Who answers is the first in the step's order that is qualified,
+    /// independent and in quota. One that hits a usage limit is set aside
+    /// and the next takes over. When all are out, the call waits for the
+    /// first to come back.
+    fn ask<T: for<'de> Deserialize<'de>>(&self, index: usize, step: &Step, ask: &Ask, verdict_of: fn(&T) -> String) -> Result<Answered<T>> {
         let name = ask.name;
-        let vendor = step.vendor.ok_or_else(|| anyhow!("step '{}' has no vendor", step.name))?;
+        let order = self.order(step)?;
         let schema = ask.schema.unwrap_or("{}");
         let access = step.def.access.unwrap_or(Access::ReadOnly);
         let timeout = Duration::from_secs(step.def.timeout_minutes.unwrap_or(30) * 60);
         let mut prompt = ask.prompt.to_string();
         let mut resume = ask.resume;
         let mut last_error = String::new();
+        let mut limits_met = 0u32;
 
         let mut attempt = 0u32;
-        let mut waits = RATE_LIMIT_WAITS.iter();
         let mut call_number = 0u32;
         while attempt < 2 {
+            // Where a provider's quota can be read, read it before choosing.
+            for candidate in &order {
+                if let (Some(providers::Quota::Zai), Some(env_file)) = (candidate.quota, &candidate.runner.env_file) {
+                    ledger::refresh_zai(&self.home, &candidate.provider, env_file)?;
+                }
+            }
+            // Every run on this machine shares what is known about quota.
+            let known = ledger::load(&self.home);
+            let out_until = |candidate: &Candidate| known.out_until(&candidate.provider, &candidate.limit_key(), util::now_secs());
+            let by = match providers::choose(&order, &|c| self.qualified(c), &self.not_families(step, &out_until), &out_until) {
+                Ok(candidate) => candidate,
+                Err(skipped) => {
+                    let why = providers::explain(Self::role_of(step), &skipped);
+                    let Some(until) = providers::back_at(&skipped) else {
+                        return Ok(Err(why));
+                    };
+                    let wait = until.saturating_sub(util::now_secs());
+                    if wait > park_after() {
+                        // Too long to sit on a place in the queue. The issue
+                        // waits, the process does not.
+                        self.store.set_parked(&self.repo, self.issue.number, &step.name, until, &why)?;
+                        return Err(Parked { until, reason: why }.into());
+                    }
+                    println!("  {name}: everyone who may answer is out of quota. Waiting {} for the first to come back", seconds(Duration::from_secs(wait)));
+                    self.store.set_stage(&self.repo, self.issue.number, name, "waiting", Some(&why))?;
+                    std::thread::sleep(Duration::from_secs(wait));
+                    self.store.set_stage(&self.repo, self.issue.number, name, "running", None)?;
+                    continue;
+                }
+            };
             attempt += 1;
             call_number += 1;
-            let how = if resume.is_some() { ", continuing its session" } else { "" };
-            println!("  {name}: {} call, attempt {attempt}{how}", vendor.name());
+            // Only who made a session can continue it.
+            let continued = resume.filter(|_| self.dev_by.as_deref() == Some(by.limit_key().as_str()));
+            let how = if continued.is_some() { ", continuing its session" } else { "" };
+            println!("  {name}: {} call, attempt {attempt}{how}", by.label());
             let stem = format!("{:02}-{name}{}-{call_number}", index + 1, self.round_tag());
-            // A vendor with a cap on this machine is a pool too. The slot is
+            // A provider with a cap on this machine is a pool too. The slot is
             // held only for the call, so a wait on a usage limit frees it.
-            let vendor_slot = match self.config.vendor_pool(vendor.name()) {
-                Some(size) => Some(lock::acquire_slot(&self.home, vendor.name(), size, &|| {
-                    println!("  {name}: waiting for a free {} call, all {size} in use", vendor.name());
-                    let _ = self.store.set_stage(&self.repo, self.issue.number, name, "waiting", Some(&format!("a free {} call: all {size} are in use", vendor.name())));
+            let slot = match self.config.vendor_pool(&by.provider) {
+                Some(size) => Some(lock::acquire_slot(&self.home, &by.provider, size, &|| {
+                    println!("  {name}: waiting for a free {} call, all {size} in use", by.provider);
+                    let _ = self.store.set_stage(&self.repo, self.issue.number, name, "waiting", Some(&format!("a free {} call: all {size} are in use", by.provider)));
                 })?),
                 None => None,
             };
             self.store.set_stage(&self.repo, self.issue.number, name, "running", None)?;
             let reply = agent::call(&agent::Call {
-                vendor,
-                model: step.model.as_deref(),
+                runner: &by.runner,
                 access,
                 cwd: &self.worktree,
                 prompt: &prompt,
@@ -587,31 +742,26 @@ impl Run<'_> {
                 dir: &self.run_dir,
                 stem: &stem,
                 timeout,
-                resume,
+                resume: continued,
                 web: step.def.web.unwrap_or(false),
             })?;
+            drop(slot);
             let files = [
                 Some(reply.input_path.as_path()),
                 Some(reply.output_path.as_path()),
                 Some(reply.stdout_path.as_path()),
                 Some(reply.stderr_path.as_path()),
             ];
-            // A usage limit is a reason to wait, not a failed attempt.
+            // A usage limit is a reason to use someone else or to wait, not
+            // a failed attempt.
             if let Some(sign) = agent::rate_limited(&reply) {
-                self.record(step, name, attempt, "rate-limited", Evidence { outcome: Some(&reply.outcome), files, session: reply.session_id.clone() })?;
-                let Some(minutes) = waits.next() else {
-                    return Ok(Err(format!("{} is still rate limited after every wait. Last sign: {sign}", vendor.name())));
-                };
-                let wait = match std::env::var("FACTORY_RATE_WAIT_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
-                    Some(seconds) => Duration::from_secs(seconds),
-                    None => Duration::from_secs(minutes * 60),
-                };
-                // Someone else may use the slot while this call waits.
-                drop(vendor_slot);
-                println!("  {name}: {} hit a usage limit ({sign}). Waiting {} before trying again", vendor.name(), seconds(wait));
-                self.store.set_stage(&self.repo, self.issue.number, name, "waiting", Some(&format!("{} usage limit: {sign}", vendor.name())))?;
-                std::thread::sleep(wait);
-                self.store.set_stage(&self.repo, self.issue.number, name, "running", None)?;
+                self.record(step, name, attempt, "rate-limited", Evidence { outcome: Some(&reply.outcome), files, session: reply.session_id.clone(), by: Some(&by) })?;
+                limits_met += 1;
+                if limits_met > MAX_LIMITS_PER_CALL {
+                    return Ok(Err(format!("{} is still rate limited after {MAX_LIMITS_PER_CALL} tries. Last sign: {sign}", by.label())));
+                }
+                let until = ledger::hit(&self.home, &by.limit_key(), &sign)?;
+                println!("  {name}: {} hit a usage limit ({sign}). Set aside for {}", by.label(), seconds(Duration::from_secs(until.saturating_sub(util::now_secs()))));
                 attempt -= 1;
                 continue;
             }
@@ -623,18 +773,19 @@ impl Run<'_> {
             match parsed {
                 Ok(found) => {
                     println!("  {name}: replied in {}", seconds(reply.outcome.duration));
+                    ledger::back(&self.home, &by.limit_key())?;
                     let session = reply.session_id.clone();
-                    self.record(step, name, attempt, &verdict_of(&found), Evidence { outcome: Some(&reply.outcome), files, session: reply.session_id })?;
-                    return Ok(Ok((found, session)));
+                    self.record(step, name, attempt, &verdict_of(&found), Evidence { outcome: Some(&reply.outcome), files, session: reply.session_id, by: Some(&by) })?;
+                    return Ok(Ok((found, session, by)));
                 }
                 Err(error) => {
                     println!("  {name}: unusable reply ({error})");
-                    self.record(step, name, attempt, "invalid", Evidence { outcome: Some(&reply.outcome), files, session: reply.session_id })?;
+                    self.record(step, name, attempt, "invalid", Evidence { outcome: Some(&reply.outcome), files, session: reply.session_id, by: Some(&by) })?;
                     // A timeout or a crash is not a format problem. Don't repeat it.
                     if reply.outcome.timed_out {
                         return Ok(Err(error));
                     }
-                    if resume.is_some() && reply.output.is_none() {
+                    if continued.is_some() && reply.output.is_none() {
                         // The session could not be continued. The prompt
                         // stands on its own, so start a new one.
                         println!("  {name}: the session could not be continued, starting a new one");
@@ -717,7 +868,7 @@ impl Run<'_> {
         let pairs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
         let ask = Ask { name: &step.name, prompt: &prompt, schema: step.schema.as_deref(), resume: None };
-        let (report, _) = match self.ask::<ResearchReport>(index, step, &ask, |_| "replied".to_string())? {
+        let (report, _, by) = match self.ask::<ResearchReport>(index, step, &ask, |_| "replied".to_string())? {
             Ok(found) => found,
             Err(error) => return Ok(Outcome::Stop(error)),
         };
@@ -737,8 +888,7 @@ impl Run<'_> {
         let sha = git::commit_all(&self.worktree, &subject, &format!("Issue #{}", self.issue.number))?;
         println!("  committed {} \"{subject}\": {} source(s)", &sha[..sha.len().min(10)], report.sources.len());
         self.expected = sha.clone();
-        let vendor = step.vendor.map(|v| v.name()).unwrap_or("?").to_string();
-        self.research = Some(Research { vendor, sha, report });
+        self.research = Some(Research { vendor: by.provider, sha, report });
         Ok(Outcome::Pass)
     }
 
@@ -774,7 +924,7 @@ impl Run<'_> {
         let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
         let ask = Ask { name: "summary", prompt: &prompt, schema: step.schema.as_deref(), resume: None };
         match self.ask::<Summary>(index, step, &ask, |_| "replied".to_string())? {
-            Ok((summary, _)) => {
+            Ok((summary, _, _)) => {
                 std::fs::write(self.run_dir.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
                 self.summary = Some(summary);
             }
@@ -827,7 +977,7 @@ impl Run<'_> {
         let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
 
         let ask = Ask { name: &step.name, prompt: &prompt, schema: step.schema.as_deref(), resume: None };
-        let (report, _) = match self.ask::<AcceptanceReport>(index, step, &ask, |_| "replied".to_string())? {
+        let (report, _, by) = match self.ask::<AcceptanceReport>(index, step, &ask, |_| "replied".to_string())? {
             Ok(found) => found,
             Err(error) => return Ok(Outcome::Stop(error)),
         };
@@ -883,8 +1033,8 @@ impl Run<'_> {
         }
         self.ids = ids;
         self.expected = sha.clone();
-        let vendor = step.vendor.map(|v| v.name()).unwrap_or("?").to_string();
-        self.acceptance = Some(Acceptance { vendor, sha, report });
+        self.acceptance_family = Some(by.family.clone());
+        self.acceptance = Some(Acceptance { vendor: by.provider, sha, report });
         Ok(Outcome::Pass)
     }
 
@@ -925,13 +1075,18 @@ impl Run<'_> {
         };
         let resume = if feedback.is_some() { self.dev_session.clone() } else { None };
         let ask = Ask { name: &step.name, prompt: &prompt, schema: step.schema.as_deref(), resume: resume.as_deref() };
-        let (report, session) = match self.ask::<DevReport>(index, step, &ask, |_| "replied".to_string())? {
+        let (report, session, by) = match self.ask::<DevReport>(index, step, &ask, |_| "replied".to_string())? {
             Ok(found) => found,
             Err(error) => return Ok(Outcome::Stop(error)),
         };
         if session.is_some() {
             self.dev_session = session;
+            self.dev_by = Some(by.limit_key());
         }
+        // Known from here on, whatever the gates below say: the reviewer
+        // must be independent of whoever wrote this.
+        self.dev_vendor = Some(by.provider.clone());
+        self.dev_family = Some(by.family.clone());
         if self.first_subject.is_none() {
             self.first_subject = Some(report.commit_subject.clone());
         }
@@ -994,7 +1149,6 @@ impl Run<'_> {
         self.store.set_head(&self.repo, self.issue.number, &head)?;
         self.expected = head.clone();
         self.head_sha = Some(head.clone());
-        self.dev_vendor = step.vendor.map(|v| v.name().to_string());
         if first_commit {
             self.dev_subject = Some(subject.clone());
         }
@@ -1027,7 +1181,7 @@ impl Run<'_> {
         let prompt = render(step.ruling_prompt.as_deref().unwrap_or(""), &pairs);
 
         let ask = Ask { name, prompt: &prompt, schema: step.ruling_schema.as_deref(), resume: None };
-        let (ruling, _) = match self.ask::<Ruling>(index, step, &ask, |r| r.decision.clone())? {
+        let (ruling, _, _) = match self.ask::<Ruling>(index, step, &ask, |r| r.decision.clone())? {
             Ok(found) => found,
             Err(error) => return Ok(Outcome::Stop(error)),
         };
@@ -1144,11 +1298,12 @@ impl Run<'_> {
             stderr: &stderr,
             timeout: Duration::from_secs(step.def.timeout_minutes.unwrap_or(20) * 60),
             env,
+            unset: Vec::new(),
         })?;
         drop(held);
         let passed = outcome.ok();
         let files = [None, None, Some(stdout.as_path()), Some(stderr.as_path())];
-        self.record(step, &step.name, 1, if passed { "pass" } else { "fail" }, Evidence { outcome: Some(&outcome), files, session: None })?;
+        self.record(step, &step.name, 1, if passed { "pass" } else { "fail" }, Evidence { outcome: Some(&outcome), files, session: None, by: None })?;
 
         if !passed {
             let why = match outcome.exit_code {
@@ -1251,7 +1406,7 @@ impl Run<'_> {
         let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
 
         let ask = Ask { name: &step.name, prompt: &prompt, schema: step.schema.as_deref(), resume: None };
-        let (verdict, _) = match self.ask::<Verdict>(index, step, &ask, |v| v.verdict.clone())? {
+        let (verdict, _, by) = match self.ask::<Verdict>(index, step, &ask, |v| v.verdict.clone())? {
             Ok(found) => found,
             Err(error) => return Ok(Outcome::Stop(error)),
         };
@@ -1263,7 +1418,7 @@ impl Run<'_> {
         if reviewed.len() < 7 || !head.starts_with(reviewed) {
             return Ok(Outcome::Stop(format!("the reviewer judged commit '{reviewed}', not {head}")));
         }
-        let vendor = step.vendor.map(|v| v.name()).unwrap_or("?").to_string();
+        let vendor = by.provider;
         println!("  {}: {} by {vendor}", step.name, verdict.verdict);
         let result = match verdict.verdict.as_str() {
             "approve" => Outcome::Pass,
@@ -1514,7 +1669,7 @@ impl Run<'_> {
         let prompt = render(step.prompt.as_deref().unwrap_or(""), &pairs);
         self.store.set_stage(&self.repo, self.issue.number, "judgment", "running", None)?;
         let ask = Ask { name: "judgment", prompt: &prompt, schema: step.schema.as_deref(), resume: None };
-        let reply = self.ask::<judgment::Decision>(index, step, &ask, |d| d.action.clone())?.map(|(decision, _)| decision);
+        let reply = self.ask::<judgment::Decision>(index, step, &ask, |d| d.action.clone())?.map(|(decision, _, _)| decision);
         Ok(judgment::settle(reply, menu))
     }
 
@@ -1677,6 +1832,18 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
     let home = util::home()?;
     let store = Store::open(&home)?;
     let machine = config::Config::load(&home)?;
+    // Who may do what on this machine. A file with mistakes stops the run:
+    // guessing which subscription to spend would be worse.
+    let provider_set = providers::Providers::load(&home)?;
+    if let Some(set) = &provider_set {
+        let problems = set.problems();
+        if !problems.is_empty() {
+            bail!("{} has problems, `factory providers` lists them:\n  {}", providers::Providers::file(&home).display(), problems.join("\n  "));
+        }
+    }
+    let checks = qualify::load(&home);
+    // Families a judgment ruled out for the developer, for the next attempt.
+    let mut avoid_dev: Vec<String> = Vec::new();
 
     let issue = issue::load(&repo, opts.issue)?;
     println!("run {repo}#{} {}/{}: {}", issue.number, issue.plan, issue.key, issue.title);
@@ -1815,6 +1982,10 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         store: &store,
         home: home.clone(),
         config: machine.clone(),
+        providers: provider_set.as_ref(),
+        checks: &checks,
+        avoid_dev: avoid_dev.clone(),
+        dev_step: steps.get(dev_index).cloned(),
         repo: repo.clone(),
         issue: &issue,
         run_id: run_id.clone(),
@@ -1841,6 +2012,9 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
         merged: false,
         dev: None,
         dev_vendor: None,
+        dev_family: None,
+        dev_by: None,
+        acceptance_family: None,
         dev_subject: None,
         first_subject: None,
         dev_session: None,
@@ -1897,8 +2071,13 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
                 _ => Err(anyhow!("step '{}' has a kind the engine can't run yet", step.name)),
             },
         };
-        // An engine error stops the run like any failure no fix round can help.
-        Ok(result.unwrap_or_else(|e| Outcome::Stop(format!("engine error: {e:#}"))))
+        match result {
+            // Parked is not a failure of the step: it ends this process and
+            // the issue continues later, at this step.
+            Err(e) if e.is::<Parked>() => Err(e),
+            // An engine error stops the run like any failure no fix round can help.
+            other => Ok(other.unwrap_or_else(|e| Outcome::Stop(format!("engine error: {e:#}")))),
+        }
     })?;
     let fix_rounds_used = used.local + used.github;
     let stopped = match end {
@@ -1945,10 +2124,22 @@ pub fn run(opts: &RunOptions) -> Result<bool> {
                 }
                 earlier.push(format!("Attempt {attempt} stopped at `{step}`: {} The judgment chose `{}`: {}", first_line(&failure), action.name(), first_line(&reason)));
                 if action == judgment::Action::SwitchVendor {
-                    for step in steps.iter_mut() {
-                        step.vendor = step.vendor.map(|v| if v == Vendor::Codex { Vendor::Claude } else { Vendor::Codex });
+                    let listed = provider_set.as_ref().is_some_and(|set| set.roles.contains_key("develop"));
+                    match (run.dev_family.clone(), listed) {
+                        // This machine lists who may develop: the next
+                        // attempt takes the first from another family.
+                        (Some(family), true) => {
+                            println!("  the next attempt's developer comes from another family than {family}");
+                            avoid_dev.push(family);
+                        }
+                        (None, true) => println!("  nobody had developed yet, so there is no family to switch from"),
+                        (_, false) => {
+                            for step in steps.iter_mut() {
+                                step.vendor = step.vendor.map(|v| if v == Vendor::Codex { Vendor::Claude } else { Vendor::Codex });
+                            }
+                            println!("  the vendors are swapped for the next attempt");
+                        }
                     }
-                    println!("  the vendors are swapped for the next attempt");
                 }
                 attempt += 1;
                 continue;

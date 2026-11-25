@@ -254,12 +254,15 @@ fn simulators() -> Option<Simulators> {
 }
 
 /// The pool sizes a proposal stands for, as the machine config holds them.
-pub fn pools_of(proposal: &Proposal) -> BTreeMap<String, u32> {
-    BTreeMap::from([
-        ("simulator".to_string(), proposal.simulator_steps),
-        ("codex".to_string(), proposal.agent_calls_per_vendor),
-        ("claude".to_string(), proposal.agent_calls_per_vendor),
-    ])
+/// Agent calls are capped per subscription: the providers this machine
+/// lists, or the two programs a workflow can name when it lists none.
+pub fn pools_of(proposal: &Proposal, providers: &[String]) -> BTreeMap<String, u32> {
+    let mut pools = BTreeMap::from([("simulator".to_string(), proposal.simulator_steps)]);
+    let named: Vec<String> = if providers.is_empty() { vec!["codex".into(), "claude".into()] } else { providers.to_vec() };
+    for name in named {
+        pools.insert(name, proposal.agent_calls_per_vendor);
+    }
+    pools
 }
 
 /// The name of the simulator that belongs to a slot. A repository's
@@ -526,9 +529,12 @@ mod tests {
 
     #[test]
     fn a_proposal_becomes_pools_and_slots_have_simulators() {
-        let pools = pools_of(&propose(&machine(12, 8, 96)));
+        let pools = pools_of(&propose(&machine(12, 8, 96)), &[]);
         assert_eq!(pools.get("simulator"), Some(&3));
         assert_eq!((pools.get("codex"), pools.get("claude")), (Some(&2), Some(&2)));
+        // A machine that lists its subscriptions gets a cap for each of those.
+        let listed = pools_of(&propose(&machine(12, 8, 96)), &["chatgpt".to_string(), "glm".to_string()]);
+        assert_eq!(listed.keys().map(String::as_str).collect::<Vec<_>>(), ["chatgpt", "glm", "simulator"]);
         assert_eq!(simulator_name(2), "factory-sim-2");
         // Of two runtimes with the newest version, the plainly named one.
         let keys: Vec<String> = ["com.apple.CoreSimulator.SimRuntime.iOS-26-5", "com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4", "com.apple.CoreSimulator.SimRuntime.iOS-27-2", "com.apple.CoreSimulator.SimRuntime.tvOS-27-2"]

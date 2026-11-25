@@ -235,6 +235,7 @@ mod tests {
             head_sha: Some("abc123".into()),
             pr_url: (stage != "verify").then(|| format!("https://example.invalid/pull/{number}")),
             failure: failure.map(str::to_string),
+            wake_at: None,
             updated_at: "2026-11-24T10:05:00Z".into(),
         }
     }

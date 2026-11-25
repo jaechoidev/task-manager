@@ -167,8 +167,14 @@ n=$(( $(cat "$STUB_DIR/codex.count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$STUB_DIR/codex.count"
 echo "$*" > "$STUB_DIR/codex.args.$n"
 cat > "$STUB_DIR/codex.prompt.$n"
-out=""; prev=""
-for arg in "$@"; do [ "$prev" = "-o" ] && out="$arg"; prev="$arg"; done
+out=""; model=""; prev=""
+for arg in "$@"; do [ "$prev" = "-o" ] && out="$arg"; [ "$prev" = "-m" ] && model="$arg"; prev="$arg"; done
+# Which login and model the engine chose for this call.
+echo "codex ${STUB_WHO:-default} ${model:-none}" >> "$STUB_DIR/who"
+if [ "$STUB_CODEX_LIMIT" = "always" ]; then
+  echo '{"type":"error","message":"You have hit your usage limit. Try again at 3:10 PM."}'
+  exit 1
+fi
 if grep -q "^You are the reviewer" "$STUB_DIR/codex.prompt.$n"; then
   # The vendors were swapped: Codex reviews what Claude developed.
   echo review >> "$STUB_DIR/codex.roles"
@@ -182,6 +188,14 @@ mkdir -p Sources
 if [ "$STUB_DEV" = "by-issue" ]; then
   # Each issue gets its own folder. The pause makes overlap in time visible.
   issue=$(sed -n 's/^# Issue #\([0-9]*\):.*/\1/p' "$STUB_DIR/codex.prompt.$n" | head -1)
+  if [ "$STUB_CODEX_LIMIT_ISSUE" = "$issue" ] && [ ! -f "$STUB_DIR/codex.limited" ]; then
+    # The usage limit is reached once, on this issue's first call, and only
+    # once another issue's developer is at work: that call must go through.
+    for _ in $(seq 1 100); do grep -q "^dev-start" "$STUB_DIR/events" 2>/dev/null && break; sleep 0.1; done
+    touch "$STUB_DIR/codex.limited"
+    echo '{"type":"error","message":"You have hit your usage limit. Try again at 3:10 PM."}'
+    exit 1
+  fi
   echo "dev-start $issue" >> "$STUB_DIR/events"
   sleep 1
   mkdir -p "Sources/I$issue"
@@ -234,6 +248,15 @@ echo "$n" > "$STUB_DIR/claude.count"
 echo "$*" > "$STUB_DIR/claude.args.$n"
 cat > "$STUB_DIR/claude.prompt.$n"
 reply() { echo "{\"type\":\"result\",\"is_error\":false,\"session_id\":\"stub-claude-$n\",\"structured_output\":$1}"; }
+# Which login and model the engine chose for this call. A provider's env
+# file names the login.
+model=""; prev=""
+for arg in "$@"; do [ "$prev" = "--model" ] && model="$arg"; prev="$arg"; done
+echo "claude ${STUB_WHO:-default} ${model:-none}" >> "$STUB_DIR/who"
+if [ -n "$STUB_CLAUDE_LIMIT" ] && [ "$STUB_CLAUDE_LIMIT" = "${STUB_WHO:-default}" ]; then
+  echo '{"type":"result","is_error":true,"result":"API Error: Rate limit reached"}'
+  exit 1
+fi
 if grep -q "^You decide what happens next" "$STUB_DIR/claude.prompt.$n"; then
   echo judgment >> "$STUB_DIR/claude.roles"
   j=$(( $(cat "$STUB_DIR/judge.count" 2>/dev/null || echo 0) + 1 ))
@@ -415,6 +438,11 @@ impl Trial {
         self.run_ruling(dev, review, "")
     }
 
+    /// Runs `factory run 7 --no-pr` with this environment.
+    fn run_with(&self, env: &[(&str, &str)]) -> (Output, String) {
+        self.factory(&["--no-pr"], env)
+    }
+
     fn run_ruling(&self, dev: &str, review: &str, ruling: &str) -> (Output, String) {
         self.factory(&["--no-pr"], &[("STUB_DEV", dev), ("STUB_REVIEW", review), ("STUB_RULING", ruling)])
     }
@@ -439,6 +467,10 @@ impl Trial {
 
     /// Runs `factory queue` with real merges into the stand-in origin.
     fn queue(&self, flags: &[&str]) -> (Output, String) {
+        self.queue_with(flags, &[])
+    }
+
+    fn queue_with(&self, flags: &[&str], env: &[(&str, &str)]) -> (Output, String) {
         let output = self
             .command(env!("CARGO_BIN_EXE_factory"))
             .arg("queue")
@@ -446,6 +478,7 @@ impl Trial {
             .arg("--repo-dir")
             .arg(self.dir.join("repo"))
             .envs([("STUB_DEV", "by-issue"), ("STUB_REVIEW", "approve"), ("STUB_GITHUB", "green"), ("STUB_REAL_MERGE", "1")])
+            .envs(env.iter().copied())
             .env("FACTORY_POLL_SECONDS", "0")
             .env("FACTORY_SETTLE_SECONDS", "0")
             .output()
@@ -471,6 +504,38 @@ impl Trial {
             .unwrap();
         let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         (output, text)
+    }
+
+    /// Gives this machine three subscriptions and the given role lists:
+    /// `chatgpt` (Codex), `claude`, and `glm`, which is the Claude program
+    /// with another login. `passed` names who has passed its check.
+    fn with_providers(self, roles: &str, passed: &[&str]) -> Trial {
+        let env_file = self.dir.join("stub/glm-env.sh");
+        fs::write(&env_file, "STUB_WHO=glm\n").unwrap();
+        let file = format!(
+            "providers:\n  chatgpt: {{ cli: codex, family: openai, tiers: {{ standard: gpt-x }} }}\n  claude: {{ cli: claude, family: anthropic, tiers: {{ high: opus }} }}\n  glm: {{ cli: claude, family: zhipu, env_file: {}, tiers: {{ high: glm-big }} }}\nroles:\n{roles}",
+            env_file.display()
+        );
+        fs::write(self.dir.join("home/providers.yaml"), file).unwrap();
+        let model = |provider: &str| match provider {
+            "chatgpt" => ("standard", "gpt-x"),
+            "claude" => ("high", "opus"),
+            _ => ("high", "glm-big"),
+        };
+        let mut checked = serde_json::Map::new();
+        for provider in passed {
+            let (tier, model) = model(provider);
+            let entry = serde_json::json!({"provider": provider, "tier": tier, "model": model, "qualified": true, "structured": true, "wrote_inside": true, "wrote_outside": false, "read_outside": false, "unreliable": false, "checked_at": 1, "dir": "d"});
+            checked.insert(format!("{provider}/{tier}"), entry);
+        }
+        fs::write(self.dir.join("home/providers-checked.json"), serde_json::Value::Object(checked).to_string()).unwrap();
+        self
+    }
+
+    /// Who answered each agent call, in order: `codex default gpt-x`,
+    /// `claude glm glm-big`, ...
+    fn who(&self) -> Vec<String> {
+        self.stub("who").lines().map(str::to_string).collect()
     }
 
     /// Sets this machine's pool sizes, as `factory capacity --write` would.
@@ -1350,4 +1415,131 @@ fn a_new_module_is_scaffolded_into_a_pull_request() {
     let (output, text) = trial.cli(&["module", "new", "agent/helper"], &[]);
     assert_eq!(output.status.code(), Some(2), "{text}");
     assert!(text.contains("an agent module needs a role"), "{text}");
+}
+
+const ALL_PASSED: &[&str] = &["chatgpt", "claude", "glm"];
+
+#[test]
+fn a_role_goes_to_the_next_provider_when_the_first_is_out_of_quota() {
+    let roles = "  develop: [{ use: chatgpt, tier: standard }, { use: glm, tier: high }]\n  review: [{ use: claude, tier: high }, { use: glm, tier: high }]\n";
+    let trial = Trial::new("p-fallback", 1).with_providers(roles, ALL_PASSED);
+    // A long wait: the run must not sit it out when someone else can do the work.
+    let env = [("STUB_CODEX_LIMIT", "always"), ("STUB_REVIEW", "approve"), ("FACTORY_RATE_WAIT_SECONDS", "600")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("chatgpt standard (gpt-x, openai) hit a usage limit"), "{text}");
+    // Codex was asked once. GLM developed, through the Claude program with
+    // its own login and model. Claude, another family, reviewed.
+    assert_eq!(trial.who(), ["codex default gpt-x", "claude glm glm-big", "claude default opus"]);
+    assert_eq!(trial.stub("claude.roles"), "develop\nreview");
+    let log = trial.log();
+    assert!(log.contains("\"vendor\":\"glm\"") && log.contains("\"model\":\"glm-big\"") && log.contains("\"subscription\":\"glm\""), "{log}");
+    assert!(log.contains("\"verdict\":\"rate-limited\""), "{log}");
+}
+
+#[test]
+fn the_reviewer_never_comes_from_the_developers_family() {
+    // Claude is first in both lists. It develops, so it may not review.
+    let roles = "  develop: [{ use: claude, tier: high }]\n  review: [{ use: claude, tier: high }, { use: glm, tier: high }]\n";
+    let trial = Trial::new("p-independent", 1).with_providers(roles, ALL_PASSED);
+    let (output, text) = trial.factory(&["--no-pr"], &[("STUB_REVIEW", "approve")]);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(trial.who(), ["claude default opus", "claude glm glm-big"]);
+    assert!(text.contains("review: approve by glm"), "{text}");
+    // Codex, the workflow file's developer, was never called: the machine's list decides.
+    assert_eq!(trial.stub("codex.count"), "");
+}
+
+#[test]
+fn only_a_provider_that_passed_its_check_is_used() {
+    let roles = "  develop: [{ use: chatgpt, tier: standard }, { use: glm, tier: high }]\n  review: [{ use: claude, tier: high }]\n";
+    let trial = Trial::new("p-qualified", 1).with_providers(roles, &["claude", "glm"]);
+    let (output, text) = trial.factory(&["--no-pr"], &[("STUB_REVIEW", "approve")]);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(trial.who(), ["claude glm glm-big", "claude default opus"]);
+
+    // With nobody left for a role the issue stops, and says why for each one.
+    let roles = "  develop: [{ use: glm, tier: high }]\n  review: [{ use: glm, tier: high }, { use: chatgpt, tier: standard }]\n";
+    let trial = Trial::new("p-nobody", 1).with_providers(roles, &["claude", "glm"]);
+    let (output, text) = trial.factory(&["--no-pr"], &[("STUB_REVIEW", "approve")]);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("nobody can take the role review"), "{text}");
+    assert!(text.contains("glm high (glm-big, zhipu): its family, zhipu, must stay independent here"), "{text}");
+    assert!(text.contains("chatgpt standard (gpt-x, openai): has not passed `factory providers check`"), "{text}");
+    assert_eq!(trial.who(), ["claude glm glm-big"]);
+}
+
+#[test]
+fn a_judgment_of_switch_vendor_takes_the_next_family_in_the_list() {
+    let roles = "  develop: [{ use: chatgpt, tier: standard }, { use: glm, tier: high }]\n  review: [{ use: claude, tier: high }]\n";
+    let trial = Trial::build("p-switch", &judged_workflow(0, 2), ISSUE_BODY).with_providers(roles, ALL_PASSED);
+    let env = [("STUB_DEV", "never"), ("STUB_REVIEW", "approve"), ("STUB_JUDGE", "switch")];
+    let (output, text) = trial.factory(&["--no-pr"], &env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("the next attempt's developer comes from another family than openai"), "{text}");
+    // Codex failed, the judgment (the workflow's own vendor: no list names
+    // that role) chose, GLM developed, Claude reviewed.
+    assert_eq!(trial.who(), ["codex default gpt-x", "claude default none", "claude glm glm-big", "claude default opus"]);
+}
+
+#[test]
+fn a_providers_file_with_a_mistake_stops_the_run_before_any_call() {
+    let roles = "  develop: [{ use: nobody, tier: high }]\n";
+    let trial = Trial::new("p-mistake", 1).with_providers(roles, ALL_PASSED);
+    let (output, text) = trial.factory(&["--no-pr"], &[("STUB_REVIEW", "approve")]);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("providers.yaml has problems") && text.contains("role develop: unknown provider nobody"), "{text}");
+    assert!(trial.who().is_empty());
+}
+
+#[test]
+fn an_issue_parks_when_nobody_has_quota_and_continues_where_it_stopped() {
+    let trial = Trial::new("park", 1);
+    // The limit lasts 4 seconds. Waits over 1 second park instead of sleeping.
+    let env = [("STUB_DEV", "limit-once"), ("STUB_REVIEW", "approve"), ("FACTORY_RATE_WAIT_SECONDS", "4"), ("FACTORY_PARK_AFTER_SECONDS", "1")];
+    let (output, text) = trial.run_with(&env);
+    assert_eq!(output.status.code(), Some(75), "{text}");
+    assert!(text.contains("codex hit a usage limit") && text.contains("PARKED: parked until"), "{text}");
+    assert!(text.contains("nobody can take the role develop. codex: out of quota until"), "{text}");
+    // It is waiting, not failed, and nobody was asked to look at it.
+    let (_, status) = trial.cli(&["status"], &[]);
+    assert!(status.contains("waiting") && !status.contains("failed"), "{status}");
+    let (_, blocked) = trial.cli(&["blocked"], &[]);
+    assert!(blocked.contains("no issue is waiting for a person"), "{blocked}");
+
+    // Picked up too early, it parks again without spending a call.
+    let (output, text) = trial.run_with(&env);
+    assert_eq!(output.status.code(), Some(75), "{text}");
+    assert_eq!(trial.stub("codex.count"), "1");
+
+    // After the wait it continues at the step it stopped at, and passes.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let (output, text) = trial.run_with(&env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("resuming run") && text.contains("at 'develop'"), "{text}");
+    assert_eq!(trial.stub("codex.count"), "2");
+    assert_eq!(trial.log().matches("\"verdict\":\"rate-limited\"").count(), 1);
+    // The good reply cleared the ledger.
+    let ledger = fs::read_to_string(trial.dir.join("home/availability.json")).unwrap();
+    assert!(!ledger.contains("codex/default"), "{ledger}");
+}
+
+#[test]
+fn the_queue_goes_on_with_other_work_while_an_issue_is_parked() {
+    let trial = Trial::build("q-park", &github_workflow(2), ISSUE_BODY)
+        .with_issues(&[(7, "a", "Sources/I7/", &["today"], &[]), (8, "b", "Sources/I8/", &["today"], &[])]);
+    // Issue 8's developer hits the limit once. Issue 7's call is already under way.
+    let env = [("STUB_CODEX_LIMIT_ISSUE", "8"), ("FACTORY_RATE_WAIT_SECONDS", "6"), ("FACTORY_PARK_AFTER_SECONDS", "1")];
+    let (output, text) = trial.queue_with(&["--parallel", "2"], &env);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("#8 b parked after"), "{text}");
+    assert!(text.contains("queue done. Merged: #7, #8. Pull request open: none. Blocked: none"), "{text}");
+    // Issue 7 was merged while 8 waited. 8 then developed, on top of 7's work.
+    assert!(text.find("#7 a ended").unwrap() < text.rfind("#8 b ended").unwrap(), "{text}");
+    assert!(trial.position("dev-end 7") < trial.position("dev-start 8"), "{:?}", trial.events());
+    let files = trial.dev_files();
+    assert!(files.contains("Sources/I7/File.swift") && files.contains("Sources/I8/File.swift"), "{files}");
+    // 8's second process took up the run the first one left.
+    let logs: String = fs::read_dir(trial.dir.join("home/queue/o__r")).unwrap().map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap()).collect();
+    assert!(logs.contains("PARKED: parked until") && logs.contains("resuming run"), "{logs}");
 }

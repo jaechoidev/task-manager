@@ -21,6 +21,8 @@ pub struct Spec<'a> {
     pub timeout: Duration,
     /// Added to the child's environment.
     pub env: Vec<(String, String)>,
+    /// Taken out of the child's environment, before `env` is added.
+    pub unset: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,9 @@ pub fn run(spec: &Spec) -> Result<Outcome> {
     let stderr = File::create(spec.stderr).with_context(|| format!("creating {}", spec.stderr.display()))?;
 
     let mut command = Command::new(spec.program);
+    for name in &spec.unset {
+        command.env_remove(name);
+    }
     command
         .args(&spec.args)
         .envs(spec.env.iter().map(|(key, value)| (key, value)))
@@ -109,6 +114,7 @@ mod tests {
             stderr: err,
             timeout: Duration::from_secs(secs),
             env: vec![("FACTORY_TEST_VALUE".to_string(), "from the engine".to_string())],
+            unset: vec!["HOME".to_string()],
         }
     }
 
@@ -117,9 +123,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("factory-proc-env-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (out, err) = (dir.join("out"), dir.join("err"));
-        let outcome = run(&spec(&dir, &["-c", "echo \"$FACTORY_TEST_VALUE\""], None, &out, &err, 5)).unwrap();
+        let outcome = run(&spec(&dir, &["-c", "echo \"$FACTORY_TEST_VALUE, home ${HOME:-taken out}\""], None, &out, &err, 5)).unwrap();
         assert!(outcome.ok());
-        assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "from the engine");
+        // And it does not see what the engine takes out.
+        assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "from the engine, home taken out");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -97,6 +97,9 @@ pub struct IssueRow {
     pub pr_url: Option<String>,
     pub failure: Option<String>,
     pub updated_at: String,
+    /// Set while the issue is parked: when to pick it up again, in seconds
+    /// since 1970.
+    pub wake_at: Option<u64>,
 }
 
 pub struct Store {
@@ -115,6 +118,11 @@ impl Store {
         let has_round = db.prepare("SELECT 1 FROM pragma_table_info('steps') WHERE name = 'round'")?.exists([])?;
         if !has_round {
             db.execute_batch("ALTER TABLE steps ADD COLUMN round INTEGER NOT NULL DEFAULT 0")?;
+        }
+        // Databases from before parking have no `wake_at` column.
+        let has_wake = db.prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name = 'wake_at'")?.exists([])?;
+        if !has_wake {
+            db.execute_batch("ALTER TABLE issues ADD COLUMN wake_at INTEGER")?;
         }
         Ok(Store { db, log: home.join("requests.jsonl") })
     }
@@ -147,8 +155,18 @@ impl Store {
 
     pub fn set_stage(&self, repo: &str, number: u64, stage: &str, status: &str, failure: Option<&str>) -> Result<()> {
         self.db.execute(
-            "UPDATE issues SET stage = ?3, status = ?4, failure = ?5, updated_at = ?6 WHERE repo = ?1 AND number = ?2",
+            "UPDATE issues SET stage = ?3, status = ?4, failure = ?5, updated_at = ?6, wake_at = NULL WHERE repo = ?1 AND number = ?2",
             params![repo, number, stage, status, failure, util::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Marks an issue as parked at a step: nothing runs for it until
+    /// `wake_at`, and whoever picks it up continues at that step.
+    pub fn set_parked(&self, repo: &str, number: u64, stage: &str, wake_at: u64, reason: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE issues SET stage = ?3, status = 'waiting', failure = ?4, updated_at = ?5, wake_at = ?6 WHERE repo = ?1 AND number = ?2",
+            params![repo, number, stage, reason, util::now(), wake_at],
         )?;
         Ok(())
     }
@@ -208,7 +226,7 @@ impl Store {
 
     pub fn issues(&self) -> Result<Vec<IssueRow>> {
         let mut statement = self.db.prepare(
-            "SELECT repo, number, key, title, run_id, stage, status, head_sha, pr_url, failure, updated_at
+            "SELECT repo, number, key, title, run_id, stage, status, head_sha, pr_url, failure, updated_at, wake_at
              FROM issues ORDER BY updated_at DESC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -224,6 +242,7 @@ impl Store {
                 pr_url: row.get(8)?,
                 failure: row.get(9)?,
                 updated_at: row.get(10)?,
+                wake_at: row.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

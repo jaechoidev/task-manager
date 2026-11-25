@@ -152,16 +152,31 @@ pub fn run(opts: &QueueOptions) -> Result<bool> {
     let program = std::env::current_exe().context("finding the factory program")?;
     println!("queue {repo}: issues labelled '{}', up to {} at once", opts.label, opts.parallel);
 
+    let store = super::state::Store::open(&home)?;
     let mut tried: BTreeSet<u64> = BTreeSet::new();
     let mut running: Vec<Running> = Vec::new();
+    // Issues whose next call nobody has quota for, and when to look again.
+    let mut parked: Vec<(Candidate, u64)> = Vec::new();
     let mut merged: Vec<u64> = Vec::new();
     let mut opened: Vec<u64> = Vec::new();
     let mut failed: Vec<u64> = Vec::new();
     loop {
         let all = candidates(&repo, &opts.label)?;
-        let busy: Vec<Candidate> = running.iter().map(|r| r.candidate.clone()).collect();
+        // A parked issue whose time has come goes first: it is half done.
+        let now = util::now_secs();
+        let mut due: Vec<Candidate> = Vec::new();
+        parked.retain(|(candidate, wake)| {
+            let wake_now = *wake <= now && running.len() + due.len() < opts.parallel;
+            if wake_now {
+                due.push(candidate.clone());
+            }
+            !wake_now
+        });
+        // A parked issue keeps its files, so nothing that overlaps it may start.
+        let busy: Vec<Candidate> = running.iter().map(|r| r.candidate.clone()).chain(parked.iter().map(|(c, _)| c.clone())).chain(due.iter().cloned()).collect();
         let waiting = ready(&all, &tried);
-        for candidate in pick(&waiting, &busy, opts.parallel.saturating_sub(running.len())) {
+        let fresh = pick(&waiting, &busy, opts.parallel.saturating_sub(running.len() + due.len()));
+        for candidate in due.into_iter().chain(fresh) {
             let log = logs.join(format!("issue-{}-{}.log", candidate.number, util::run_id()));
             let out = std::fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
             let err = out.try_clone()?;
@@ -174,6 +189,14 @@ pub fn run(opts: &QueueOptions) -> Result<bool> {
             println!("  #{} {} started. Log: {}", candidate.number, candidate.key, log.display());
             tried.insert(candidate.number);
             running.push(Running { candidate, child, log, started: Instant::now() });
+        }
+        if running.is_empty() && !parked.is_empty() {
+            // Only parked issues are left. Nothing is held while waiting.
+            let wake = parked.iter().map(|(_, wake)| *wake).min().unwrap_or(now);
+            let list: Vec<String> = parked.iter().map(|(c, _)| format!("#{}", c.number)).collect();
+            println!("  waiting until {} for quota: {} parked", util::clock(wake), list.join(", "));
+            std::thread::sleep(Duration::from_secs(wake.saturating_sub(util::now_secs()).max(1)));
+            continue;
         }
         if running.is_empty() {
             // Nothing runs and nothing can start. Say why for what is left.
@@ -208,6 +231,14 @@ pub fn run(opts: &QueueOptions) -> Result<bool> {
         let status = done.child.wait()?;
         let result = last_line(&done.log);
         let number = done.candidate.number;
+        if status.code() == Some(i32::from(super::PARKED_EXIT_CODE)) {
+            // Out of quota, not failed. It gives its place to other work and
+            // comes back at the step it stopped at.
+            let wake = store.issue(&repo, number)?.and_then(|row| row.wake_at).unwrap_or(util::now_secs() + 60);
+            println!("  #{number} {} parked after {:.0} s, until {}: {result}", done.candidate.key, done.started.elapsed().as_secs_f64(), util::clock(wake));
+            parked.push((done.candidate, wake));
+            continue;
+        }
         println!("  #{number} {} ended after {:.0} s: {result}", done.candidate.key, done.started.elapsed().as_secs_f64());
         if !status.success() {
             failed.push(number);

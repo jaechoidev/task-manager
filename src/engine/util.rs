@@ -34,8 +34,15 @@ fn civil(secs: u64) -> (i64, u32, u32, u64, u64, u64) {
     (year, month, day, rem / 3_600, rem % 3_600 / 60, rem % 60)
 }
 
-fn now_secs() -> u64 {
+/// Seconds since 1970.
+pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// A time in seconds since 1970 as `2026-11-24 09:15 UTC`.
+pub fn clock(secs: u64) -> String {
+    let (y, mo, d, h, mi, _) = civil(secs);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02} UTC")
 }
 
 /// `2026-11-24T09:15:02Z`
@@ -59,5 +66,6 @@ mod tests {
         assert_eq!(civil(0), (1970, 1, 1, 0, 0, 0));
         assert_eq!(civil(951_782_400), (2000, 2, 29, 0, 0, 0));
         assert_eq!(civil(1_795_511_702), (2026, 11, 24, 9, 15, 2));
+        assert_eq!(super::clock(1_795_511_702), "2026-11-24 09:15 UTC");
     }
 }
