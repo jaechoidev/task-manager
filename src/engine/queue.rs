@@ -47,6 +47,69 @@ pub struct Options {
     pub guard: bool,
     /// One project, worded as `factory queue` always was.
     pub single: bool,
+    /// The projects are this machine's registered ones. With `watch`, the
+    /// list is read again at each look, so `factory project add` and
+    /// `remove` take effect without starting the scheduler again.
+    pub registered: bool,
+}
+
+/// The projects registered on this machine, in the order they were added.
+pub fn registered(home: &Path) -> Result<Vec<Project>> {
+    let config = super::config::Config::load(home)?;
+    Ok(config.projects.iter().map(|entry| Project { repo_dir: entry.path(), label: entry.label().to_string(), max_parallel: entry.max_parallel }).collect())
+}
+
+/// What a project list read again means for the projects being worked on.
+/// Positions are into `listed` for `new`, and into `known` for the others.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Follow {
+    /// Listed now and not known before.
+    pub new: Vec<usize>,
+    /// Known and worked on, no longer listed. Its runs finish, nothing new starts.
+    pub gone: Vec<usize>,
+    /// Known but set aside earlier, listed again.
+    pub back: Vec<usize>,
+}
+
+/// Compares the projects known, each with whether it was set aside, with the
+/// list as it reads now. A known project is never forgotten, only set aside,
+/// so what runs keeps its place.
+pub fn follow(known: &[(PathBuf, bool)], listed: &[PathBuf]) -> Follow {
+    let mut out = Follow::default();
+    for (at, path) in listed.iter().enumerate() {
+        if !known.iter().any(|(dir, _)| dir == path) {
+            out.new.push(at);
+        }
+    }
+    for (at, (dir, aside)) in known.iter().enumerate() {
+        match (listed.contains(dir), aside) {
+            (false, false) => out.gone.push(at),
+            (true, true) => out.back.push(at),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// How an issue is named in the output: `#7`, or `todo-trial#7` when there
+/// are several projects.
+struct Names {
+    single: bool,
+    short: Vec<String>,
+}
+
+impl Names {
+    fn tag(&self, project: usize, number: u64) -> String {
+        if self.single {
+            format!("#{number}")
+        } else {
+            format!("{}#{number}", self.short[project])
+        }
+    }
+
+    fn push(&mut self, repo: &str) {
+        self.short.push(repo.rsplit('/').next().unwrap_or(repo).to_string());
+    }
 }
 
 /// What the scheduler knows about a project when it hands out a place.
@@ -242,6 +305,87 @@ struct State {
     merged: Vec<u64>,
     opened: Vec<u64>,
     failed: Vec<u64>,
+    /// No longer registered. What runs finishes, and nothing new starts.
+    aside: bool,
+}
+
+fn state_of(home: &Path, project: &Project) -> Result<State> {
+    let repo_dir = project.repo_dir.canonicalize().with_context(|| format!("{} does not exist", project.repo_dir.display()))?;
+    let repo = super::repo_name(&repo_dir)?;
+    let logs = home.join("queue").join(util::repo_dir_name(&repo));
+    std::fs::create_dir_all(&logs)?;
+    Ok(State {
+        repo_dir,
+        repo,
+        label: project.label.clone(),
+        max: project.max_parallel,
+        logs,
+        all: Vec::new(),
+        tried: BTreeSet::new(),
+        parked: Vec::new(),
+        merged: Vec::new(),
+        opened: Vec::new(),
+        failed: Vec::new(),
+        aside: false,
+    })
+}
+
+/// Reads the registered projects again and takes in what changed. Each
+/// problem is said once, and the list as it was stands meanwhile.
+fn take_in(home: &Path, states: &mut Vec<State>, names: &mut Names, running: &[Running], said: &mut BTreeSet<String>) {
+    let mut once = |message: String| {
+        if said.insert(message.clone()) {
+            eprintln!("warning: {message}");
+        }
+    };
+    let projects = match registered(home) {
+        Ok(projects) => projects,
+        Err(e) => return once(format!("could not read the registered projects again: {e:#}. Working on the ones read before")),
+    };
+    let mut listed: Vec<(PathBuf, &Project)> = Vec::new();
+    for project in &projects {
+        match project.repo_dir.canonicalize() {
+            Ok(dir) => listed.push((dir, project)),
+            Err(_) => once(format!("{} is registered but does not exist", project.repo_dir.display())),
+        }
+    }
+    let known: Vec<(PathBuf, bool)> = states.iter().map(|state| (state.repo_dir.clone(), state.aside)).collect();
+    let paths: Vec<PathBuf> = listed.iter().map(|(dir, _)| dir.clone()).collect();
+    let change = follow(&known, &paths);
+    for at in change.gone {
+        let state = &mut states[at];
+        state.aside = true;
+        let parked: Vec<String> = state.parked.drain(..).map(|(candidate, _)| format!("#{}", candidate.number)).collect();
+        let runs = running.iter().filter(|run| run.project == at).count();
+        let left = if parked.is_empty() { String::new() } else { format!(" Parked {} stays where it stopped.", parked.join(", ")) };
+        println!("  {} is no longer registered: {runs} run(s) finish, and nothing new of it starts.{left}", state.repo);
+    }
+    for at in change.back {
+        states[at].aside = false;
+        println!("  {} is registered again", states[at].repo);
+    }
+    for at in change.new {
+        let project = listed[at].1;
+        match state_of(home, project) {
+            Ok(state) if states.iter().any(|known| known.repo == state.repo) => {
+                once(format!("{} is registered twice, at {}. Only the first is worked on", state.repo, state.repo_dir.display()));
+            }
+            Ok(state) => {
+                let max = state.max.map(|max| format!(", at most {max} at once")).unwrap_or_default();
+                println!("  now also {}: issues labelled '{}'{max}", state.repo, state.label);
+                names.push(&state.repo);
+                states.push(state);
+            }
+            Err(e) => once(format!("could not take in {}: {e:#}. Trying again at the next look", project.repo_dir.display())),
+        }
+    }
+    // A changed label or limit counts from the next start.
+    for (dir, project) in &listed {
+        if let Some(state) = states.iter_mut().find(|state| &state.repo_dir == dir) {
+            state.label = project.label.clone();
+            state.max = project.max_parallel;
+        }
+    }
 }
 
 /// What the scheduler is doing now, for other processes to read.
@@ -250,6 +394,9 @@ fn board_of(opts: &Options, states: &[State], running: &[Running], held_back: Op
     let mut projects = Vec::new();
     for (project, state) in states.iter().enumerate() {
         let mine: Vec<&Running> = running.iter().filter(|run| run.project == project).collect();
+        if state.aside && mine.is_empty() {
+            continue;
+        }
         let busy: Vec<Candidate> = mine.iter().map(|run| run.candidate.clone()).chain(state.parked.iter().map(|(candidate, _)| candidate.clone())).collect();
         let limit = state.max.filter(|max| mine.len() >= *max);
         // In order, a project waits while one ahead of it has work running or ready.
@@ -285,37 +432,25 @@ pub fn run(opts: &Options) -> Result<bool> {
     let store = super::state::Store::open(&home)?;
     let mut states: Vec<State> = Vec::new();
     for project in &opts.projects {
-        let repo_dir = project.repo_dir.canonicalize().with_context(|| format!("{} does not exist", project.repo_dir.display()))?;
-        let repo = super::repo_name(&repo_dir)?;
-        if states.iter().any(|known| known.repo == repo) {
-            bail!("{repo} is listed twice");
+        let state = state_of(&home, project)?;
+        if states.iter().any(|known| known.repo == state.repo) {
+            bail!("{} is listed twice", state.repo);
         }
-        let logs = home.join("queue").join(util::repo_dir_name(&repo));
-        std::fs::create_dir_all(&logs)?;
-        states.push(State {
-            repo_dir,
-            repo,
-            label: project.label.clone(),
-            max: project.max_parallel,
-            logs,
-            all: Vec::new(),
-            tried: BTreeSet::new(),
-            parked: Vec::new(),
-            merged: Vec::new(),
-            opened: Vec::new(),
-            failed: Vec::new(),
-        });
+        states.push(state);
     }
-    // How an issue is named in the output: `#7`, or `todo-trial#7` when
-    // there are several projects.
     let single = opts.single && states.len() == 1;
-    let short: Vec<String> = states.iter().map(|state| state.repo.rsplit('/').next().unwrap_or(&state.repo).to_string()).collect();
-    let tag = |project: usize, number: u64| if single { format!("#{number}") } else { format!("{}#{number}", short[project]) };
+    let mut names = Names { single, short: Vec::new() };
+    states.iter().for_each(|state| names.push(&state.repo));
+    let follows = opts.watch && opts.registered;
     if single {
         println!("queue {}: issues labelled '{}', up to {} at once", states[0].repo, states[0].label, opts.parallel);
     } else {
         let how = if opts.in_order { "one project after the other" } else { "projects side by side" };
-        let watch = if opts.watch { ", and it keeps looking for new work until stopped" } else { "" };
+        let watch = match (opts.watch, follows) {
+            (true, true) => ", and it keeps looking for new work until stopped, reading the registered projects again at each look",
+            (true, false) => ", and it keeps looking for new work until stopped",
+            _ => "",
+        };
         println!("schedule: {} project(s), up to {} issue(s) at once, {how}{watch}", states.len(), opts.parallel);
         for state in &states {
             let max = state.max.map(|max| format!(", at most {max} at once")).unwrap_or_default();
@@ -343,8 +478,16 @@ pub fn run(opts: &Options) -> Result<bool> {
     let mut left_alone: BTreeSet<String> = BTreeSet::new();
     let mut held_back: Option<String> = None;
     let mut ended_since_handoff = false;
+    let mut said: BTreeSet<String> = BTreeSet::new();
     loop {
+        if follows {
+            take_in(&home, &mut states, &mut names, &running, &mut said);
+        }
         for state in states.iter_mut() {
+            if state.aside {
+                state.all.clear();
+                continue;
+            }
             match candidates(&state.repo, &state.label) {
                 Ok(found) => {
                     state.all = found;
@@ -399,7 +542,7 @@ pub fn run(opts: &Options) -> Result<bool> {
                 let room = super::capacity::room();
                 if room.simulator_steps == 0 {
                     if held_back.as_deref() != Some(room.reason.as_str()) {
-                        println!("  holding back {} {}: {}", tag(project, candidate.number), candidate.key, room.reason);
+                        println!("  holding back {} {}: {}", names.tag(project, candidate.number), candidate.key, room.reason);
                     }
                     held_back = Some(room.reason);
                     break;
@@ -419,7 +562,7 @@ pub fn run(opts: &Options) -> Result<bool> {
                 command.arg("--no-merge");
             }
             let child = command.stdin(Stdio::null()).stdout(out).stderr(err).spawn().context("starting a run")?;
-            println!("  {} {} started. Log: {}", tag(project, candidate.number), candidate.key, log.display());
+            println!("  {} {} started. Log: {}", names.tag(project, candidate.number), candidate.key, log.display());
             state.tried.insert(candidate.number);
             running.push(Running { project, candidate, child, log, started: Instant::now(), started_at: util::now_secs() });
         }
@@ -429,7 +572,7 @@ pub fn run(opts: &Options) -> Result<bool> {
             let wake = states.iter().flat_map(|state| state.parked.iter().map(|(_, wake)| *wake)).min();
             if let Some(wake) = wake {
                 // Only parked issues are left. Nothing is held while waiting.
-                let list: Vec<String> = states.iter().enumerate().flat_map(|(project, state)| state.parked.iter().map(move |(c, _)| (project, c.number))).map(|(project, number)| tag(project, number)).collect();
+                let list: Vec<String> = states.iter().enumerate().flat_map(|(project, state)| state.parked.iter().map(move |(c, _)| (project, c.number))).map(|(project, number)| names.tag(project, number)).collect();
                 println!("  waiting until {} for quota: {} parked", util::clock(wake), list.join(", "));
                 let wait = Duration::from_secs(wake.saturating_sub(util::now_secs()).max(1));
                 // With `watch`, new work may arrive before that.
@@ -453,7 +596,7 @@ pub fn run(opts: &Options) -> Result<bool> {
                         let blockers: Vec<String> = candidate.blockers.iter().map(|n| format!("#{n}")).collect();
                         format!("is blocked by {}, still open", blockers.join(", "))
                     };
-                    println!("  {} {} not run: it {why}", tag(project, candidate.number), candidate.key);
+                    println!("  {} {} not run: it {why}", names.tag(project, candidate.number), candidate.key);
                 }
             }
             break;
@@ -483,7 +626,7 @@ pub fn run(opts: &Options) -> Result<bool> {
         let status = done.child.wait()?;
         let result = last_line(&done.log);
         let number = done.candidate.number;
-        let name = tag(done.project, number);
+        let name = names.tag(done.project, number);
         let state = &mut states[done.project];
         if status.code() == Some(i32::from(super::PARKED_EXIT_CODE)) {
             // Out of quota, not failed. It gives its place to other work and
@@ -558,6 +701,30 @@ fn write_handoff() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_list_read_again_adds_sets_aside_and_brings_back() {
+        let p = |name: &str| PathBuf::from(format!("/code/{name}"));
+        // Nothing changed.
+        assert_eq!(follow(&[(p("a"), false)], &[p("a")]), Follow::default());
+        // b was added, a was removed, c came back after being removed.
+        let change = follow(&[(p("a"), false), (p("c"), true)], &[p("c"), p("b")]);
+        assert_eq!(change, Follow { new: vec![1], gone: vec![0], back: vec![1] });
+        // One already set aside and still not listed stays as it is.
+        assert_eq!(follow(&[(p("a"), true)], &[]), Follow::default());
+        // An empty list sets everything aside but forgets nothing.
+        assert_eq!(follow(&[(p("a"), false), (p("b"), false)], &[]).gone, vec![0, 1]);
+    }
+
+    #[test]
+    fn issues_are_named_with_their_project_when_there_are_several() {
+        let mut names = Names { single: false, short: Vec::new() };
+        names.push("o/todo-trial");
+        names.push("o/counter-trial");
+        assert_eq!(names.tag(1, 21), "counter-trial#21");
+        let alone = Names { single: true, short: vec!["todo-trial".into()] };
+        assert_eq!(alone.tag(0, 7), "#7");
+    }
 
     fn candidate(number: u64, scope: &[&str], priority: u8) -> Candidate {
         Candidate {

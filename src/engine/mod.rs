@@ -9,6 +9,7 @@ pub mod agent;
 pub mod api;
 pub mod board;
 pub mod capacity;
+pub mod checkout;
 pub mod config;
 pub mod editing;
 pub mod flows;

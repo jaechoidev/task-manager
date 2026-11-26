@@ -1859,6 +1859,50 @@ fn watching_the_scheduler_picks_up_work_that_arrives_later_and_does_not_end() {
 }
 
 #[test]
+fn a_watching_scheduler_takes_in_a_project_registered_while_it_runs() {
+    let trial = Trial::build("s-follow", &github_workflow(2), ISSUE_BODY)
+        .with_issues(&[(7, "a", "Sources/I7/", &[], &[])])
+        .with_second_project(&github_workflow(2), &[(17, "c", "Sources/I17/", &["today"], &[])], "");
+    // Only the first project is registered when it starts.
+    let config = trial.dir.join("home/config.yaml");
+    let both = fs::read_to_string(&config).unwrap();
+    let first_only: String = both.lines().take(2).map(|line| format!("{line}\n")).collect();
+    fs::write(&config, &first_only).unwrap();
+    let log = trial.dir.join("schedule.log");
+    let out = fs::File::create(&log).unwrap();
+    let mut child = trial
+        .schedule_command(&["--watch"], &[("FACTORY_QUEUE_LOOK_SECONDS", "1")])
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(!trial.dir.join("stub/r2/closed-17").exists(), "o/r2 is not registered yet: {}", fs::read_to_string(&log).unwrap());
+    // `factory project add` writes the list. Nobody starts the scheduler again.
+    fs::write(&config, &both).unwrap();
+    let merged = trial.dir.join("stub/r2/closed-17");
+    for _ in 0..300 {
+        if merged.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Removed again, it is set aside, and the scheduler goes on.
+    fs::write(&config, &first_only).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let still_running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(merged.exists(), "{text}");
+    assert!(text.contains("schedule: 1 project(s)") && text.contains("reading the registered projects again"), "{text}");
+    let added = text.find("now also o/r2: issues labelled 'today'").expect(&text);
+    assert!(added < text.find("r2#17 c started").expect(&text), "{text}");
+    assert!(text.contains("o/r2 is no longer registered: 0 run(s) finish"), "{text}");
+    assert!(still_running, "{text}");
+}
+
+#[test]
 fn an_issue_another_process_is_running_is_left_alone_not_counted_as_blocked() {
     let trial = Trial::build("q-held", &github_workflow(2), ISSUE_BODY)
         .with_issues(&[(7, "a", "Sources/I7/", &["today"], &[]), (8, "b", "Sources/I8/", &["today"], &[])]);

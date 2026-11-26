@@ -3,6 +3,7 @@ mod gh;
 mod labels;
 mod plan;
 mod repo;
+mod skills;
 mod yaml;
 
 use anyhow::{bail, Context, Result};
@@ -30,6 +31,12 @@ enum Top {
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
+    },
+    /// The skills a project carries for people's sessions: writing plans,
+    /// reading what runs, promoting. Built into this program
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
     },
     /// Take one issue through develop, verify and review, then open a pull request
     Run {
@@ -363,6 +370,22 @@ enum PlanCommand {
 }
 
 #[derive(Subcommand)]
+enum SkillsCommand {
+    /// Say whether the repository's default branch holds this program's
+    /// skills. Exits 1 when it doesn't
+    Check {
+        /// owner/name of the repository
+        repo: String,
+    },
+    /// Make the repository's default branch hold this program's skills, in
+    /// one commit made through GitHub. No checkout is needed
+    Update {
+        /// owner/name of the repository
+        repo: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum RepoCommand {
     /// Create a private repo from a template and apply its settings. Safe to rerun
     Init {
@@ -481,6 +504,24 @@ fn run() -> Result<bool> {
             Ok(repo::passed(&checks))
         }
 
+        Top::Skills { command: SkillsCommand::Check { repo } } => {
+            let (branch, drift) = skills::status(&repo)?;
+            if drift.is_empty() {
+                println!("{repo} {branch}: the factory skills match this program's");
+            } else {
+                println!("{repo} {branch}: out of date, {}. `factory skills update {repo}` writes them", drift.describe());
+            }
+            Ok(drift.is_empty())
+        }
+
+        Top::Skills { command: SkillsCommand::Update { repo } } => {
+            match skills::update(&repo)? {
+                None => println!("{repo}: the factory skills already match this program's"),
+                Some((commit, drift)) => println!("{repo}: committed {}, {}", &commit[..7.min(commit.len())], drift.describe()),
+            }
+            Ok(true)
+        }
+
         Top::Run { issue, repo_dir, workflow, no_pr, no_merge, restart } => {
             engine::run(&engine::RunOptions { repo_dir, issue, workflow_file: workflow, no_pr, no_merge, restart, take_over: false })
         }
@@ -489,14 +530,14 @@ fn run() -> Result<bool> {
             let pool = engine::config::Config::load(&engine::util::home()?)?.pool("simulator") as usize;
             let parallel = parallel.unwrap_or(pool.max(2));
             let projects = vec![engine::queue::Project { repo_dir, label, max_parallel: None }];
-            engine::queue::run(&engine::queue::Options { projects, parallel, in_order: false, watch: false, no_merge, guard: false, single: true })
+            engine::queue::run(&engine::queue::Options { projects, parallel, in_order: false, watch: false, no_merge, guard: false, single: true, registered: false })
         }
 
         Top::Schedule { parallel, in_order, watch, no_merge, no_guard } => {
             let config = engine::config::Config::load(&engine::util::home()?)?;
             let parallel = parallel.unwrap_or((config.pool("simulator") as usize).max(2));
-            let projects = config.projects.iter().map(|entry| engine::queue::Project { repo_dir: entry.path(), label: entry.label().to_string(), max_parallel: entry.max_parallel }).collect();
-            engine::queue::run(&engine::queue::Options { projects, parallel, in_order, watch, no_merge, guard: !no_guard, single: false })
+            let projects = engine::queue::registered(&engine::util::home()?)?;
+            engine::queue::run(&engine::queue::Options { projects, parallel, in_order, watch, no_merge, guard: !no_guard, single: false, registered: true })
         }
 
         Top::Service { command } => {
@@ -537,9 +578,17 @@ fn run() -> Result<bool> {
                     if max_parallel == Some(0) {
                         bail!("--max-parallel must be at least 1");
                     }
+                    let findings = engine::checkout::check(&dir)?;
+                    if !findings.refusals.is_empty() {
+                        bail!("{repo} at {} is not registered: {}", dir.display(), findings.refusals.join(". "));
+                    }
+                    for note in &findings.notes {
+                        println!("note: {note}");
+                    }
                     let new = config.add_project(engine::config::ProjectEntry { dir: dir.display().to_string(), label, max_parallel });
                     config.save(&home)?;
                     println!("{} {repo}, at {}", if new { "added" } else { "updated" }, dir.display());
+                    println!("A watching scheduler and the API, including the service's, take it in at their next look.");
                     Ok(true)
                 }
                 ProjectCommand::Remove { dir } => {
@@ -714,11 +763,13 @@ fn run() -> Result<bool> {
         }
 
         Top::Serve { bind, token, mut repo_dirs } => {
-            // With none named, the projects this machine has registered.
-            if repo_dirs.is_empty() {
+            // With none named, the projects this machine has registered, read
+            // again before each request.
+            let registered = repo_dirs.is_empty();
+            if registered {
                 repo_dirs = engine::config::Config::load(&engine::util::home()?)?.projects.iter().map(|entry| entry.path()).collect();
             }
-            engine::api::serve(&engine::api::ServeOptions { bind, token, repo_dirs })?;
+            engine::api::serve(&engine::api::ServeOptions { bind, token, repo_dirs, registered })?;
             Ok(true)
         }
 

@@ -69,6 +69,7 @@ An unknown field is an error, so a typo like `depend_on` is caught.
 | References | `depends_on: [modle]` |
 | Cycles | `a → b → a`: neither can ever start |
 | Scope overlap | Two unordered issues that both edit `Sources/UI/Shared/` |
+| Folders people keep | A scope under `.claude/` (the skills people's sessions follow) or `.github/` (the workflows that check every pull request) |
 | Flow files | A flow that doesn't exist, isn't marked new, and isn't created by a dependency |
 | Labels | A label outside the allowed set |
 | File name | `plans/a.yaml` holding `plan: b` |

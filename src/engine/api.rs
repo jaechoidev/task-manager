@@ -23,6 +23,26 @@ pub struct ServeOptions {
     pub token: Option<String>,
     /// Checkouts of the repositories the API may act on and read workflows from.
     pub repo_dirs: Vec<PathBuf>,
+    /// The checkouts are this machine's registered projects. The list is
+    /// read again before each request, so a project added or removed shows
+    /// without starting the server again.
+    pub registered: bool,
+}
+
+/// `owner/name` to checkout, for each directory that is a checkout. What
+/// can't be read is returned as a message, and the rest still counts.
+fn checkouts(dirs: &[PathBuf]) -> (BTreeMap<String, PathBuf>, Vec<String>) {
+    let mut repos = BTreeMap::new();
+    let mut problems = Vec::new();
+    for dir in dirs {
+        match dir.canonicalize().map_err(anyhow::Error::from).and_then(|dir| Ok((repo_of(&dir)?, dir))) {
+            Ok((repo, dir)) => {
+                repos.insert(repo, dir);
+            }
+            Err(e) => problems.push(format!("{}: {e:#}", dir.display())),
+        }
+    }
+    (repos, problems)
 }
 
 /// A request, reduced to what the routes need.
@@ -462,15 +482,38 @@ pub fn serve(opts: &ServeOptions) -> Result<()> {
     if !address.ip().is_loopback() && opts.token.as_deref().is_none_or(|t| t.trim().is_empty()) {
         bail!("refusing to listen on {address}: it is not this machine only, and no --token is set. This API can start runs");
     }
-    let mut repos = BTreeMap::new();
-    for dir in &opts.repo_dirs {
-        let dir = dir.canonicalize().with_context(|| format!("{} does not exist", dir.display()))?;
-        repos.insert(repo_of(&dir)?, dir);
+    let (repos, problems) = checkouts(&opts.repo_dirs);
+    if let Some(problem) = problems.first() {
+        bail!("{problem}");
     }
-    let context = Context_ { home: util::home()?, repos, program: std::env::current_exe().context("finding the factory program")? };
+    let home = util::home()?;
+    let mut context = Context_ { home: home.clone(), repos, program: std::env::current_exe().context("finding the factory program")? };
     let server = tiny_http::Server::http(address).map_err(|e| anyhow!("could not listen on {address}: {e}"))?;
-    println!("factory API on http://{address}/v1, for {}", if context.repos.is_empty() { "no repository (read only)".to_string() } else { context.repos.keys().cloned().collect::<Vec<_>>().join(", ") });
+    let shown = |repos: &BTreeMap<String, PathBuf>| if repos.is_empty() { "no repository (read only)".to_string() } else { repos.keys().cloned().collect::<Vec<_>>().join(", ") };
+    println!("factory API on http://{address}/v1, for {}", shown(&context.repos));
+    let mut listed = opts.repo_dirs.clone();
+    let mut said: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for mut request in server.incoming_requests() {
+        if opts.registered {
+            match super::config::Config::load(&home) {
+                Ok(config) => {
+                    let dirs: Vec<PathBuf> = config.projects.iter().map(|entry| entry.path()).collect();
+                    if dirs != listed {
+                        let (repos, problems) = checkouts(&dirs);
+                        problems.into_iter().filter(|p| said.insert(p.clone())).for_each(|p| eprintln!("warning: {p}"));
+                        context.repos = repos;
+                        listed = dirs;
+                        println!("now for {}", shown(&context.repos));
+                    }
+                }
+                Err(e) => {
+                    let problem = format!("could not read the registered projects again: {e:#}");
+                    if said.insert(problem.clone()) {
+                        eprintln!("warning: {problem}");
+                    }
+                }
+            }
+        }
         let url = request.url().to_string();
         let (path, query) = url.split_once('?').unwrap_or((&url, ""));
         let method = request.method().as_str().to_string();
@@ -704,7 +747,7 @@ mod tests {
         assert!(!authorized(Some("s3cret"), Some("Bearer wrong")));
         assert!(!authorized(Some("s3cret"), Some("s3cret")));
         // Anywhere but this machine needs a token.
-        let open = ServeOptions { bind: "0.0.0.0:7878".into(), token: None, repo_dirs: Vec::new() };
+        let open = ServeOptions { bind: "0.0.0.0:7878".into(), token: None, repo_dirs: Vec::new(), registered: false };
         assert!(serve(&open).unwrap_err().to_string().contains("refusing to listen on 0.0.0.0:7878"));
     }
 

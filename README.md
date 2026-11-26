@@ -4,7 +4,7 @@ Status, open decisions and what needs a person: [the status report](https://clau
 
 A deterministic task manager. Software owns the loop and every gate. An LLM is called only for bounded steps.
 
-So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. A queue runs every ready issue, several at once, and a judgment step decides what happens to an issue that gets stuck. A local API serves all of it to the macOS app in [app/](app/). A long-running daemon is not built yet.
+So far it covers repo bootstrap, the plan pipeline, and one issue end to end: acceptance flows, develop, verify, review, pull request, GitHub's checks and review, and the merge, with fix rounds when something fails. A queue runs every ready issue, several at once, and a judgment step decides what happens to an issue that gets stuck. A local API serves all of it to the macOS app in [app/](app/), and both run as a launchd service on the machine that works on issues.
 
 ## Commands
 
@@ -26,6 +26,8 @@ factory module list --repo-dir <checkout>
 factory module new <kind>/<name> --repo-dir <checkout>
 factory project add <checkout> [--label <label>] [--max-parallel <n>]
 factory project list
+factory skills check <owner>/<name>
+factory skills update <owner>/<name>
 factory schedule [--parallel <n>] [--in-order] [--watch]
 factory capacity [--write] [--prepare]
 factory providers
@@ -36,14 +38,15 @@ factory status
 
 | Command | Does | Exit code |
 | --- | --- | --- |
-| `repo init` | Creates a private repo from a template, then sets branches, rulesets, collaborators, labels and Actions permissions. Ends with a preflight. Safe to rerun | 1 when the preflight fails |
-| `repo preflight` | Reads every setting back from GitHub. Changes nothing. Run it as the repository's owner: some settings are shown only to an admin, so an agent account can't check its own repos | 1 when a setting is wrong, 2 when the account isn't an admin |
+| `repo init` | Creates a private repo from a template, then sets branches, rulesets, collaborators, labels and Actions permissions, and writes the [skills](#skills) to the default branch. Ends with a preflight. Safe to rerun | 1 when the preflight fails |
+| `repo preflight` | Reads every setting back from GitHub, and warns when the default branch's skills differ from this program's. Changes nothing. Run it as the repository's owner: some settings are shown only to an admin, so an agent account can't check its own repos | 1 when a setting is wrong, 2 when the account isn't an admin |
 | `plan validate` | Checks plan files and prints the parallel batches. No network | 1 when a plan is invalid |
 | `plan create` | Creates issues, parent links and blocked-by links from valid plans. Safe to rerun | 1 when a plan is invalid |
 | `run` | Takes one issue through acceptance flows, develop, verify and review, opens a pull request, waits for GitHub on the same commit and merges. `--no-merge` leaves the merge to a person, `--no-pr` stops before pushing | 1 when the issue ends blocked |
 | `queue` | Runs every ready issue labelled `today`, most urgent first, up to `--parallel` at once | 1 when an issue ended blocked |
 | `schedule` | Runs the ready issues of every registered project, with one set of places for all of them. `--watch` keeps it running | 1 when an issue ended blocked |
-| `project` | `add`, `list` and `remove` the checkouts `schedule` works on | 1 when a listed folder is not a checkout |
+| `project` | `add`, `list` and `remove` the checkouts `schedule` works on. `add` refuses a checkout whose `verify.sh` can't pass anything, and notes when its commits would carry another name than the account `gh` works as. A watching scheduler and the API take a change in at their next look | 1 when a listed folder is not a checkout, 2 when `add` refuses |
+| `skills` | `check` compares the [skills](#skills) on a repository's default branch with this program's. `update` commits this program's there, through GitHub | `check`: 1 when they differ |
 | `blocked` | Lists the issues waiting for a person, with what failed and what the judgment said | |
 | `retry` | Starts a stuck issue over: closes the pull request and deletes the branch its last attempt left, then runs it from nothing | 1 when it ends blocked again |
 | `drop` | Takes a stuck issue off the queue: closes its pull request, deletes its branch and worktree, removes the `today` label. The issue stays open | |
@@ -341,7 +344,7 @@ The simulators and the agent subscriptions are already shared between projects, 
 - **`--watch`** never ends. With nothing to do it looks again every 30 seconds, so labelling an issue `today` is all it takes to start it. This is the long-running form, and what the service runs. A watching scheduler does not end when GitHub fails to answer: it says so once, keeps what it listed last, and looks again.
 - **An issue someone else is running** is left alone and not counted as blocked.
 
-Projects are kept in `~/.factory/config.yaml`, in the order they were added. `factory serve` with no `--repo-dir` serves the registered projects. In the output an issue is named with its repository, as in `todo-trial#37`.
+Projects are kept in `~/.factory/config.yaml`, in the order they were added. A watching scheduler reads the list again at each look, so `project add` and `remove` need no restart. `factory serve` with no `--repo-dir` serves the registered projects. In the output an issue is named with its repository, as in `todo-trial#37`.
 
 ### Running as a service
 
@@ -359,7 +362,7 @@ factory service uninstall
 | `dev.factory.serve` | `factory serve --bind 127.0.0.1:7878`, or the address given with `--bind` | `~/.factory/service/serve.log` |
 
 - **What goes into an agent's environment** is only the `PATH` of the shell that installed it, each folder once, and `FACTORY_HOME` when that was set. So install it from a shell that finds `git`, `gh`, `claude`, `codex` and the Xcode tools. No login of that shell is carried over: the agents' calls use this machine's own logins.
-- **It needs a registered project.** `install` refuses when `factory project list` is empty.
+- **It needs a registered project.** `install` refuses when `factory project list` is empty. Projects added or removed later need no new install: the scheduler and the API read the list again at each look. A project removed while its issues run lets them finish and starts nothing new of it.
 - **To change how it runs,** run `install` again with other flags. It stops what is loaded and starts the new settings. It waits up to 10 seconds for launchd to finish removing each old agent, offers the new file up to five times, and tries both agents even when one is refused. It says the API runs only once `/v1/health` answers with the agent's own process id, which it waits up to 10 seconds for. When an agent is not loaded, or another process answers on the API's address, it says which and exits 1.
 - **The agents run the program where it was when `install` ran.** Building again replaces that file, and an agent picks the new build up the next time it starts.
 - **`uninstall` cuts off issues at work.** They pick up at the step they were on the next time they are run.
@@ -587,6 +590,23 @@ export PATH="/opt/homebrew/opt/openjdk/bin:/opt/homebrew/opt/rustup/bin:$HOME/.c
 
 The service takes its `PATH` from the shell that installs it, so this line is also what lets it find them.
 
+## Skills
+
+A project run by factory carries skills for the Claude Code sessions people work in there, in `.claude/skills/factory-*`. They are the steps that need judgment or a person's word, written down so every session follows them the same way. The rest is commands.
+
+| Skill | For |
+| --- | --- |
+| `factory-plan` | Turning a feature discussion, spec or document into a plan file and its pull request into `main` |
+| `factory-status` | What runs, what is blocked and why, and a retry or a drop when the person asks, through the API |
+| `factory-promote` | The promote pull request, whose merge stays the person's |
+
+Their text is in [skills/](skills/) and is built into the program, so a project's copy matches the engine that runs it. `repo init` writes them, `factory skills update <owner>/<name>` refreshes them after an engine update, and the preflight warns when they differ. Only `factory-*` folders are factory's: a project's other skills are left alone.
+
+- **The engine's own agents never see them.** Every agent call runs with skills turned off (`--disable-slash-commands`), and so does the GitHub review in the template's `review.yml`.
+- **No issue can change them.** The validator refuses a scope under `.claude/`, and under `.github/`.
+
+Three more live in this repository's [.claude/skills/](.claude/skills/), for sessions started in it: `factory-new-project` makes a repository and its app skeleton, `factory-register-project` registers it on the machine that runs the engine, and `factory-update-engine` updates that machine and every project's skills.
+
 ## Build and test
 
 ```bash
@@ -606,6 +626,9 @@ cargo install --path .
 | `src/plan/render.rs` | Text, markdown and JSON reports |
 | `src/plan/create.rs` | Issue bodies, creation and links, behind a `Github` trait |
 | `src/repo.rs` | `repo init` and the preflight |
+| `src/skills.rs` | The skills a project carries, built in from `skills/`, and how they are compared and committed |
+| `skills/` | The project skills' text. Changing one here and running `factory skills update` is how projects get the change |
+| `.claude/skills/` | This repository's own skills: making a project, registering it on the engine's machine, updating the engine |
 | `src/engine/mod.rs` | The steps and the fixed gates |
 | `src/engine/rounds.rs` | The loop: what runs next, and when the rounds run out |
 | `src/engine/queue.rs` | The scheduler: which issues are ready, in what order, how many at once, and which project gets the next place |
@@ -617,6 +640,7 @@ cargo install --path .
 | `app/` | The macOS app, a Swift package |
 | `src/engine/lock.rs` | Locks that hold across processes |
 | `src/engine/capacity.rs` | What the machine has, and how much to run at once |
+| `src/engine/checkout.rs` | What `project add` checks in a checkout |
 | `src/engine/config.rs` | This machine's settings: pools, the handoff folder |
 | `src/engine/providers.rs` | This machine's subscriptions, and who may fill which role |
 | `src/engine/qualify.rs` | The check a provider must pass before the engine uses it |

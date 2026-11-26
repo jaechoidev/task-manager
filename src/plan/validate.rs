@@ -63,6 +63,13 @@ struct Node {
     key: String,
 }
 
+/// Top-level folders that belong to people, and why. An issue's scope is
+/// what its developer may change, so neither may be in one.
+const PEOPLES_FOLDERS: &[(&str, &str)] = &[
+    (".claude", "it holds the skills people's sessions follow"),
+    (".github", "it holds the workflows that check and review every pull request"),
+];
+
 /// A scope path split into components, plus the text as written.
 struct ScopePath {
     parts: Vec<String>,
@@ -213,7 +220,12 @@ pub fn validate(set: &PlanSet, opts: &Options) -> Report {
             }
             for raw in &issue.scope {
                 match parse_scope(raw) {
-                    Ok(s) => parsed_scopes.push(s),
+                    Ok(s) => {
+                        if let Some(why) = PEOPLES_FOLDERS.iter().find(|(folder, _)| s.parts[0] == *folder).map(|(_, why)| why) {
+                            err(&subject, format!("scope '{}' is under {}/, which no issue may change: {why}", s.shown, s.parts[0]));
+                        }
+                        parsed_scopes.push(s);
+                    }
                     Err(message) => err(&subject, message),
                 }
             }
@@ -608,6 +620,22 @@ issues:
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("dependency cycle: a → b → a"), "{found:?}");
         assert!(report.plans[0].batches.is_empty());
+    }
+
+    #[test]
+    fn a_scope_in_a_folder_people_keep_is_refused() {
+        let text = r#"
+plan: own-v1
+title: Own
+issues:
+  - {key: a, title: A, scope: [.claude/skills/], accept: [x]}
+  - {key: b, title: B, scope: [./.github/workflows/review.yml], accept: [x]}
+  - {key: c, title: C, scope: [Sources/.claude/], accept: [x]}
+"#;
+        let found = messages(&check(&[("own-v1", text)]));
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].starts_with("own-v1/a: scope '.claude/skills/' is under .claude/"), "{found:?}");
+        assert!(found[1].starts_with("own-v1/b: scope './.github/workflows/review.yml' is under .github/"), "{found:?}");
     }
 
     #[test]

@@ -247,6 +247,13 @@ pub fn init(opts: &Options) -> Result<Vec<Check>> {
     gh::api("PUT", &format!("repos/{repo}/actions/permissions/workflow"), Some(&workflow))?;
     step("Actions enabled with a read-only default token");
 
+    // 7. The skills people's sessions follow in the project, on the
+    // default branch, where a checkout has them.
+    match crate::skills::update(repo)? {
+        None => step("factory skills already match this program's"),
+        Some((commit, _)) => step(&format!("wrote the factory skills to the default branch, commit {}", &commit[..7.min(commit.len())])),
+    }
+
     preflight(opts)
 }
 
@@ -389,6 +396,14 @@ pub fn preflight(opts: &Options) -> Result<Vec<Check>> {
         let found = exists(gh::api("GET", &format!("repos/{repo}/contents/{file}?ref=main"), None))?.is_some();
         add(found, &format!("{file} on main"), if found { "found".into() } else { "missing".into() });
     }
+
+    // The skills people's sessions follow. Out of date warns: no run depends on them.
+    let (status, name, detail) = match crate::skills::status(repo) {
+        Ok((branch, drift)) if drift.is_empty() => (Status::Pass, format!("factory skills on {branch}"), "match this program's".to_string()),
+        Ok((branch, drift)) => (Status::Warn, format!("factory skills on {branch}"), format!("{}. Run `factory skills update {repo}`", drift.describe())),
+        Err(e) => (Status::Warn, "factory skills".to_string(), format!("could not compare: {e:#}")),
+    };
+    checks.push(Check { status, name, detail });
 
     // Things only a person can finish. These warn and don't fail.
     for login in pending {
