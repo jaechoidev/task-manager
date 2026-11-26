@@ -297,7 +297,7 @@ pub fn route(context: &Context_, request: &Request) -> (u16, Value) {
         let parts: Vec<&str> = request.path.trim_matches('/').split('/').collect();
         let not_found = || Ok((404, json!({ "error": format!("no such route: {} {}", request.method, request.path) })));
         Ok(match (request.method, parts.as_slice()) {
-            ("GET", ["v1", "health"]) => (200, json!({ "ok": true, "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(), "repos": context.repos.keys().collect::<Vec<_>>() })),
+            ("GET", ["v1", "health"]) => (200, json!({ "ok": true, "version": env!("CARGO_PKG_VERSION"), "commit": env!("FACTORY_COMMIT"), "pid": std::process::id(), "repos": context.repos.keys().collect::<Vec<_>>() })),
             ("GET", ["v1", "issues"]) => {
                 let rows = store.issues()?;
                 (200, json!(rows.iter().map(|row| issue_json(&store, row)).collect::<Result<Vec<_>>>()?))
@@ -581,6 +581,18 @@ mod tests {
     fn get(context: &Context_, path: &str) -> (u16, Value) {
         let (path, query) = path.split_once('?').unwrap_or((path, ""));
         route(context, &Request { method: "GET", path, query: parse_query(query), body: "" })
+    }
+
+    #[test]
+    fn health_says_which_build_answers() {
+        let home = home("health");
+        let context = Context_ { home: home.clone(), repos: BTreeMap::new(), program: PathBuf::from("factory") };
+        let (status, health) = get(&context, "/v1/health");
+        assert_eq!(status, 200);
+        let commit = health["commit"].as_str().unwrap();
+        assert_eq!(commit, env!("FACTORY_COMMIT"));
+        assert!(commit == "unknown" || commit.trim_end_matches("-dirty").len() == 12, "{commit}");
+        assert_eq!(health["pid"], std::process::id());
     }
 
     #[test]

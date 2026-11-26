@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 #[derive(Parser)]
-#[command(name = "factory", version, about = "Deterministic task manager: plans, issues and repo bootstrap")]
+#[command(name = "factory", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("FACTORY_COMMIT"), ")"), about = "Deterministic task manager: plans, issues and repo bootstrap")]
 struct Cli {
     #[command(subcommand)]
     command: Top,

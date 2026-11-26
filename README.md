@@ -63,6 +63,8 @@ factory status
 
 Exit code 2 means the command itself could not run.
 
+`factory --version` names the commit the program was built from, as in `factory 0.1.0 (0bb1d84f457b)`. A build with uncommitted changes to tracked files ends in `-dirty`, and one built without git says `unknown`.
+
 All GitHub access goes through `gh api`, so `gh` must be installed and logged in. No feature depends on a particular `gh` version.
 
 ## Plan files
@@ -257,7 +259,7 @@ It is generated from the state database and the run files, with no LLM call, and
 
 | Route | Answers |
 | --- | --- |
-| `GET /v1/health` | The version, the server's process id, and the repositories it may act on |
+| `GET /v1/health` | The version, the commit the server was built from, its process id, and the repositories it may act on |
 | `GET /v1/issues` | Every issue run so far: its state, its stage, what it waits on, which pass it is on |
 | `GET /v1/issues/<owner>/<repo>/<n>` | One issue: every step with who answered and on which model, the summary, what failed, the judgment, the run's files |
 | `GET /v1/issues/<owner>/<repo>/<n>/log` | The end of the newest output of that run |
@@ -354,7 +356,7 @@ factory service status
 factory service uninstall
 ```
 
-`install` makes the scheduler and the API two launchd agents of this Mac. They start at login and are started again when they stop. `status` exits 1 unless both run and the API answers as its own agent, so a script can tell. From then on, putting the label on an issue is all it takes, and the app always has an engine to talk to.
+`install` makes the scheduler and the API two launchd agents of this Mac. They start at login and are started again when they stop. `status` exits 1 unless both run and the API answers as its own agent, so a script can tell, and it names the commit the API was built from. From then on, putting the label on an issue is all it takes, and the app always has an engine to talk to.
 
 | Agent | Runs | Output |
 | --- | --- | --- |

@@ -57,6 +57,15 @@ pub struct State {
 pub struct Api {
     pub address: String,
     pub answer: Answer,
+    /// The commit the answering server was built from, when it says.
+    pub commit: Option<String>,
+}
+
+/// What a health reply says, as far as it can be read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reply {
+    pub pid: Option<u32>,
+    pub commit: Option<String>,
 }
 
 /// Who answers on the API's address.
@@ -256,7 +265,7 @@ const ANSWERS_WITHIN: Duration = Duration::from_secs(10);
 /// Asks `address` for `/v1/health`. `None` when nothing answers over HTTP.
 /// Otherwise the process the reply names: an API says its own, and a
 /// server that wants a token, or isn't factory's, names none.
-pub fn health(address: &str, within: Duration) -> Option<Option<u32>> {
+pub fn health(address: &str, within: Duration) -> Option<Reply> {
     use std::io::{Read, Write};
     use std::net::ToSocketAddrs;
     let socket = address.to_socket_addrs().ok()?.next()?;
@@ -273,8 +282,10 @@ pub fn health(address: &str, within: Duration) -> Option<Option<u32>> {
         return None;
     }
     let body = reply.split_once("\r\n\r\n").map(|(_, body)| body).unwrap_or_default();
-    let pid = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|value| value.get("pid")?.as_u64()).and_then(|pid| u32::try_from(pid).ok());
-    Some(pid)
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let pid = value.as_ref().and_then(|value| value.get("pid")?.as_u64()).and_then(|pid| u32::try_from(pid).ok());
+    let commit = value.as_ref().and_then(|value| value.get("commit")?.as_str()).map(str::to_string);
+    Some(Reply { pid, commit })
 }
 
 /// Looks until `check` is true, for at most `limit`. The time a look takes
@@ -341,9 +352,12 @@ pub fn install(opts: &Options) -> Result<Installed> {
         let mut state = state_of(job, &file)?;
         if let Some(address) = bind_of(&job.args).filter(|_| taken.is_ok()) {
             let mut seen = Answer::Nobody;
+            let mut commit = None;
             let mut look = || {
                 let Ok(now) = state_of(job, &file) else { return false };
-                seen = answer(health(&address, Duration::from_secs(1)), now.pid);
+                let reply = health(&address, Duration::from_secs(1));
+                seen = answer(reply.as_ref().map(|reply| reply.pid), now.pid);
+                commit = reply.and_then(|reply| reply.commit);
                 state = now;
                 seen == Answer::Ours
             };
@@ -357,7 +371,7 @@ pub fn install(opts: &Options) -> Result<Installed> {
                     refused.push(format!("{}: {who} answers on http://{address}, not this agent, after {after} s. Stop it, for example a `factory serve` started by hand, and install again. This agent's output is in {}", job.label, job.log.display()));
                 }
             }
-            state.api = Some(Api { address, answer: seen });
+            state.api = Some(Api { address, answer: seen, commit });
         }
         states.push(state);
     }
@@ -394,7 +408,9 @@ pub fn status() -> Result<Vec<State>> {
             let mut state = state_of(job, &file)?;
             // The address is the one the installed file names.
             if let Some(address) = std::fs::read_to_string(&file).ok().and_then(|text| bind_in(&text)) {
-                state.api = Some(Api { answer: answer(health(&address, Duration::from_secs(1)), state.pid), address });
+                let reply = health(&address, Duration::from_secs(1));
+                let answer = answer(reply.as_ref().map(|reply| reply.pid), state.pid);
+                state.api = Some(Api { answer, commit: reply.and_then(|reply| reply.commit), address });
             }
             Ok(state)
         })
@@ -410,15 +426,18 @@ pub fn print(states: &[State]) {
     for state in states {
         let how = match (state.installed, state.loaded, state.pid) {
             (_, true, Some(pid)) => match &state.api {
-                Some(Api { address, answer: Answer::Ours }) => format!("running, process {pid}, answering on http://{address}"),
-                Some(Api { address, answer: Answer::Nobody }) => format!("running, process {pid}, NOT answering on http://{address}"),
-                Some(Api { address, answer: Answer::Someone(Some(other)) }) => format!("running, process {pid}, but process {other} answers on http://{address}"),
-                Some(Api { address, answer: Answer::Someone(None) }) => format!("running, process {pid}, but another server answers on http://{address}"),
+                Some(Api { address, answer: Answer::Ours, commit }) => {
+                    let build = commit.as_deref().map(|commit| format!(", build {commit}")).unwrap_or_default();
+                    format!("running, process {pid}, answering on http://{address}{build}")
+                }
+                Some(Api { address, answer: Answer::Nobody, .. }) => format!("running, process {pid}, NOT answering on http://{address}"),
+                Some(Api { address, answer: Answer::Someone(Some(other)), .. }) => format!("running, process {pid}, but process {other} answers on http://{address}"),
+                Some(Api { address, answer: Answer::Someone(None), .. }) => format!("running, process {pid}, but another server answers on http://{address}"),
                 None => format!("running, process {pid}"),
             },
             (_, true, None) => match &state.api {
-                Some(Api { address, answer: Answer::Someone(Some(other)) }) => format!("loaded, not running right now. Process {other} answers on http://{address}, so this agent can't listen there"),
-                Some(Api { address, answer: Answer::Someone(None) }) => format!("loaded, not running right now. Another server answers on http://{address}, so this agent can't listen there"),
+                Some(Api { address, answer: Answer::Someone(Some(other)), .. }) => format!("loaded, not running right now. Process {other} answers on http://{address}, so this agent can't listen there"),
+                Some(Api { address, answer: Answer::Someone(None), .. }) => format!("loaded, not running right now. Another server answers on http://{address}, so this agent can't listen there"),
                 _ => "loaded, not running right now. launchd starts it again".to_string(),
             },
             (true, false, _) => "installed, not loaded. It starts at the next login, or with `factory service install`".to_string(),
@@ -545,12 +564,12 @@ mod tests {
 
     #[test]
     fn a_health_reply_names_the_process_that_answered() {
-        let (address, server) = one_reply("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"pid\":4242}");
-        assert_eq!(health(&address, Duration::from_secs(2)), Some(Some(4242)));
+        let (address, server) = one_reply("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"pid\":4242,\"commit\":\"0bb1d84f457b\"}");
+        assert_eq!(health(&address, Duration::from_secs(2)), Some(Reply { pid: Some(4242), commit: Some("0bb1d84f457b".into()) }));
         assert!(server.join().unwrap().starts_with("GET /v1/health HTTP/1.0\r\n"));
         // One that wants a token is up, and doesn't say who it is.
         let (address, server) = one_reply("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
-        assert_eq!(health(&address, Duration::from_secs(2)), Some(None));
+        assert_eq!(health(&address, Duration::from_secs(2)), Some(Reply::default()));
         server.join().unwrap();
         // Nobody listens there now.
         assert_eq!(health(&address, Duration::from_millis(500)), None);
@@ -596,7 +615,7 @@ mod tests {
 
     #[test]
     fn healthy_means_both_run_and_the_api_answers_as_itself() {
-        let state = |pid: Option<u32>, answer: Option<Answer>| State { label: "x".into(), installed: true, loaded: true, pid, log: PathBuf::from("/l"), api: answer.map(|answer| Api { address: "a".into(), answer }) };
+        let state = |pid: Option<u32>, answer: Option<Answer>| State { label: "x".into(), installed: true, loaded: true, pid, log: PathBuf::from("/l"), api: answer.map(|answer| Api { address: "a".into(), answer, commit: None }) };
         assert!(healthy(&[state(Some(1), None), state(Some(2), Some(Answer::Ours))]));
         assert!(!healthy(&[state(Some(1), None), state(None, Some(Answer::Someone(Some(9))))]));
         assert!(!healthy(&[state(Some(1), None), state(Some(2), Some(Answer::Nobody))]));
