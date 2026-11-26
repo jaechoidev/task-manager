@@ -64,8 +64,8 @@ Three were found here and are done on `main`:
 - **The README's Maestro line.** It now runs `brew trust --formula mobile-dev-inc/tap/maestro` first, and gives the `~/.zprofile` line for `openjdk`, `rustup` and `~/.cargo/bin`. `0afc3b0`.
 - **The acceptance writer's model.** The engine already read `roles.acceptance`. Only the files lacked it. `factory providers` now names each job with no list as not pinned to a model, the example file gives acceptance a list, and the app says so for an empty list. `a6bf483`. Pinning it on the Mac Studio is still an edit of its `providers.yaml`, and Jae's choice. With develop on ChatGPT only, the acceptance writer has to come from another family, so Claude at some tier.
 
-Still open:
+One more is done on the Mac Studio itself, not in the code:
 
-- **Whose name the engine's commits carry.** On the Mac Studio they carry Jae's git identity, not `neostudiodot`'s. If the agent machine's work should be told apart in history, its `git config user.name` and `user.email` should be the agent's. Jae's call.
+- **Whose name the engine's commits carry.** The engine makes its worktrees from `~/code/counter-trial` and `~/code/todo-trial`, and a worktree uses its checkout's config. Both checkouts now set `user.name` to `neostudiodot` and `user.email` to its GitHub no-reply address, so the engine's commits are the agent's. The global `~/.gitconfig` is still Jae's, so commits made by hand in other repos stay Jae's. Commits made before this, like those on counter-trial#18, keep Jae's name, and no issue has run since. The engine doesn't set an identity itself, so each new agent machine needs this step for each checkout.
 
 After this run, the service was installed on the Mac Studio: both agents run from `~/.cargo/bin/factory`, and the API answers on `127.0.0.1:7878`. No issue has run under it yet, so "Not covered" above still holds.
