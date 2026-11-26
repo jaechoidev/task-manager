@@ -1,6 +1,6 @@
 # Findings: the Mac Studio's first issues, as neostudiodot (2026-11-25)
 
-Every run before this was on the MacBook as `jaechoidev`. This sets `factory` up on the Mac Studio, the machine meant to run issues from now on, and runs one real issue there as the agent account `neostudiodot`, with `factory schedule` started by hand. The service was installed afterwards, and a second issue ran under it the next day, with no Claude Code session involved.
+Every run before this was on the MacBook as `jaechoidev`. This sets `factory` up on the Mac Studio, the machine meant to run issues from now on, and runs one real issue there as the agent account `neostudiodot`, with `factory schedule` started by hand. The service was installed afterwards, and a second issue ran under it later the same day, with no Claude Code session involved.
 
 ## The first issue, started by hand
 
@@ -26,11 +26,11 @@ The model names are from each call's own output, except the developer's: Codex's
 - **The GitHub review counted.** Its comment is from `github-actions[bot]`, verdict approve, for `69e0d1e`.
 - **Nothing waits.** `factory blocked` lists no issue.
 
-## The second issue, run by the service (2026-11-26)
+## The second issue, run by the service
 
 After the first run, the service was installed: both launchd agents run from `~/.cargo/bin/factory`, built at `655291c`, and the API answers on `127.0.0.1:7878`. The plan, [counter-trial#19](https://github.com/jaechoidev/counter-trial/pull/19), was opened from the MacBook as `jaechoidev` and merged by Jae. The repository's plan-create workflow made the issue, and it was labelled `today` from the MacBook. Nothing on the MacBook was watching the trial repos, so only the Mac Studio could take it.
 
-[counter-trial#21](https://github.com/jaechoidev/counter-trial/issues/21) `about-tagline` merged as [counter-trial#22](https://github.com/jaechoidev/counter-trial/pull/22) in 289 seconds, on the first attempt, with no fix round and nobody asked to look.
+[counter-trial#21](https://github.com/jaechoidev/counter-trial/issues/21) `about-tagline` merged as [counter-trial#22](https://github.com/jaechoidev/counter-trial/pull/22) 289 seconds after it was picked up, on the first attempt, with no fix round and nobody asked to look.
 
 | Step | Who answered | Result | Seconds |
 | --- | --- | --- | --- |
@@ -47,7 +47,7 @@ After the first run, the service was installed: both launchd agents run from `~/
 
 - **The machine's own logins answered.** The service's environment holds only `PATH`, so every Claude and Codex call used this machine's own login, not a Claude Code session's. That was the part the first run could not show.
 - **`dev` is what was verified.** The tree of `dev` after the merge, `34ebe86`, is the tree of `b9e0c4d`, the commit that passed verify and review.
-- **Every commit carries the agent's name.** Both commits on the branch, `ba576b5` and `b9e0c4d`, are authored and committed by `neostudiodot`, and so is the squash `34ebe86`. This is the first run since the git identity change in the open items below.
+- **Every commit carries the agent's name.** Both commits on the branch, `ba576b5` and `b9e0c4d`, are authored and committed by `neostudiodot`. The squash, `34ebe86`, is authored by `neostudiodot` and committed by GitHub. This is the first run since the git identity change in the open items below.
 - **The agent account did the GitHub work.** The pull request's author and the account that merged it are both `neostudiodot`. The issue closed as completed 1 second after the merge.
 - **The GitHub review counted.** Its comment is from `github-actions[bot]`, verdict approve, for `b9e0c4d`.
 - **The watcher outlasted GitHub's errors.** The scheduler had been up for about 17 hours when the label went on. In that time it logged two 503 answers and one cut-off reply while listing issues, said so, and kept looking.
@@ -72,7 +72,7 @@ After the first run, the service was installed: both launchd agents run from `~/
 - **Java and Rust are not on PATH after install.** Both formulae are keg-only. `/usr/bin/java` is Apple's stub and fails without a JDK it knows, and Maestro's start script uses the `java` it finds on PATH. A line in `~/.zprofile`, added by hand, puts `openjdk/bin`, `rustup/bin` and `~/.cargo/bin` first. The service takes its PATH from the shell that installs it, so that line is what lets the service find them. The service's run found both.
 - **Preflight needs the owner.** Its first call reads `repos/<repo>/invitations`, which needs admin. As `neostudiodot`, which has write, it fails with 403 and exits 2. Run from the MacBook as `jaechoidev`, all 16 checks pass on both trial repos. An agent account can't preflight itself.
 - **Who pushes is git's credential, not `gh`'s.** The engine runs plain `git push`. Here the keychain's `github.com` entry, used through Xcode's `osxkeychain` helper, is `neostudiodot`. `gh` is also logged in as `jaechoidev`, not active. If the keychain held the other account, pushes and `gh api` calls would come from different accounts.
-- **The squash commit is the agent's.** The engine's own commits carry this machine's git identity, Jae's. The squash commit on `dev` is authored by `neostudiodot`'s GitHub identity, because the account that squash merges authors the result. On the MacBook both were Jae.
+- **The squash commit is the agent's.** In the first run, the engine's own commits carried this machine's git identity, Jae's. The squash commit on `dev` was authored by `neostudiodot`, the account that opened and merged the pull request. On the MacBook both were Jae.
 - **GLM is left out.** There is no `~/.zai/env.sh` here. So each job has one name: develop ChatGPT `sol`, review Claude `high`, summary Claude `fast`. The summary went to Claude, where the MacBook's went to GLM. If ChatGPT runs out, an issue parks, because nobody else may develop.
 - **The acceptance writer ran on Fable.** Acceptance has no list in `providers.yaml`, so it falls back to the workflow's `claude` with no model, which is the program's default. `~/.claude/settings.json` on this machine names `fable`. That this setting is where the default came from is a guess, not checked. The MacBook's findings say "default model" without naming it.
 - **Verify took 102 seconds** for 7 flows, and 116 seconds for 8 under the service. On the MacBook, counter-trial's verify took 91 to 107 seconds with five or six flows ([a view of the scheduler](2026-11-24-schedule-view.md)), so this machine is in line with it.
