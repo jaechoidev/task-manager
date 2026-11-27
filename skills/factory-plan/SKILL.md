@@ -12,7 +12,7 @@ The thinking about what to build can happen anywhere: in this conversation, with
 ## Before writing
 
 1. Read `plans/README.md` for the format and `AGENTS.md` for the accessibility ID rules. They are this repo's own copies and win over anything here.
-2. Read the plans merged so far, which live on `main`: `git fetch origin && git ls-tree --name-only origin/main plans/`, then `git show origin/main:plans/<file>`. Read the code under `Sources/` as it is on `origin/dev`, since scopes and IDs have to fit it.
+2. Read the plans merged so far, which live on `main`: `git fetch origin && git ls-tree --name-only origin/main plans/`, then `git show origin/main:plans/<file>`. Read the code under `Sources/`, and `Tests/` if there is one, as it is on `origin/dev`, since scopes and IDs have to fit it.
 3. Find the `factory` program: `command -v factory`, or `~/code/task-manager/target/release/factory`. If neither exists, say so and stop.
 
 ## Writing the plan
@@ -22,6 +22,7 @@ The thinking about what to build can happen anywhere: in this conversation, with
 - **`accessibility_ids` lists every ID the flows will use.** Development implements exactly those. Format from `AGENTS.md`: `<feature>.<screen>.<element>`, lowercase, words joined by `-`. Reuse an existing ID when the element exists already.
 - **`flows`:** `{file: name.yaml, new: true}` for a flow this issue adds. Name it after the issue key.
 - **Scope is every path development may change.** A change outside it fails the issue. When a change touches a model and a screen, list both folders. Never `.claude/`, `.github/` or `.maestro/`: the validator refuses the first two, and flows are written by the acceptance step.
+- **When the repo has `Tests/`, each source folder brings its test folder.** For every `Sources/<area>/` in an issue's scope, also list `Tests/<area>/`, even if that folder doesn't exist yet. `Sources/Model/` goes with `Tests/Model/`. Without it, development can't add or update a test, so an issue that changes tested behaviour on purpose fails. Test folders mirror source folders, so this adds no new overlap and no new `depends_on`.
 - **Two issues whose scopes overlap need `depends_on`** on one of them, or the validator refuses the plan. Issues with separate scopes run side by side.
 - **Labels:** `needs-sim` for anything with a flow, `needs-research` when it needs an API or library the agents may not know, `priority:high` or `priority:low` only when the order matters.
 - Plan ID: `<feature>-v<n>`, the file `plans/<plan-id>.yaml`, unused so far.
