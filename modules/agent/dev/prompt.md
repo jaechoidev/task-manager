@@ -39,8 +39,8 @@ Never create or edit a file in `.maestro/`. If a flow assumes something the acce
 # Rules
 
 - Do not run `git add`, `git commit`, `git push` or any command that changes branches. The engine commits your work after you finish.
-- Do not edit project files outside the scope, including the Xcode project. New Swift files under `Sources/` are picked up automatically.
-- You may run `./verify.sh`, which builds the app and runs the flows on a simulator. If the sandbox blocks it, set `verify_ran` to `blocked` and carry on. The engine runs it again after you finish, and that run is the one that counts.
+- Do not edit project files outside the scope, including the Xcode project. New Swift files under `Sources/` and `Tests/` are picked up automatically.
+- You may run `./verify.sh`, which builds the app, runs the unit tests in `Tests/` and runs the flows on a simulator. If the sandbox blocks it, set `verify_ran` to `blocked` and carry on. The engine runs it again after you finish, and that run is the one that counts.
 - Keep the change as small as the acceptance criteria allow.
 
 # Your final message

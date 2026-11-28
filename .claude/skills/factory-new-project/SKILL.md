@@ -39,6 +39,13 @@ The template has the workflows, `verify.sh`, `AGENTS.md` and `plans/`, but no ap
 
 - An Xcode project at the root (`<App>.xcodeproj`), a SwiftUI app, bundle ID `com.example.<name without dashes>`.
 - Code under `Sources/`: `Sources/App/` for the app, one folder per screen under `Sources/UI/`, so plans can give each issue its own scope.
+- A unit-test target `<App>Tests` whose synchronized folder is `Tests/`, with at least one test, so the unit-test step in `verify.sh` runs from day one. Test folders mirror `Sources/`, as in `Tests/Model/` for `Sources/Model/`. counter-trial has none, so copy the shape from my-favorite-thing's commit `cd22c78` (`gh api repos/jaechoidev/my-favorite-thing/commits/cd22c78 -H "Accept: application/vnd.github.diff"`), which writes it by hand into an objectVersion 77 project:
+  - a `PBXFileSystemSynchronizedRootGroup` with path `Tests` in the main group, and an `<App>Tests.xctest` product reference in the Products group
+  - a `PBXNativeTarget` of type `com.apple.product-type.bundle.unit-test` with empty Sources, Frameworks and Resources phases, the `Tests` group in `fileSystemSynchronizedGroups`, and a `PBXTargetDependency` on the app through a `PBXContainerItemProxy`
+  - `TestTargetID` set to the app target in `TargetAttributes`, and the new target in the project's `targets`
+  - build settings `TEST_HOST = "$(BUILT_PRODUCTS_DIR)/<App>.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/<App>"`, `BUNDLE_LOADER = "$(TEST_HOST)"`, `GENERATE_INFOPLIST_FILE = YES` and `PRODUCT_BUNDLE_IDENTIFIER = com.example.<name without dashes>tests`
+  - a `TestAction` in the shared scheme whose testable has `parallelizable = "NO"`, because parallel testing clones the simulator and the engine gives each verify one
+- The app hosts the tests, so launching it never asks for a permission such as photos or camera. Ask on a tap, or the alert stops the tests and the flows.
 - A root accessibility ID on each screen, as in `counter.screen.root`, following the format in `AGENTS.md`.
 - `.maestro/launch.yaml`: the app launches and each screen can be reached. Its `appId` is the bundle ID. Remove `.maestro/sample.yaml` if it doesn't fit the app.
 - In `verify.sh`, set `SCHEME` and `PROJECT`, for example `SCHEME="${SCHEME:-NotesApp}"` and `PROJECT="${PROJECT:-NotesApp.xcodeproj}"`.

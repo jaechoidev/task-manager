@@ -27,9 +27,11 @@ Read AGENTS.md first. The current directory is the repository at the commit unde
 # What was verified
 
 - Commit under review: `{{head_sha}}`
-- `./verify.sh`, which builds the app and runs every flow in `.maestro/`: {{verify_result}}
+- `./verify.sh`, which builds the app, runs the unit tests in `Tests/` if there are any, and runs every flow in `.maestro/`: {{verify_result}}
 
-The change has already passed the scope gate, the build and the flows. Judge what those can't: whether the code meets each acceptance criterion beyond what the flows check, whether every accessibility ID is on the right element, and whether there are bugs.
+The change has already passed the scope gate, the build, the unit tests and the flows. Judge what those can't: whether the code meets each acceptance criterion beyond what the flows check, whether every accessibility ID is on the right element, and whether there are bugs.
+
+The developer writes its own unit tests, unlike the flows. When the change adds or edits tests in `Tests/`, check that they test the acceptance criteria and can fail, not that they repeat what the code returns. A criterion no flow checks is unmet when its test doesn't check it. In a project with `Tests/`, new logic needs a test, as `AGENTS.md` says.
 
 If the flows miss an acceptance criterion, say so in `items` and ask for a flow that covers the gap. Don't ask the developer to edit a flow: it may not.
 

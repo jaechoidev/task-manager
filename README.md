@@ -97,7 +97,7 @@ The rest of the body repeats the same data as markdown for people.
    - **acceptance**: one agent call, by a different vendor from the developer, that writes the Maestro flows the issue adds. The engine commits them as their own commit.
    - **red**: `./verify.sh --red <new flows>`. It passes only when each new flow is valid Maestro and fails on the app as it is, which shows the flow tests something new.
    - **develop**: one headless agent call that may only write inside the worktree.
-   - **verify**: the repo's `./verify.sh`, which builds the app and runs every flow. Exit code 0 is the only pass.
+   - **verify**: the repo's `./verify.sh`, which builds the app, runs the unit tests in `Tests/` if there are any, and runs every flow. Exit code 0 is the only pass.
    - **review**: one read-only agent call, by a different vendor from the developer.
 3. The engine's own steps, which are not in `factory.yaml`:
    - **sync**: if the default branch moved, merge it in and run verify and review again.
@@ -571,10 +571,10 @@ Before a run, and before a change to the file is proposed, the engine checks tha
 
 | Call | Passes (exit 0) when |
 | --- | --- |
-| `./verify.sh` | The build and every flow in `.maestro/` pass |
+| `./verify.sh` | The build, every unit test in `Tests/` and every flow in `.maestro/` pass |
 | `./verify.sh --red FLOW...` | Each named flow is valid Maestro, runs, and fails |
 
-The template repo's `verify.sh` does both for an Xcode project and an iOS simulator. It needs Maestro and Java 17 or newer:
+The template repo's `verify.sh` does both for an Xcode project and an iOS simulator. It runs the unit tests only when `Tests/` has a Swift file, one at a time so they stay on the slot's simulator, and never with `--red`. It needs Maestro and Java 17 or newer:
 
 ```bash
 brew trust --formula mobile-dev-inc/tap/maestro
